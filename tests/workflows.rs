@@ -629,6 +629,24 @@ fn failed_external_cleanup_holds_capacity_until_confirmed() {
 }
 
 #[test]
+fn external_cleanup_starts_outside_the_job_workspace() {
+    let lab = Lab::new();
+    let profile = lab.profile(json!([{
+        "name":"resource","command":["sh","-c","chmod 000 ."],
+        "cleanup":["sh","-c",
+            "test \"$PWD\" = \"$PATCHWEFT_STATE/attempts/$PATCHWEFT_ATTEMPT\" && chmod 700 \"$PATCHWEFT_WORKSPACE\" && printf drained > \"$PATCHWEFT_STATE/cleanup-cwd\""],
+        "report":{"kind":"command"}
+    }]));
+    let candidate = lab.submit(&lab.base, &profile, "agent");
+    lab.drain();
+    assert_eq!(lab.state(&candidate), "passed");
+    assert_eq!(
+        fs::read_to_string(lab.state.join("cleanup-cwd")).unwrap(),
+        "drained"
+    );
+}
+
+#[test]
 fn a_tracked_old_report_cannot_supply_fresh_passing_evidence() {
     let lab = Lab::new();
     let stale = json!({"success":true,"numTotalTests":1,"numFailedTests":0,"numFailedTestSuites":0,
@@ -669,6 +687,44 @@ fn a_shared_build_feeds_two_private_downstream_workspaces() {
             .count(),
         3
     );
+    let database = rusqlite::Connection::open(lab.state.join("state.sqlite")).unwrap();
+    let mut statement = database.prepare("SELECT body FROM attempts").unwrap();
+    let attempts: Vec<Value> = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+        .collect();
+    assert_eq!(attempts.len(), 3);
+    for attempt in attempts {
+        let result = &attempt["result"];
+        let preparation = &result["preparation"];
+        let expected_bytes = if result["job"] == "build" {
+            0
+        } else {
+            b"export const offset = 0;\n".len() as u64
+        };
+        assert_eq!(
+            preparation["dependency_copy_bytes"].as_u64(),
+            Some(expected_bytes)
+        );
+        assert_eq!(
+            preparation["dependency_files"].as_u64(),
+            Some(u64::from(expected_bytes > 0))
+        );
+        for field in [
+            "source_seconds",
+            "dependency_seconds",
+            "dependency_copy_seconds",
+        ] {
+            assert!(preparation[field].as_f64().unwrap() >= 0.0);
+        }
+        assert!(
+            preparation["dependency_copy_seconds"].as_f64().unwrap()
+                <= preparation["dependency_seconds"].as_f64().unwrap()
+        );
+        assert!(result["command_seconds"].as_f64().unwrap() >= 0.0);
+        assert!(result["artifact_capture_seconds"].as_f64().unwrap() >= 0.0);
+    }
 }
 
 #[test]

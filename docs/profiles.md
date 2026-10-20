@@ -117,4 +117,14 @@ such as project-owned containers. Uncertain cleanup retains capacity for an oper
 
 Jobs receive `PATCHWEFT_STATE`, `PATCHWEFT_ATTEMPT`, `PATCHWEFT_REVISION`,
 `PATCHWEFT_SLOTS` and `PATCHWEFT_REPORT`. Cleanup receives the state and attempt
-identifiers. These are trusted execution hooks, not a permission boundary.
+identifiers plus `PATCHWEFT_WORKSPACE`, the absolute job checkout path. Cleanup
+starts from the protected attempt directory so a job changing its checkout's
+permissions cannot prevent cleanup from launching. Use the explicit workspace
+variable when cleanup needs job files. These are trusted execution hooks, not a
+permission boundary.
+
+Attempt evidence records source preparation time, dependency verification and
+copy time, actual dependency bytes copied, command time and artifact-capture
+time. Copy time excludes archive extraction performed by job scripts. These
+measurements describe observed work; a shared request alone does not establish
+CPU or elapsed time saved.

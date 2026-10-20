@@ -332,7 +332,8 @@ fn prepare(
     profile: &RegisteredProfile,
     job: &Job,
     directory: &Path,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, Value)> {
+    let source_started = Instant::now();
     engine::verify_runtime(profile)?;
     let view = directory.join("work");
     if job.reuse == Reuse::Files {
@@ -356,6 +357,10 @@ fn prepare(
     } else {
         source::checkout(store, &action.revision, &view)?;
     }
+    let source_seconds = source_started.elapsed().as_secs_f64();
+    let dependencies_started = Instant::now();
+    let mut copied_bytes = 0_u64;
+    let mut copy_seconds = 0.0;
     let mut restored = BTreeMap::new();
     for dependency in &action.dependencies {
         ensure!(
@@ -401,17 +406,28 @@ fn prepare(
                 "dependency artifact would overwrite source: {name}"
             );
             contained_parent(&view, &target)?;
-            fs::copy(&source, &target)?;
+            let copy_started = Instant::now();
+            copied_bytes += fs::copy(&source, &target)?;
             fs::set_permissions(
                 &target,
                 fs::Permissions::from_mode(
                     expected["mode"].as_u64().context("artifact mode")? as u32
                 ),
             )?;
+            copy_seconds += copy_started.elapsed().as_secs_f64();
             restored.insert(name.clone(), hash);
         }
     }
-    Ok(view)
+    Ok((
+        view,
+        json!({
+            "source_seconds": source_seconds,
+            "dependency_seconds": dependencies_started.elapsed().as_secs_f64(),
+            "dependency_copy_seconds": copy_seconds,
+            "dependency_copy_bytes": copied_bytes,
+            "dependency_files": restored.len()
+        }),
+    ))
 }
 
 fn execute_command(
@@ -423,7 +439,7 @@ fn execute_command(
     directory: &Path,
 ) -> Result<(i32, Value)> {
     let started = Instant::now();
-    let view = prepare(store, action, profile, job, directory)?;
+    let (view, preparation) = prepare(store, action, profile, job, directory)?;
     let scratch = directory.join("scratch");
     let home = directory.join("home");
     fs::create_dir(&scratch)?;
@@ -469,6 +485,7 @@ fn execute_command(
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
+    let command_started = Instant::now();
     let mut child = command.spawn()?;
     let mut status = None;
     let mut terminating: Option<(Instant, &str)> = None;
@@ -530,6 +547,7 @@ fn execute_command(
         }
         thread::sleep(Duration::from_millis(50));
     }
+    let command_seconds = command_started.elapsed().as_secs_f64();
     let mut code = status
         .context("child result missing")?
         .code()
@@ -543,6 +561,7 @@ fn execute_command(
     } else {
         json!({"execution_failed":true})
     };
+    let capture_started = Instant::now();
     let artifacts = if code == 0 {
         capture_artifacts(job, &view, directory)?
     } else {
@@ -551,6 +570,8 @@ fn execute_command(
     Ok((
         code,
         json!({"exit_code":code,"reason":reason,"elapsed_seconds":started.elapsed().as_secs_f64(),
+                    "command_seconds":command_seconds,"preparation":preparation,
+                    "artifact_capture_seconds":capture_started.elapsed().as_secs_f64(),
                     "report":report,"log_sha256":file_hash(&directory.join("output.log"))?,
                     "artifacts":artifacts,"revision":action.revision,"profile":profile.id,"job":job.name}),
     ))
@@ -727,9 +748,10 @@ fn cleanup_external(
         .envs(&job.environment)
         .env("PATCHWEFT_STATE", &store.root)
         .env("PATCHWEFT_ATTEMPT", &attempt.id)
+        .env("PATCHWEFT_WORKSPACE", &work)
         .env("TMPDIR", directory.join("scratch"))
         .env("HOME", directory.join("home"))
-        .current_dir(if work.is_dir() { &work } else { directory })
+        .current_dir(directory)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
