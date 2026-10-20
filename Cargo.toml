@@ -1,0 +1,42 @@
+[package]
+name = "patchweft"
+version = "0.1.0"
+edition = "2024"
+description = "Shared source and execution for coding agents"
+license = "MIT"
+repository = "https://github.com/lumenloop/patchweft"
+readme = "README.md"
+keywords = ["agents", "collaboration", "build", "testing"]
+categories = ["development-tools"]
+
+[[bin]]
+name = "patchweft"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+futures-core = "0.3"
+http-body-util = "0.1"
+libc = "0.2"
+quick-xml = "0.37"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "fs", "io-util"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+strip = true

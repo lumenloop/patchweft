@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+patchweft_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ ! -x "$patchweft_directory/target/release/patchweft" ]; then
+  printf 'Build first: cargo build --release --locked --manifest-path "%s/Cargo.toml"\n' "$patchweft_directory" >&2
+  exit 1
+fi
+exec "$patchweft_directory/target/release/patchweft" "$@"
