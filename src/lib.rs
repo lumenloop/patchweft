@@ -56,3 +56,16 @@ pub mod api;
 pub mod client;
 pub mod http;
 pub mod mcp;
+
+#[cfg(test)]
+mod receipt_tests {
+    #[test]
+    fn persisted_json_preserves_timestamp_values_exactly() {
+        // Durable replay must return the same value as the first response.
+        // This timestamp exposes a one-ULP change with approximate float parsing.
+        let receipt = serde_json::json!({"result": {"created": 1_792_511_574.900_662_7_f64}});
+        let stored = serde_json::to_string(&receipt).unwrap();
+        let replayed: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(replayed, receipt);
+    }
+}
