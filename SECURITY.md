@@ -11,7 +11,7 @@ is an administrative capability. See [connections](docs/connections.md) and
 [operations](docs/operations.md) for the full boundary.
 
 Report a suspected vulnerability through
-[GitHub's private vulnerability reporting](https://github.com/lumenloop/patchweft/security/advisories/new).
+[GitHub's private vulnerability reporting](https://github.com/rawritude/patchweft/security/advisories/new).
 Provide a minimal synthetic reproduction and affected version. Do not include
 credentials or private project data. Avoid posting an exploitable issue publicly
 before maintainers can assess it.

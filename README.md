@@ -58,7 +58,7 @@ sudo apt-get install build-essential git python3
 With rustup installed:
 
 ```bash
-git clone https://github.com/lumenloop/patchweft.git
+git clone https://github.com/rawritude/patchweft.git
 cd patchweft
 cargo build --release --locked
 ./target/release/patchweft --help
