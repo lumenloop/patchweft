@@ -33,6 +33,22 @@ cleanup keeps reservations held. Only after inspecting and draining those resour
 should an authorized operator use `recover --confirm-drained ATTEMPT_ID`.
 That command records the operator's assertion; it cannot establish the assertion.
 
+Before confirming drain, inspect the adapter's durable resource records and
+verify that every owned resource is absent, including resources created before
+startup failed and dependencies left after a parent was removed. Retry the
+adapter's cleanup when needed. Preserve the records until verification finishes;
+an exited command or a missing parent alone is insufficient. See the
+[external resource hook contract](profiles.md#external-resource-hooks).
+
+After a supervised command times out, its attempt records `reason: "timeout"`
+and exit code 124 in the command evidence. Its combined stdout/stderr remains
+in `attempts/ATTEMPT_ID/output.log`, with `log_sha256` in the result. A cleanup
+failure can change the attempt's final exit code and holds its reservation.
+Retain the failed attempt's log and evidence when retrying; a successful retry
+is a separate observation. Adapter subprocess wrappers should also preserve
+partial output on timeout or startup failure, rather than replacing it with
+only an exception message.
+
 `retry CANDIDATE_ID` retains successful obligations and retries failed,
 interrupted or canceled obligations. Publish a new revision when source changes.
 `resolve REPAIR_ID --candidate PASSING_CANDIDATE_ID` records repair attribution;

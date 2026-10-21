@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -626,6 +627,109 @@ fn failed_external_cleanup_holds_capacity_until_confirmed() {
     lab.call(&["retry", candidate["id"].as_str().unwrap()]);
     lab.drain();
     assert_eq!(lab.state(&candidate), "passed");
+}
+
+#[test]
+fn timeout_retains_output_and_cleanup_evidence_across_retry() {
+    let lab = Lab::new();
+    let profile = lab.profile(json!([{
+        "name":"resource", "slots":2, "timeout_seconds":15,
+        "command":["sh","-c",
+            "printf 'stdout before completion\n'; printf 'stderr before completion\n' >&2; \
+             printf '%s\n' \"$PATCHWEFT_ATTEMPT\" > \"$PATCHWEFT_STATE/external-resource\"; \
+             if test -f \"$PATCHWEFT_STATE/allow-completion\"; then printf 'retry completed\n'; exit 0; fi; \
+             exec sleep 60"],
+        "cleanup":["sh","-c",
+            "test \"$(cat \"$PATCHWEFT_STATE/external-resource\")\" = \"$PATCHWEFT_ATTEMPT\" && \
+             rm \"$PATCHWEFT_STATE/external-resource\" && test ! -e \"$PATCHWEFT_STATE/external-resource\" && \
+             printf '%s\n' \"$PATCHWEFT_ATTEMPT\" >> \"$PATCHWEFT_STATE/cleanup-records\""],
+        "report":{"kind":"command"}
+    }]));
+    let candidate = lab.submit(&lab.base, &profile, "agent");
+    lab.drain();
+    assert_eq!(lab.state(&candidate), "failed");
+
+    let database = rusqlite::Connection::open(lab.state.join("state.sqlite")).unwrap();
+    let (first_id, first_state, first_drained, first_body): (String, String, bool, String) =
+        database
+            .query_row("SELECT id,state,drained,body FROM attempts", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap();
+    assert_eq!(first_state, "failed");
+    assert!(first_drained);
+    let first: Value = serde_json::from_str(&first_body).unwrap();
+    assert_eq!(first["exit_code"], 124);
+    assert_eq!(first["result"]["reason"], "timeout");
+    assert_eq!(first["result"]["report"]["execution_failed"], true);
+    let log_path = lab
+        .state
+        .join("attempts")
+        .join(&first_id)
+        .join("output.log");
+    let log = fs::read(&log_path).unwrap();
+    let output = String::from_utf8(log.clone()).unwrap();
+    assert!(output.contains("stdout before completion\n"));
+    assert!(output.contains("stderr before completion\n"));
+    assert!(!output.contains("retry completed"));
+    assert_eq!(
+        first["result"]["log_sha256"],
+        format!("{:x}", Sha256::digest(&log))
+    );
+    assert!(!lab.state.join("external-resource").exists());
+    assert_eq!(
+        fs::read_to_string(lab.state.join("cleanup-records")).unwrap(),
+        format!("{first_id}\n")
+    );
+
+    // The retry consumes all available slots, so completion also checks release
+    // of the failed attempt's reservation after its cleanup succeeds.
+    fs::write(lab.state.join("allow-completion"), "ready").unwrap();
+    lab.call(&["retry", candidate["id"].as_str().unwrap()]);
+    lab.drain();
+    assert_eq!(
+        lab.state(&candidate),
+        "passed",
+        "{}",
+        database
+            .query_row(
+                "SELECT body FROM attempts WHERE id != ?",
+                [&first_id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap()
+    );
+    let (second_id, second_state, second_drained): (String, String, bool) = database
+        .query_row(
+            "SELECT id,state,drained FROM attempts WHERE id != ?",
+            [&first_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_ne!(first_id, second_id);
+    assert_eq!(second_state, "passed");
+    assert!(second_drained);
+    assert!(!lab.state.join("external-resource").exists());
+    assert_eq!(
+        fs::read_to_string(lab.state.join("cleanup-records")).unwrap(),
+        format!("{first_id}\n{second_id}\n")
+    );
+    assert_eq!(fs::read(&log_path).unwrap(), log);
+    let retained_body: String = database
+        .query_row(
+            "SELECT body FROM attempts WHERE id = ?",
+            [&first_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained_body, first_body);
+    assert_eq!(
+        database
+            .query_row("SELECT COUNT(*) FROM attempts", [], |row| row
+                .get::<_, u64>(0))
+            .unwrap(),
+        2
+    );
 }
 
 #[test]

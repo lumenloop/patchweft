@@ -115,6 +115,12 @@ to 1 slot, 1024 MiB reserved and 1800 seconds. Reservations are admission units,
 not hard CPU/RSS limits. Declare a bounded `cleanup` argv for external resources
 such as project-owned containers. Uncertain cleanup retains capacity for an operator.
 
+The timeout budget starts before source and dependency preparation. The worker
+checks it during command supervision; preparation is not independently
+interrupted by this timer. Allow for preparation when choosing the budget.
+Cleanup runs afterward, so the job timeout is not a hard bound on the complete
+attempt lifecycle.
+
 Jobs receive `PATCHWEFT_STATE`, `PATCHWEFT_ATTEMPT`, `PATCHWEFT_REVISION`,
 `PATCHWEFT_SLOTS` and `PATCHWEFT_REPORT`. Cleanup receives the state and attempt
 identifiers plus `PATCHWEFT_WORKSPACE`, the absolute job checkout path. Cleanup
@@ -128,3 +134,31 @@ copy time, actual dependency bytes copied, command time and artifact-capture
 time. Copy time excludes archive extraction performed by job scripts. These
 measurements describe observed work; a shared request alone does not establish
 CPU or elapsed time saved.
+
+## External resource hooks
+
+An adapter that starts containers, databases or other external resources owns
+their lifecycle. Patchweft supervises native descendants and calls the declared
+cleanup command; it cannot discover or verify those resources on the adapter's
+behalf. Make the cleanup contract explicit:
+
+- Assign an attempt-specific identity before creation. Persist actual resource
+  identifiers in a durable record outside the job checkout. If creation succeeds
+  before that record is written, cleanup must discover only resources bearing
+  that attempt's identity and persist the recovered identifiers before removal.
+- Record dependent resources, such as volumes, before deleting the parent that
+  exposes their identifiers. Keep those records through interrupted cleanup so
+  a later invocation can finish even when the parent is already absent.
+- Verify ownership before removal and verify absence afterward. Treat missing
+  owned resources as successful cleanup, while distinguishing absence from an
+  unavailable service or an inspection error. Never use global prune operations.
+- Make cleanup safe to repeat after partial creation, command failure, timeout,
+  cancellation or interruption. Return success only when the resources are
+  confirmed drained; an uncertain result must retain the reservation.
+
+Exercise the ordinary workload path when checking an execution boundary. A
+startup refusal proves that invocation was rejected, not that its payload's
+assertions ran. Keep the exact command, exit status and partial output for each
+probe. If a changed invocation is needed to execute the payload, record that
+change and limit claims to what it actually tested. Register a new profile when
+adapter tools or declared configuration change.
