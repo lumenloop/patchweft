@@ -41,7 +41,7 @@ A useful participant sequence is:
 
 Queries return their result directly; commands return an API envelope. Log bytes
 are base64 encoded. Failed actions have no deliverable artifacts: their artifact
-query currently returns a sanitized internal error. Passing actions have retained
+query returns HTTP 409 with code `artifacts_unavailable`. Passing actions have retained
 artifacts with source/attempt identity.
 
 The parent can end the host with `seal --root ...`. Sealing records elapsed time

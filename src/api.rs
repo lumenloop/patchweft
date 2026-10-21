@@ -966,7 +966,7 @@ fn query_inner(
         }
         Query::Artifacts { action } => {
             action_project(store, principal, action)?;
-            artifact_manifest(store, action).map_err(ApiError::internal)?
+            artifact_manifest(store, action)?
         }
         Query::Events {
             after,
@@ -1211,7 +1211,7 @@ impl Api {
         if !digest(sha256, 64) {
             return Err(ApiError::new(400, "invalid", "Invalid SHA-256."));
         }
-        let manifest = artifact_manifest(&store, action).map_err(ApiError::internal)?;
+        let manifest = artifact_manifest(&store, action)?;
         let files = manifest["files"]
             .as_object()
             .ok_or_else(|| ApiError::internal("invalid manifest"))?;
@@ -1249,21 +1249,29 @@ impl Api {
     }
 }
 
-fn artifact_manifest(store: &Store, action: &str) -> Result<Value> {
-    ensure!(
-        engine::action_state(&store.db, action)? == "passed",
-        "action has no passing artifacts"
-    );
-    let attempt: String =
-        store
-            .db
-            .query_row("SELECT attempt FROM actions WHERE id=?", [action], |r| {
-                r.get(0)
-            })?;
-    let row = store.attempt(&attempt)?;
-    let files = row.result.context("missing result")?["artifacts"].clone();
-    ensure!(files.is_object(), "missing artifact manifest");
+fn artifact_manifest(store: &Store, action: &str) -> ApiResult<Value> {
+    if engine::action_state(&store.db, action).map_err(ApiError::internal)? != "passed" {
+        return Err(ApiError::new(
+            409,
+            "artifacts_unavailable",
+            "Artifacts are available only for a passing action. Inspect its status and logs.",
+        ));
+    }
+    let attempt: String = store
+        .db
+        .query_row("SELECT attempt FROM actions WHERE id=?", [action], |r| {
+            r.get(0)
+        })
+        .map_err(ApiError::internal)?;
+    let row = store.attempt(&attempt).map_err(ApiError::internal)?;
+    let files = row
+        .result
+        .ok_or_else(|| ApiError::internal("missing result"))?["artifacts"]
+        .clone();
+    if !files.is_object() {
+        return Err(ApiError::internal("missing artifact manifest"));
+    }
     Ok(
-        json!({"action":action,"revision":store.action(action)?.revision,"attempt":attempt,"files":files}),
+        json!({"action":action,"revision":store.action(action).map_err(ApiError::internal)?.revision,"attempt":attempt,"files":files}),
     )
 }

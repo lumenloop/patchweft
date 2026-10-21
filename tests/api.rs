@@ -519,6 +519,168 @@ async fn send(
 }
 
 #[tokio::test]
+async fn unavailable_artifacts_are_a_scoped_state_error_and_failed_logs_remain_readable() {
+    let lab = Lab::new();
+    let store = Store::open(&lab.root).unwrap();
+    let profile_path = lab.root.join("artifact-profile.json");
+    fs::write(
+        &profile_path,
+        json!({"version":1,"name":"artifact-states","tools":{"sh":"/usr/bin/sh"},"jobs":[
+            {"name":"fail","command":["sh","-c","printf 'failed fixture\\n'; printf 'not retained\\n' > report.txt; exit 1"],
+             "artifacts":["report.txt"],"report":{"kind":"command"}},
+            {"name":"pass","command":["sh","-c","printf 'artifact\\n' > report.txt"],
+             "artifacts":["report.txt"],"report":{"kind":"command"}}
+        ]}).to_string(),
+    ).unwrap();
+    let registered = Process::new(env!("CARGO_BIN_EXE_patchweft"))
+        .arg("--state")
+        .arg(&lab.root)
+        .arg("register")
+        .arg(&profile_path)
+        .output()
+        .unwrap();
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
+    let profile: Value = serde_json::from_slice(&registered.stdout).unwrap();
+    let profile_id = profile["id"].as_str().unwrap();
+    let request = |job: &str| {
+        let output = Process::new(env!("CARGO_BIN_EXE_patchweft"))
+            .arg("--state")
+            .arg(&lab.root)
+            .args([
+                "request",
+                "--revision",
+                &lab.a,
+                "--profile",
+                profile_id,
+                "--job",
+                job,
+                "--owner",
+                "fixture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<patchweft::model::Action>(&output.stdout).unwrap()
+    };
+    let failed = request("fail");
+    let passed = request("pass");
+    let digest = hash(b"artifact\n");
+    for after_execution in [false, true] {
+        if after_execution {
+            let output = Process::new(env!("CARGO_BIN_EXE_patchweft"))
+                .arg("--state")
+                .arg(&lab.root)
+                .args(["worker", "--drain"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                engine::action_state(&store.db, &failed.id).unwrap(),
+                "failed"
+            );
+        }
+        let query = json!({"op":"artifacts","action":failed.id});
+        let (status, body) = send(lab.router(), "/v1/query", query.clone(), Some(ALICE), &[]).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "artifacts_unavailable");
+        assert_eq!(
+            send(lab.router(), "/v1/query", query, Some(BOB), &[])
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let response = lab
+            .router()
+            .oneshot(
+                Request::get(format!("/v1/artifacts/{}/{digest}", failed.id))
+                    .header("authorization", format!("Bearer {ALICE}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"]["code"], "artifacts_unavailable");
+        assert_eq!(
+            lab.api
+                .artifact(BOB, &failed.id, &digest)
+                .unwrap_err()
+                .status,
+            403
+        );
+    }
+    let action = lab
+        .api
+        .query(
+            ALICE,
+            &Query::Action {
+                action: failed.id.clone(),
+            },
+        )
+        .unwrap();
+    let log = lab
+        .api
+        .query(
+            ALICE,
+            &Query::Logs {
+                attempt: action["attempt"].as_str().unwrap().into(),
+                offset: 0,
+                limit: 1024,
+            },
+        )
+        .unwrap();
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(log["data"].as_str().unwrap())
+        .unwrap();
+    assert!(String::from_utf8(bytes).unwrap().contains("failed fixture"));
+    let manifest = lab
+        .api
+        .query(
+            ALICE,
+            &Query::Artifacts {
+                action: passed.id.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(manifest["files"]["report.txt"]["sha256"], digest);
+    use std::io::Read;
+    let mut contents = String::new();
+    lab.api
+        .artifact(ALICE, &passed.id, &digest)
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+    assert_eq!(contents, "artifact\n");
+    assert_eq!(
+        lab.api
+            .query(
+                ALICE,
+                &Query::Artifacts {
+                    action: "unknown-action".into()
+                }
+            )
+            .unwrap_err()
+            .status,
+        403
+    );
+}
+
+#[tokio::test]
 async fn http_rejects_spoofed_identity_origin_and_missing_credentials() {
     let lab = Lab::new();
     let command = serde_json::to_value(lab.command()).unwrap();

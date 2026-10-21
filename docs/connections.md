@@ -166,6 +166,10 @@ includes a SHA-256 header checked by the CLI. Artifact downloads use
 GET `/v1/artifacts/ACTION_ID/SHA256`, with membership in an authorized passing manifest
 and content verified before streaming. The CLI also verifies content, safe relative
 paths and recorded modes, then atomically publishes a new destination directory.
+For an authorized action that has not passed, both the manifest query and download
+route return HTTP 409 with code `artifacts_unavailable`. Inspect its status and logs;
+failed work does not produce a deliverable artifact manifest. This replaces the
+previous generic HTTP 500 response. Unknown or out-of-scope actions remain forbidden.
 Existing destinations are never overwritten. Reuse the same bundle file on publication
 retry: independently regenerated bundle bytes need not have the same SHA-256.
 
