@@ -220,12 +220,26 @@ compatibility with every vendor's MCP client have not been established.
 
 ## Bounds and measurement
 
-The server bounds HTTP calls and actual blocking operations separately at 64, event
-streams at 32, and transfers at four. Ordinary requests have a 35-second server
+The server admits up to 64 authenticated HTTP calls, with eight per principal.
+Different credentials for one principal share that budget. Authentication has
+16 separate execution slots, with two per credential. Ordinary application work
+has 24 slots, with two per principal; queries (including event polls) and explicit
+action cancellation have eight separate slots, with four per principal. These
+limits apply to both HTTP and MCP. Excess work receives `503 busy` without joining
+an unbounded queue. Admission records are reclaimed when unused, with at most
+256 credential records and 256 principal records held at once.
+
+Event streams retain their existing 32-slot budget and release HTTP call admission
+after sending headers; subsequent polls still use the control execution budget.
+This is a limit on open streams, not simultaneous polls from one principal. If a
+poll is refused after headers, the stream emits an error event and closes instead
+of changing its HTTP status.
+Transfers are limited to four. Ordinary requests have a 35-second server
 deadline; receiving an upload or preparing a source download has a 600-second deadline.
 The remote CLI allows 600 seconds for each transfer, including response-body download.
 The server does not impose that deadline on a download body after sending its headers.
-Blocking work retains its permits after a caller disconnects or a deadline expires.
+Application blocking closures retain their admission and execution permits after
+a caller disconnects or a deadline expires.
 An upload's disk writer owns its temporary file and transfer permit until writing and
 finalization finish, even if the client cancels; incomplete streams are discarded.
 Download permits remain held through the response stream. Upload ingress is also
@@ -244,3 +258,8 @@ microseconds waiting for the command gate/SQLite transaction, executing commands
 committing. These are process-local counters and reset when the API restarts. Worker
 processes have separate execution state; they are not included in API timing counters.
 Project permissions do not provide per-project latency isolation under overload.
+The control execution reserve protects against admitted ordinary work consuming
+all blocking capacity; it is not a latency guarantee. Slow request bodies can
+occupy a principal's shared HTTP budget, authentication has its own finite budget,
+and cancellation still waits for an in-progress database writer. Multiple busy
+principals, event polls, storage and host load can also exhaust shared resources.

@@ -1,7 +1,7 @@
 use crate::api::{Api, ApiError, Command, MAX_BUNDLE, Query, TRANSFER_TIMEOUT_SECONDS};
 use anyhow::{Result, ensure};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::{Body, Bytes},
     extract::{
         DefaultBodyLimit, Path, Query as UrlQuery, Request, State,
@@ -19,20 +19,72 @@ use http_body_util::BodyExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
-use tokio::{io::AsyncReadExt, sync::Semaphore};
+use tokio::{
+    io::AsyncReadExt,
+    sync::{OwnedSemaphorePermit, Semaphore},
+};
+
+// Capacity records live only while requests or detached work own them. The
+// registry itself is bounded, including when callers rotate invalid credentials.
+struct Budgets<T>(Mutex<BTreeMap<String, Weak<T>>>);
+impl<T> Budgets<T> {
+    fn new() -> Self {
+        Self(Mutex::new(BTreeMap::new()))
+    }
+    fn get(&self, key: String, create: impl FnOnce() -> T) -> Result<Arc<T>, ApiError> {
+        let mut entries = self
+            .0
+            .lock()
+            .map_err(|_| ApiError::internal("admission lock"))?;
+        if let Some(value) = entries.get(&key).and_then(Weak::upgrade) {
+            return Ok(value);
+        }
+        entries.retain(|_, value| value.strong_count() > 0);
+        if entries.len() >= 256 {
+            return Err(busy());
+        }
+        let value = Arc::new(create());
+        entries.insert(key, Arc::downgrade(&value));
+        Ok(value)
+    }
+}
+
+struct PrincipalBudget {
+    requests: Arc<Semaphore>,
+    work: Arc<Semaphore>,
+    control: Arc<Semaphore>,
+}
+impl PrincipalBudget {
+    fn new() -> Self {
+        Self {
+            requests: Arc::new(Semaphore::new(8)),
+            work: Arc::new(Semaphore::new(2)),
+            control: Arc::new(Semaphore::new(4)),
+        }
+    }
+}
+struct Admission {
+    principal: Arc<PrincipalBudget>,
+    _request: Option<OwnedSemaphorePermit>,
+    _call: Option<OwnedSemaphorePermit>,
+}
 
 #[derive(Clone)]
 pub struct Service {
     pub api: Arc<Api>,
     calls: Arc<Semaphore>,
     work: Arc<Semaphore>,
+    control: Arc<Semaphore>,
+    authentication: Arc<Semaphore>,
+    credentials: Arc<Budgets<Arc<Semaphore>>>,
+    principals: Arc<Budgets<PrincipalBudget>>,
     ingress: Arc<Semaphore>,
     streams: Arc<Semaphore>,
     transfers: Arc<Semaphore>,
@@ -45,7 +97,13 @@ impl Service {
             calls: Arc::new(Semaphore::new(64)),
             streams: Arc::new(Semaphore::new(32)),
             transfers: Arc::new(Semaphore::new(4)),
-            work: Arc::new(Semaphore::new(64)),
+            // Together these allow at most 48 blocking application operations,
+            // leaving room in the runtime's 64-thread pool for file streaming.
+            work: Arc::new(Semaphore::new(24)),
+            control: Arc::new(Semaphore::new(8)),
+            authentication: Arc::new(Semaphore::new(16)),
+            credentials: Arc::new(Budgets::new()),
+            principals: Arc::new(Budgets::new()),
             ingress: Arc::new(Semaphore::new(4)),
             origins,
         }
@@ -94,7 +152,7 @@ fn busy() -> ApiError {
     )
 }
 
-async fn boundary(State(service): State<Service>, request: Request, next: Next) -> Response {
+async fn boundary(State(service): State<Service>, mut request: Request, next: Next) -> Response {
     if let Some(origin) = request.headers().get("origin")
         && origin
             .to_str()
@@ -107,10 +165,48 @@ async fn boundary(State(service): State<Service>, request: Request, next: Next) 
         Ok(t) => t,
         Err(e) => return e.into_response(),
     };
-    let permit = match service.calls.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => return busy().into_response(),
+    let admitted = async {
+        // Bound authentication before opening a database connection. Store only
+        // the digest for this accounting; authentication is still checked live.
+        let credential = service.credentials.get(crate::hash(token.as_bytes()), || {
+            Arc::new(Semaphore::new(2))
+        })?;
+        let credential_permit = credential
+            .as_ref()
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| busy())?;
+        let api = service.api.clone();
+        let principal = blocking(service.authentication.clone(), move || {
+            let _credential = credential;
+            let _permit = credential_permit;
+            api.authenticate(&token)
+        })
+        .await?;
+        // Different credentials for one principal share these budgets.
+        let principal = service.principals.get(principal.id, PrincipalBudget::new)?;
+        let request = principal
+            .requests
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| busy())?;
+        let call = service
+            .calls
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| busy())?;
+        Ok::<_, ApiError>(Arc::new(Admission {
+            principal,
+            _request: Some(request),
+            _call: Some(call),
+        }))
+    }
+    .await;
+    let admission = match admitted {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
     };
+    request.extensions_mut().insert(admission);
     let transfer = if request.uri().path().starts_with("/v1/blobs/") {
         match service.ingress.clone().try_acquire_owned() {
             Ok(p) => Some(p),
@@ -119,10 +215,6 @@ async fn boundary(State(service): State<Service>, request: Request, next: Next) 
     } else {
         None
     };
-    let api = service.api.clone();
-    if let Err(error) = blocking(service.work.clone(), move || api.authenticate(&token)).await {
-        return error.into_response();
-    }
     let transfer_request = request.uri().path().starts_with("/v1/blobs/")
         || (request.uri().path().starts_with("/v1/revisions/")
             && request.uri().path().ends_with("/bundle"));
@@ -142,7 +234,6 @@ async fn boundary(State(service): State<Service>, request: Request, next: Next) 
             .into_response(),
         };
     drop(transfer);
-    drop(permit);
     response
 }
 
@@ -190,8 +281,39 @@ fn start_blocking<T: Send + 'static>(
         work()
     }))
 }
+
+fn admitted_work<T: Send + 'static>(
+    service: &Service,
+    admission: Arc<Admission>,
+    control: bool,
+    work: impl FnOnce() -> std::result::Result<T, ApiError> + Send + 'static,
+) -> std::result::Result<tokio::task::JoinHandle<std::result::Result<T, ApiError>>, ApiError> {
+    let (local, global) = if control {
+        (&admission.principal.control, &service.control)
+    } else {
+        (&admission.principal.work, &service.work)
+    };
+    let permit = local.clone().try_acquire_owned().map_err(|_| busy())?;
+    start_blocking(global.clone(), move || {
+        // Preserve both request and execution admission after a disconnect.
+        let _admission = admission;
+        let _permit = permit;
+        work()
+    })
+}
+async fn admitted<T: Send + 'static>(
+    service: &Service,
+    admission: Arc<Admission>,
+    control: bool,
+    work: impl FnOnce() -> std::result::Result<T, ApiError> + Send + 'static,
+) -> std::result::Result<T, ApiError> {
+    admitted_work(service, admission, control, work)?
+        .await
+        .map_err(|_| ApiError::new(500, "internal", "Application worker failed."))?
+}
 async fn commands(
     State(service): State<Service>,
+    Extension(admission): Extension<Arc<Admission>>,
     headers: HeaderMap,
     body: std::result::Result<Json<Command>, JsonRejection>,
 ) -> Response {
@@ -199,8 +321,10 @@ async fn commands(
         let command = parse_json(body)?;
         let token = token(&headers)?;
         let key = header(&headers, "idempotency-key")?.to_owned();
-        blocking(service.work.clone(), move || {
-            service.api.command(&token, &key, &command)
+        let control = matches!(command, Command::Cancel { .. });
+        let api = service.api.clone();
+        admitted(&service, admission, control, move || {
+            api.command(&token, &key, &command)
         })
         .await
     }
@@ -217,16 +341,15 @@ async fn commands(
 }
 async fn queries(
     State(service): State<Service>,
+    Extension(admission): Extension<Arc<Admission>>,
     headers: HeaderMap,
     body: std::result::Result<Json<Query>, JsonRejection>,
 ) -> Response {
     let result = async {
         let query = parse_json(body)?;
         let token = token(&headers)?;
-        blocking(service.work.clone(), move || {
-            service.api.query(&token, &query)
-        })
-        .await
+        let api = service.api.clone();
+        admitted(&service, admission, true, move || api.query(&token, &query)).await
     }
     .await;
     match result {
@@ -247,6 +370,7 @@ fn event_limit() -> usize {
 }
 async fn events(
     State(service): State<Service>,
+    Extension(admission): Extension<Arc<Admission>>,
     headers: HeaderMap,
     parameters: std::result::Result<UrlQuery<EventParameters>, QueryRejection>,
 ) -> Response {
@@ -261,10 +385,16 @@ async fn events(
         let after=header_cursor.or(parameters.after).unwrap_or(0);
         let query=Query::Events {after,project:parameters.project.clone(),limit:parameters.limit};
         let api=service.api.clone(); let credential=token.clone();
-        let first=blocking(service.work.clone(),move||api.query(&credential,&query)).await?;
+        let first=admitted(&service,admission.clone(),true,move||api.query(&credential,&query)).await?;
         let wants_stream=headers.get("accept").and_then(|h|h.to_str().ok()).is_some_and(|h|h.contains("text/event-stream"));
         if !wants_stream { return Ok(Json(json!({"api_version":"1","result":first})).into_response()); }
         let permit=service.streams.clone().try_acquire_owned().map_err(|_|busy())?;
+        // Established streams use their own 32-slot budget. Keep the principal
+        // record for bounded polling, but release HTTP request admission when
+        // headers are returned, preserving the existing stream capacity.
+        let admission=Arc::new(Admission {
+            principal: admission.principal.clone(), _request: None, _call: None,
+        });
         let stream=async_stream::stream! {
             let _permit=permit;
             let mut cursor=after;
@@ -286,7 +416,7 @@ async fn events(
                 if page["more"]!=true { tokio::time::sleep(Duration::from_millis(250)).await; }
                 let api=service.api.clone(); let credential=token.clone();
                 let query=Query::Events {after:cursor,project:parameters.project.clone(),limit:parameters.limit};
-                match blocking(service.work.clone(),move||api.query(&credential,&query)).await {
+                match admitted(&service,admission.clone(),true,move||api.query(&credential,&query)).await {
                     Ok(value)=>page=value,
                     Err(error)=>{
                         yield Ok(Event::default().event("error").data(error.body().to_string()));
@@ -301,6 +431,7 @@ async fn events(
 }
 async fn upload(
     State(service): State<Service>,
+    Extension(admission): Extension<Arc<Admission>>,
     Path(sha256): Path<String>,
     request: Request,
 ) -> Response {
@@ -327,15 +458,16 @@ async fn upload(
         let api = service.api.clone();
         let credential = token.clone();
         let digest = sha256.clone();
-        let mut temp = blocking(service.work.clone(), move || {
+        let mut temp = admitted(&service, admission.clone(), false, move || {
             api.begin_upload(&credential, &digest)
         })
         .await?;
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        let writer = start_blocking(service.work.clone(), move || {
+        let api = service.api.clone();
+        let writer = admitted_work(&service, admission, false, move || {
             let _transfer = transfer;
             receive_upload(receiver, temp.as_file_mut())?;
-            service.api.finish_upload(&token, &sha256, temp)
+            api.finish_upload(&token, &sha256, temp)
         })?;
         let received = spool_upload(request.into_body(), sender, MAX_BUNDLE).await;
         if let Err(error) = received
@@ -414,10 +546,11 @@ async fn stream_file(
     file: std::fs::File,
     keep: Option<tempfile::TempDir>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    admission: Arc<Admission>,
 ) -> Response {
     let mut file = tokio::fs::File::from_std(file);
     let stream = async_stream::try_stream! {
-        let _keep=keep; let _permit=permit;
+        let _keep=keep; let _permit=permit; let _admission=admission;
         loop {
             let mut bytes=vec![0u8;65536];
             let count=file.read(&mut bytes).await?;
@@ -437,6 +570,7 @@ async fn stream_file(
 }
 async fn bundle(
     State(service): State<Service>,
+    Extension(admission): Extension<Arc<Admission>>,
     headers: HeaderMap,
     Path(revision): Path<String>,
 ) -> Response {
@@ -447,16 +581,18 @@ async fn bundle(
             .try_acquire_owned()
             .map_err(|_| busy())?;
         let token = token(&headers)?;
-        let (temp, file, sha256, permit) = blocking(service.work.clone(), move || {
-            let (temp, path) = service.api.source_bundle(&token, &revision)?;
-            let sha256 = crate::file_hash(&path)
-                .map_err(|_| ApiError::new(500, "internal", "Bundle could not be hashed."))?;
-            let file = std::fs::File::open(path)
-                .map_err(|_| ApiError::new(500, "internal", "Bundle could not be opened."))?;
-            Ok((temp, file, sha256, permit))
-        })
-        .await?;
-        let mut response = stream_file(file, Some(temp), permit).await;
+        let api = service.api.clone();
+        let (temp, file, sha256, permit) =
+            admitted(&service, admission.clone(), false, move || {
+                let (temp, path) = api.source_bundle(&token, &revision)?;
+                let sha256 = crate::file_hash(&path)
+                    .map_err(|_| ApiError::new(500, "internal", "Bundle could not be hashed."))?;
+                let file = std::fs::File::open(path)
+                    .map_err(|_| ApiError::new(500, "internal", "Bundle could not be opened."))?;
+                Ok((temp, file, sha256, permit))
+            })
+            .await?;
+        let mut response = stream_file(file, Some(temp), permit, admission).await;
         response
             .headers_mut()
             .insert("x-content-sha256", sha256.parse().expect("digest header"));
@@ -467,6 +603,7 @@ async fn bundle(
 }
 async fn artifact(
     State(service): State<Service>,
+    Extension(admission): Extension<Arc<Admission>>,
     headers: HeaderMap,
     Path((action, sha256)): Path<(String, String)>,
 ) -> Response {
@@ -477,25 +614,29 @@ async fn artifact(
             .try_acquire_owned()
             .map_err(|_| busy())?;
         let token = token(&headers)?;
-        let (file, permit) = blocking(service.work.clone(), move || {
-            Ok((service.api.artifact(&token, &action, &sha256)?, permit))
+        let api = service.api.clone();
+        let (file, permit) = admitted(&service, admission.clone(), false, move || {
+            Ok((api.artifact(&token, &action, &sha256)?, permit))
         })
         .await?;
-        Ok::<_, ApiError>(stream_file(file, None, permit).await)
+        Ok::<_, ApiError>(stream_file(file, None, permit, admission).await)
     }
     .await;
     result.unwrap_or_else(IntoResponse::into_response)
 }
 async fn mcp(
     State(service): State<Service>,
+    Extension(admission): Extension<Arc<Admission>>,
     headers: HeaderMap,
     body: std::result::Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let result = async {
         let message = parse_json(body)?;
         let token = token(&headers)?;
-        blocking(service.work.clone(), move || {
-            Ok(crate::mcp::http(&service.api, &token, &headers, message))
+        let control = mcp_control(&message);
+        let api = service.api.clone();
+        admitted(&service, admission, control, move || {
+            Ok(crate::mcp::http(&api, &token, &headers, message))
         })
         .await
     }
@@ -511,6 +652,18 @@ async fn mcp(
             .into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+fn mcp_control(message: &Value) -> bool {
+    message["method"] == "tools/call"
+        && (message["params"]["name"] == "patchweft_query"
+            || (message["params"]["name"] == "patchweft_command"
+                && matches!(
+                    serde_json::from_value::<Command>(
+                        message["params"]["arguments"]["command"].clone()
+                    ),
+                    Ok(Command::Cancel { .. })
+                )))
 }
 
 pub fn serve(
@@ -588,6 +741,224 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
+
+    const FIXTURE_TOKEN: &str = "public-control-admission-fixture";
+    const SECOND_TOKEN: &str = "public-control-admission-second-credential";
+
+    fn service_fixture() -> (tempfile::TempDir, Service) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::init(temp.path(), 2, 1024).unwrap();
+        let api = Arc::new(Api::open(temp.path()).unwrap());
+        let policy = json!({"id":"alice","projects":[],"profiles":[],
+            "roles":["read","write"],"max_pending":100});
+        store
+            .db
+            .execute(
+                "INSERT INTO api_principals VALUES ('alice',?)",
+                [policy.to_string()],
+            )
+            .unwrap();
+        for token in [FIXTURE_TOKEN, SECOND_TOKEN] {
+            store
+                .db
+                .execute(
+                    "INSERT INTO api_credentials VALUES (?,'alice')",
+                    [crate::hash(token.as_bytes())],
+                )
+                .unwrap();
+        }
+        (temp, Service::new(api, BTreeSet::new()))
+    }
+
+    fn admission(service: &Service, id: &str) -> Arc<Admission> {
+        let principal = service
+            .principals
+            .get(id.into(), PrincipalBudget::new)
+            .unwrap();
+        Arc::new(Admission {
+            _request: Some(principal.requests.clone().try_acquire_owned().unwrap()),
+            _call: Some(service.calls.clone().try_acquire_owned().unwrap()),
+            principal,
+        })
+    }
+
+    async fn fixture_request(service: &Service, token: &str, path: &str, body: Value) -> Response {
+        router(service.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "control-fixture")
+                    .header("accept", "application/json, text/event-stream")
+                    .header("mcp-protocol-version", crate::mcp::LEGACY)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn saturated_mutations_leave_http_and_mcp_control_capacity() {
+        let (_temp, service) = service_fixture();
+        let _ordinary = service.work.clone().acquire_many_owned(24).await.unwrap();
+        let mutation = json!({"op":"request","revision":"absent","profile":"absent","job":"check"});
+        assert_eq!(
+            fixture_request(&service, FIXTURE_TOKEN, "/v1/commands", mutation.clone())
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            fixture_request(
+                &service,
+                FIXTURE_TOKEN,
+                "/v1/query",
+                json!({"op":"projects"})
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let cancel = Command::Cancel {
+            action: "absent".into(),
+        };
+        let expected = service
+            .api
+            .command(FIXTURE_TOKEN, "expected", &cancel)
+            .unwrap_err();
+        assert_ne!(expected.status, 503);
+        assert_eq!(
+            fixture_request(
+                &service,
+                FIXTURE_TOKEN,
+                "/v1/commands",
+                serde_json::to_value(&cancel).unwrap()
+            )
+            .await
+            .status()
+            .as_u16(),
+            expected.status
+        );
+        for (name, arguments) in [
+            ("patchweft_query", json!({"op":"projects"})),
+            (
+                "patchweft_command",
+                json!({"idempotency_key":"mcp-cancel","command":cancel}),
+            ),
+        ] {
+            let response = fixture_request(&service, FIXTURE_TOKEN, "/mcp", json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}})).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            if name == "patchweft_query" {
+                assert_eq!(body["result"]["isError"], false);
+            } else {
+                assert_eq!(body["result"]["isError"], true);
+                assert_eq!(body["result"]["structuredContent"], expected.body());
+            }
+        }
+        let response = fixture_request(&service, FIXTURE_TOKEN, "/mcp", json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"patchweft_command","arguments":{"idempotency_key":"mcp-mutation","command":mutation}}})).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn principal_limits_survive_disconnect_and_span_credentials() {
+        let (_temp, service) = service_fixture();
+        let owner = admission(&service, "alice");
+        let mut releases = Vec::new();
+        for _ in 0..2 {
+            let (release, held) = std::sync::mpsc::channel();
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let worker = admitted_work(&service, owner.clone(), false, move || {
+                entered.send(()).unwrap();
+                held.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+            ready.await.unwrap();
+            // Abandon the join handle, as a disconnected HTTP future does.
+            drop(worker);
+            releases.push(release);
+        }
+        let principal = owner.principal.clone();
+        drop(owner);
+        assert_eq!(principal.work.available_permits(), 0);
+        assert_eq!(principal.requests.available_permits(), 7);
+        assert_eq!(service.calls.available_permits(), 63);
+        for token in [FIXTURE_TOKEN, SECOND_TOKEN] {
+            assert_eq!(
+                fixture_request(
+                    &service,
+                    token,
+                    "/v1/commands",
+                    json!({"op":"request","revision":"absent","profile":"absent","job":"check"})
+                )
+                .await
+                .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert_eq!(
+                fixture_request(&service, token, "/v1/query", json!({"op":"projects"}))
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        let other = admission(&service, "bob");
+        admitted(&service, other, false, || Ok(())).await.unwrap();
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        let all = tokio::time::timeout(
+            Duration::from_secs(5),
+            principal.work.clone().acquire_many_owned(2),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(all);
+        let requests = tokio::time::timeout(
+            Duration::from_secs(5),
+            principal.requests.clone().acquire_many_owned(8),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(requests);
+        let calls = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.calls.clone().acquire_many_owned(64),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(calls);
+        assert_eq!(principal.requests.available_permits(), 8);
+        assert_eq!(service.calls.available_permits(), 64);
+    }
+
+    #[test]
+    fn admission_registry_is_bounded_and_reclaims_idle_entries() {
+        let registry = Budgets::new();
+        let mut live = Vec::new();
+        for i in 0..256 {
+            live.push(registry.get(i.to_string(), || ()).unwrap());
+        }
+        assert_eq!(registry.get("new".into(), || ()).unwrap_err().status, 503);
+        assert!(Arc::ptr_eq(
+            &live[0],
+            &registry.get("0".into(), || ()).unwrap()
+        ));
+        live.clear();
+        registry.get("new".into(), || ()).unwrap();
+        assert_eq!(registry.0.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn streamed_upload_counts_frames_and_rejects_interrupted_bodies() {
         async fn spool(body: Body) -> (std::result::Result<(), ApiError>, tempfile::NamedTempFile) {
