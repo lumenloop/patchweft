@@ -606,6 +606,11 @@ pub fn execute(store: &mut Store, attempt_id: &str) -> Result<Value> {
     unsafe {
         // The dedicated process owns all adopted descendants; shared coordinators are never reapers.
         ensure!(
+            cfg!(target_os = "linux"),
+            "supervised execution requires Linux child-subreaper support"
+        );
+        #[cfg(target_os = "linux")]
+        ensure!(
             libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0,
             "subreaper unavailable"
         );
@@ -996,6 +1001,7 @@ pub fn publish_directory(source: &Path, destination: &Path) -> Result<()> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
     let source = CString::new(source.as_os_str().as_bytes())?;
     let destination = CString::new(destination.as_os_str().as_bytes())?;
+    #[cfg(target_os = "linux")]
     let result = unsafe {
         libc::renameat2(
             libc::AT_FDCWD,
@@ -1005,6 +1011,10 @@ pub fn publish_directory(source: &Path, destination: &Path) -> Result<()> {
             libc::RENAME_NOREPLACE,
         )
     };
+    // Remote clients deliver on macOS; RENAME_EXCL has the same no-overwrite semantics.
+    #[cfg(target_os = "macos")]
+    let result =
+        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
     if result != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
