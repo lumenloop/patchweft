@@ -347,6 +347,51 @@ fn principal_scope_covers_replays_dependencies_roles_and_cancellation() {
 }
 
 #[test]
+fn policy_update_changes_scope_without_rotating_the_credential() {
+    let lab = Lab::new();
+    let review = Command::Review {
+        revision: lab.a.clone(),
+    };
+    assert_eq!(
+        lab.api
+            .command(ALICE, "review-1", &review)
+            .unwrap_err()
+            .status,
+        403
+    );
+    let store = Store::open(&lab.root).unwrap();
+    let widened = Principal {
+        id: "alice".into(),
+        projects: BTreeSet::from([lab.pa.clone()]),
+        profiles: BTreeSet::from([lab.profile.clone()]),
+        roles: BTreeSet::from(["read".into(), "review".into()]),
+        max_pending: 1024,
+    };
+    assert_eq!(
+        api::update_policy(&store, widened).unwrap()["rotated"],
+        false
+    );
+    // The same credential now carries the new scope: review is allowed, write is gone.
+    lab.api.command(ALICE, "review-2", &review).unwrap();
+    assert_eq!(
+        lab.api
+            .command(ALICE, "request", &lab.command())
+            .unwrap_err()
+            .status,
+        403
+    );
+    let unknown = Principal {
+        id: "carol".into(),
+        projects: BTreeSet::from([lab.pa.clone()]),
+        profiles: BTreeSet::new(),
+        roles: BTreeSet::from(["read".into()]),
+        max_pending: 1,
+    };
+    assert!(api::update_policy(&store, unknown).is_err());
+    assert_eq!(lab.rows("api_credentials"), 2);
+}
+
+#[test]
 fn durable_domain_rejection_replays_without_creating_partial_work() {
     let lab = Lab::new();
     let command = Command::Request {

@@ -249,8 +249,7 @@ pub fn prepare(store: &Store) -> Result<()> {
     Ok(())
 }
 
-pub fn grant(store: &Store, principal: Principal, token_file: &Path) -> Result<Value> {
-    prepare(store)?;
+fn validate_policy(store: &Store, principal: &Principal) -> Result<()> {
     ensure!(
         !principal.id.is_empty() && principal.id.len() <= 128,
         "invalid principal name"
@@ -282,6 +281,12 @@ pub fn grant(store: &Store, principal: Principal, token_file: &Path) -> Result<V
     for profile in &principal.profiles {
         store.profile(profile)?;
     }
+    Ok(())
+}
+
+pub fn grant(store: &Store, principal: Principal, token_file: &Path) -> Result<Value> {
+    prepare(store)?;
+    validate_policy(store, &principal)?;
     let token = format!("patchweft_{}{}", unique(), unique());
     // Never print credential bytes. The operator gives this private file to a client.
     let mut file = OpenOptions::new()
@@ -313,6 +318,21 @@ pub fn grant(store: &Store, principal: Principal, token_file: &Path) -> Result<V
     }
     result?;
     Ok(json!({"principal":principal.id,"credential_file":token_file,"rotated":true}))
+}
+
+/// Replace an existing principal's scope; its issued credentials keep working.
+pub fn update_policy(store: &Store, principal: Principal) -> Result<Value> {
+    prepare(store)?;
+    validate_policy(store, &principal)?;
+    let changed = store.db.execute(
+        "UPDATE api_principals SET body=? WHERE id=?",
+        params![serde_json::to_string(&principal)?, principal.id],
+    )?;
+    ensure!(
+        changed == 1,
+        "unknown principal; grant issues its first credential"
+    );
+    Ok(json!({"principal":principal.id,"rotated":false}))
 }
 
 pub fn revoke(store: &Store, principal: &str) -> Result<Value> {

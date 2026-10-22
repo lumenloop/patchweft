@@ -38,7 +38,9 @@ patchweft remote --endpoint http://127.0.0.1:7412 \
 
 `grant` creates a new owner-private credential file without printing its contents.
 The store retains a digest. Reissuing a grant rotates that principal's credential and
-policy; `patchweft --state /private/patchweft revoke PRINCIPAL` revokes its credentials. Grant/revoke, project import,
+policy; `patchweft --state /private/patchweft policy --policy FILE` replaces an existing
+principal's scope (for example after registering a new profile) and leaves its issued
+credentials working; `patchweft --state /private/patchweft revoke PRINCIPAL` revokes its credentials. Grant/revoke, project import,
 profile registration and confirmed-drain recovery are local operator operations.
 
 Non-loopback listeners require `--tls-cert CERT --tls-key KEY`. Remote clients require
