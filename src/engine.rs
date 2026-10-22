@@ -211,50 +211,86 @@ pub fn recipes_for(profile: &RegisteredProfile, version: &str) -> Result<BTreeMa
         version == JOB_RECIPE,
         "unknown job recipe version: {version}"
     );
-    let definition = &profile.definition;
+    // Exhaustive destructuring: a new field fails to compile here until it is classified as
+    // identity or as metadata that never reaches a job's execution.
+    let RegisteredProfile {
+        id: _,
+        definition,
+        tools: tool_hashes,
+        engine,
+        platform,
+    } = profile;
+    let Profile {
+        version: _,
+        name: _,
+        certifying: _,
+        tools: tool_paths,
+        environment: profile_environment,
+        jobs,
+    } = definition;
     // Every tool directory is on every job's PATH, so every tool is part of every recipe.
-    let tools = definition
-        .tools
+    let tools = tool_paths
         .iter()
         .map(|(name, path)| {
-            let sha256 = profile.tools.get(name).context("tool identity missing")?;
+            let sha256 = tool_hashes.get(name).context("tool identity missing")?;
             Ok((name.clone(), json!({"path":path,"sha256":sha256})))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
     let mut memo: BTreeMap<String, String> = BTreeMap::new();
-    while memo.len() < definition.jobs.len() {
+    while memo.len() < jobs.len() {
         let before = memo.len();
-        for job in &definition.jobs {
-            if memo.contains_key(&job.name)
-                || !job.dependencies.iter().all(|d| memo.contains_key(d))
-            {
+        for job in jobs {
+            let Job {
+                name,
+                command,
+                dependencies,
+                slots,
+                // Reservations: scheduling only, never seen by the job.
+                memory_mb: _,
+                // In the action key, not the recipe (decision D6).
+                timeout_seconds: _,
+                reuse,
+                inputs,
+                // Why reuse is sound; wording is not identity.
+                audit: _,
+                environment: job_environment,
+                artifacts,
+                cleanup,
+                report,
+                export_slots,
+            } = job;
+            let Report {
+                kind,
+                path,
+                minimum,
+                allow_skips,
+            } = report;
+            if memo.contains_key(name) || !dependencies.iter().all(|d| memo.contains_key(d)) {
                 continue;
             }
-            let mut environment = definition.environment.clone();
-            environment.extend(job.environment.clone());
-            let dependencies: BTreeMap<_, _> = job
-                .dependencies
+            let mut environment = profile_environment.clone();
+            environment.extend(job_environment.clone());
+            let dependencies: BTreeMap<_, _> = dependencies
                 .iter()
                 .map(|d| (d.clone(), memo[d].clone()))
                 .collect();
             let recipe = identity(&json!({
                 "recipe": JOB_RECIPE,
-                "job": job.name,
-                "command": job.command,
-                "cleanup": job.cleanup,
+                "job": name,
+                "command": command,
+                "cleanup": cleanup,
                 "tools": tools,
                 "environment": environment,
-                "report": {"kind":job.report.kind,"path":job.report.path,
-                           "minimum":job.report.minimum,"allow_skips":job.report.allow_skips},
-                "artifacts": job.artifacts,
-                "reuse": job.reuse,
-                "inputs": job.inputs,
-                "slots": if job.export_slots { Some(job.slots) } else { None },
+                "report": {"kind":kind,"path":path,"minimum":minimum,"allow_skips":allow_skips},
+                "artifacts": artifacts,
+                "reuse": reuse,
+                "inputs": inputs,
+                "slots": if *export_slots { Some(*slots) } else { None },
                 "dependencies": dependencies,
-                "engine": profile.engine,
-                "platform": profile.platform,
+                "engine": engine,
+                "platform": platform,
             }))?;
-            memo.insert(job.name.clone(), recipe);
+            memo.insert(name.clone(), recipe);
         }
         ensure!(memo.len() != before, "profile contains a dependency cycle");
     }

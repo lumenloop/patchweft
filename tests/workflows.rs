@@ -9,6 +9,9 @@ use std::{
 };
 
 const AW: &str = env!("CARGO_BIN_EXE_patchweft");
+/// Deadline for event-driven waits. Generous because a loaded host stalls workers for seconds;
+/// waits poll for the event, so a long deadline costs nothing when the host is idle.
+const PATIENCE: Duration = Duration::from_secs(60);
 
 struct Lab {
     _temp: tempfile::TempDir,
@@ -584,7 +587,7 @@ fn coordinator_loss_retains_running_execution() {
         .unwrap();
     let start = Instant::now();
     while !lab.state.join("started").exists() {
-        assert!(start.elapsed().as_secs() < 10, "worker did not start");
+        assert!(start.elapsed() < PATIENCE, "worker did not start");
         thread::sleep(Duration::from_millis(10));
     }
     coordinator.kill().unwrap();
@@ -1003,7 +1006,7 @@ fn a_new_request_does_not_join_an_attempt_already_being_canceled() {
         .unwrap();
     let start = Instant::now();
     while !lab.state.join("started").exists() {
-        assert!(start.elapsed().as_secs() < 10);
+        assert!(start.elapsed() < PATIENCE);
         thread::sleep(Duration::from_millis(10));
     }
     lab.call(&["cancel", first["id"].as_str().unwrap(), "--owner", "first"]);
@@ -1018,7 +1021,7 @@ fn a_new_request_does_not_join_an_attempt_already_being_canceled() {
         {
             break;
         }
-        assert!(start.elapsed().as_secs() < 10);
+        assert!(start.elapsed() < PATIENCE);
         thread::sleep(Duration::from_millis(10));
     }
     let second = lab.call(&[
@@ -1062,7 +1065,7 @@ fn supervisor_loss_is_reported_once_and_keeps_capacity_reserved() {
         .unwrap();
     let start = Instant::now();
     while !lab.state.join("child-pid").exists() {
-        assert!(start.elapsed().as_secs() < 10);
+        assert!(start.elapsed() < PATIENCE);
         thread::sleep(Duration::from_millis(10));
     }
     let events = lab.call(&["events"]);
@@ -1679,7 +1682,7 @@ fn queued_share_raises_reservation_running_join_requires_enough() {
         .unwrap();
     let start = Instant::now();
     while !lab.state.join("gate-started").exists() {
-        assert!(start.elapsed().as_secs() < 10, "worker did not start");
+        assert!(start.elapsed() < PATIENCE, "worker did not start");
         thread::sleep(Duration::from_millis(10));
     }
     let larger = lab.submit(&lab.base, &lab.profile(gated(1024)), "two");

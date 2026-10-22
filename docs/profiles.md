@@ -110,6 +110,14 @@ Sharing and reuse are scoped to the project, job identity, evidence class and
 timeout. An existing audit therefore also covers other profiles with an
 identical job identity; audit wording is not part of identity.
 
+Registering a new profile no longer forces fresh runs: a job whose identity is
+unchanged reuses across profiles under `exact` or `files`. Identity covers the
+recipe's declared tools, environment and command, not the host. After a host
+change the recipe cannot see, such as a system compiler upgrade, a corepack
+update or an image pulled by a moving tag, force a fresh observation
+deliberately: change something in the recipe (for example an environment
+variable naming the host change) or set the job's `reuse` to `never`.
+
 The `audit` field records why completed reuse is sound. The engine checks that
 an audit exists, not whether its reasoning is true. Native execution still sees
 host libraries and can use the network. Hashing a compiler launcher does not hash
