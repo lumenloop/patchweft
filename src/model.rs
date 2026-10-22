@@ -34,6 +34,15 @@ fn default_memory() -> u32 {
 fn default_timeout() -> u64 {
     1800
 }
+fn yes() -> bool {
+    true
+}
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+/// Version tag of the frozen job recipe builder. A builder change needs a new tag.
+pub const JOB_RECIPE: &str = "patchweft.job/1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -91,6 +100,9 @@ pub struct Job {
     pub cleanup: Vec<String>,
     #[serde(default)]
     pub report: Report,
+    /// False makes `slots` a pure admission reservation: no `PATCHWEFT_SLOTS`, not in identity.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub export_slots: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +152,44 @@ impl State {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Reservation {
+    pub slots: u32,
+    pub memory_mb: u32,
+}
+
+impl Reservation {
+    pub fn max(self, other: Self) -> Self {
+        Self {
+            slots: self.slots.max(other.slots),
+            memory_mb: self.memory_mb.max(other.memory_mb),
+        }
+    }
+}
+
+impl From<&Job> for Reservation {
+    fn from(job: &Job) -> Self {
+        Self {
+            slots: job.slots,
+            memory_mb: job.memory_mb,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionIdentity {
+    pub version: String,
+    pub recipe: String,
+    pub class: String,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Origin {
+    pub owner: String,
+    pub context: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Action {
     pub id: String,
@@ -149,6 +199,12 @@ pub struct Action {
     pub job: String,
     pub dependencies: Vec<String>,
     pub created: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ActionIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation: Option<Reservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +216,12 @@ pub struct Candidate {
     pub prerequisites: Vec<String>,
     pub owner: String,
     pub created: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub not_retained: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,4 +239,6 @@ pub struct Attempt {
     pub ended: Option<f64>,
     pub exit_code: Option<i32>,
     pub result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
 }

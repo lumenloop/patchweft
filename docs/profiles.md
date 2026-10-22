@@ -4,7 +4,24 @@ A profile is an immutable, machine-specific definition of work. It names tool
 files, exact argv, environment, dependencies, resource reservations, reports,
 artifacts and optional cleanup. Registering it hashes the definition, declared
 tools, runner binary and platform. Changed tools or a new runner require a new
-registration. Use the returned profile ID in requests.
+registration. Use the returned profile ID in requests. The profile ID is the
+handle for permissions and certification policy.
+
+Each job also has a job identity, its recipe. A recipe hashes what the job's
+process can observe from the profile: job name, command and cleanup argv, every
+declared tool's path and bytes, the profile environment overlaid with the job
+environment, report contract, artifacts, reuse policy, input list, exported
+`slots`, the recipes of its dependencies, runner binary and platform. It leaves
+out `memory_mb`, `timeout_seconds`, `slots` with `export_slots: false`, `audit`,
+and the profile's name, version and `certifying` flag; `certifying` decides the
+evidence class instead. Sharing, completed reuse
+and retention compare recipes rather than profile IDs, so a reservation change
+does not change any job's identity.
+
+No hash covers system binaries such as those under `/usr/bin` and `/bin`,
+undeclared files next to declared tools, package-manager code managed by tools
+such as corepack, container images pulled by tag, host caches, the kernel, the
+network or which host executed the job.
 
 Commands run in private attempt directories with a cleared environment and
 private `HOME` and `TMPDIR`. `PATH` contains declared tool directories and system
@@ -82,19 +99,51 @@ NEW_DIRECTORY` and use the verified artifact.
 
 | Policy | Behavior |
 |---|---|
-| `inflight` (default) | Identical outstanding work shares one execution. A new direct request after completion starts a fresh observation. |
+| `inflight` (default) | Outstanding work is shared with any profile of the same evidence class whose job identity and timeout match. A new direct request after completion starts a fresh observation. |
 | `never` | Each request creates an independent action. |
-| `exact` | Completed results may be reused for the same complete source commit/history, profile and dependency identities. Requires an audit. |
+| `exact` | Completed results may be reused for the same complete source commit, job identity, timeout and dependency actions. Requires an audit. |
 | `files` | Materializes only explicitly listed regular source files; supports completed reuse across revisions with identical inputs. Requires an audit and no job dependencies. |
 
 Use `inputs` only with `files`, and include every source input, such as both the
 lockfile and preparation script. A files-only job has no implicit full checkout.
-Reuse remains scoped to the project and profile.
+Sharing and reuse are scoped to the project, job identity, evidence class and
+timeout. An existing audit therefore also covers other profiles with an
+identical job identity; audit wording is not part of identity.
 
 The `audit` field records why completed reuse is sound. The engine checks that
 an audit exists, not whether its reasoning is true. Native execution still sees
 host libraries and can use the network. Hashing a compiler launcher does not hash
 the compiler and all its libraries. Reusing the same result is not a fresh test.
+
+## Retain passed obligations after a profile change
+
+A new profile that only changes reservations, or changes some jobs, would
+otherwise rerun every obligation. Submit the same revision under the new profile
+with `--retain-from PREVIOUS_CANDIDATE_ID` (`retain_from` over the API) to keep
+the predecessor's passes whose identity still holds. A job keeps the
+predecessor's action only when all of these hold:
+
+- both candidates name the same revision; other revisions are refused. Over the
+  API, the caller also needs read access to the predecessor's project and a grant
+  for the predecessor's profile;
+- the job's reuse policy is not `never`;
+- the predecessor's action passed, recorded a job identity, and its evidence
+  class matches. Certifying and exploratory evidence never cross;
+- the job's recipe is unchanged, and the action consumed the same dependency
+  actions that this submission resolved. A rerun upstream reruns its consumers;
+- the observed time, which includes source preparation, is below the new timeout.
+
+Every other job takes the normal request path, with the new profile's
+reservation and the new candidate's own upstream actions. The candidate records
+`retained_from`, the `retained` jobs and a reason for each job in
+`not_retained`; each retention emits an `action.retained` event, and the frontier
+certificate marks those receipts as retained. A retained pass is the earlier
+observation, not a fresh test. Without `--retain-from`, a submission under the
+new profile takes no completed pass, except through the `exact` and `files`
+policies above.
+
+Job identity does not see host toolchain changes, such as a new system compiler,
+container image or package-manager release. Do not retain across those changes.
 
 ## Validate useful evidence
 
@@ -115,6 +164,19 @@ to 1 slot, 1024 MiB reserved and 1800 seconds. Reservations are admission units,
 not hard CPU/RSS limits. Declare a bounded `cleanup` argv for external resources
 such as project-owned containers. Uncertain cleanup retains capacity for an operator.
 
+`memory_mb`, and `slots` when `export_slots` is false, form a per-action
+reservation. A queued action shared by several profiles reserves the largest
+value each one requested, and retry raises it to the retrying candidate's
+profile. A running action is joined only when its attempt reserved at least as
+much; otherwise the requester gets a new action. Reservations never decrease;
+cancel and resubmit to lower one. The timeout is part of an action's identity,
+so profiles that differ only in timeout do not share outstanding work.
+
+By default `slots` is exported to the job as `PATCHWEFT_SLOTS` and is part of
+its identity. Set `"export_slots": false` when the job does not read that
+variable; slots then only control admission. Check the job's scripts and tools
+for `PATCHWEFT_SLOTS` before setting it.
+
 The timeout budget starts before source and dependency preparation. The worker
 checks it during command supervision; preparation is not independently
 interrupted by this timer. Allow for preparation when choosing the budget.
@@ -122,8 +184,9 @@ Cleanup runs afterward, so the job timeout is not a hard bound on the complete
 attempt lifecycle.
 
 Jobs receive `PATCHWEFT_STATE`, `PATCHWEFT_ATTEMPT`, `PATCHWEFT_REVISION`,
-`PATCHWEFT_SLOTS` and `PATCHWEFT_REPORT`. Cleanup receives the state and attempt
-identifiers plus `PATCHWEFT_WORKSPACE`, the absolute job checkout path. Cleanup
+`PATCHWEFT_SLOTS` (unless `export_slots` is false) and `PATCHWEFT_REPORT`.
+Cleanup receives the state and attempt identifiers plus `PATCHWEFT_WORKSPACE`,
+the absolute job checkout path. Cleanup
 starts from the protected attempt directory so a job changing its checkout's
 permissions cannot prevent cleanup from launching. Use the explicit workspace
 variable when cleanup needs job files. These are trusted execution hooks, not a
@@ -131,7 +194,10 @@ permission boundary.
 
 Attempt evidence records source preparation time, dependency verification and
 copy time, actual dependency bytes copied, command time and artifact-capture
-time. Copy time excludes archive extraction performed by job scripts. These
+time. It also records the executing profile, the job identity and action key,
+the applied budget, the hostname, and `timer_seconds`: the timeout clock when
+supervision ended, after detached descendants exited. Copy time excludes archive
+extraction performed by job scripts. These
 measurements describe observed work; a shared request alone does not establish
 CPU or elapsed time saved.
 
@@ -161,4 +227,6 @@ startup refusal proves that invocation was rejected, not that its payload's
 assertions ran. Keep the exact command, exit status and partial output for each
 probe. If a changed invocation is needed to execute the payload, record that
 change and limit claims to what it actually tested. Register a new profile when
-adapter tools or declared configuration change.
+tools or configuration change; resubmit with `--retain-from` to keep passes
+whose job identity is unchanged. Changing any declared tool's bytes changes
+every job's identity, because every tool directory is on every job's `PATH`.

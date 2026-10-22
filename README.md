@@ -33,16 +33,21 @@ flowchart LR
 
 - **Publish without waiting.** Checkpoint an editing workspace without changing its
   files, HEAD or staging. Other agents can consume that revision immediately.
-- **Share useful computation.** Identical outstanding requests share one execution.
+- **Share useful computation.** Outstanding requests with the same job identity and
+  timeout share one execution, even across profiles that differ only in memory
+  reservations (and in slots, for jobs that do not export them).
   Preparation artifacts feed separate downstream workspaces. Completed-result reuse
   requires an explicit policy and input audit.
 - **Check the combination.** A candidate names one revision, one execution profile
   and any real prerequisites. Passing changes still need validation when composed.
 - **Keep unrelated work moving.** Failed candidates create repair records. Retry
-  retains successful obligations; cancellation detaches the requesting owner's interest.
+  retains successful obligations; a resubmission under a changed profile can
+  explicitly retain passes whose job identity is unchanged. Cancellation detaches
+  the requesting owner's interest.
 - **Export recorded evidence.** Frontier promotion requires passing obligations,
   exact-revision review, ancestry and a compare-and-swap. The retained certificate
-  identifies the source, profile and execution evidence.
+  identifies the source, the certifying profile, and for each job the profile
+  that executed it, how it came to serve the candidate, and its evidence.
 
 ## Build and try
 
@@ -99,7 +104,8 @@ All commands return JSON for agents and scripts.
 Patchweft does not decide which tests are sufficient or prove that a reviewer is
 independent. Operators choose certifying profiles and review policy. Native jobs
 execute with the worker account's privileges; use a dedicated account with trusted
-code. Slot and memory reservations control admission, not operating-system limits.
+code. Slot and memory reservations control admission, not operating-system limits;
+a shared queued action reserves the largest amount its requesters asked for.
 
 The name combines *patch*, a source change, with *weft*, the threads woven across
 a fabric: independent changes forming a coherent codebase.

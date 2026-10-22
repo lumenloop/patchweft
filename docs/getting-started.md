@@ -97,11 +97,19 @@ patchweft --state /path/to/state retry CANDIDATE_ID --job verify
 Fix source by publishing a new revision and validating it. A retry alone does
 not change the source of the old candidate.
 
+If a job needs a larger reservation, such as more `memory_mb` after running out
+of memory, register a profile with that change and submit the same revision
+with `--retain-from CANDIDATE_ID`. Passed jobs whose identity is unchanged are
+kept as earlier observations; failed jobs and their consumers run again under
+the new reservation. See [retention](profiles.md#retain-passed-obligations-after-a-profile-change).
+
 ## Review and advance
 
 An exploratory profile cannot advance the validated frontier. Once you have
 chosen sufficient validation obligations, set `certifying` to `true`, register
 that profile, and submit the intended revision under the returned new profile ID.
+Exploratory evidence never serves a certifying candidate, so this reruns every
+job, even with `--retain-from`.
 
 After validation passes and an authorized reviewer has inspected that exact revision:
 

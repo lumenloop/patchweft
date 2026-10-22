@@ -27,7 +27,11 @@ connection guide maps remote commands and source/artifact transfer.
    work should remain free to proceed. Candidate resubmission is idempotent.
 7. **Handle failures locally.** Inspect `status`, `logs` and `repairs`; publish a repair
    revision and validate it. `retry` reruns failed obligations while retaining successful
-   ones. Cancel only your own interest when you no longer need an action.
+   ones. When the operator registers a changed profile, such as a larger reservation,
+   `submit --retain-from CANDIDATE_ID` (the MCP and API `retain_from` field) keeps passes
+   of that same revision whose job identity is unchanged. A retained pass is the earlier
+   observation, not a fresh test. Cancel only your own interest when you no longer need
+   an action.
 8. **Deliver by identity.** Retrieve artifacts with `deliver` into a new directory.
    Their revision/attempt identity matters; an older result must not overwrite your
    newer source. Use `events --after N` to follow progress without rereading all history.

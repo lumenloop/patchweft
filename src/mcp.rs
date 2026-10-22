@@ -39,9 +39,9 @@ fn tools() -> Value {
     // MCP requires an explicitly object-typed root, including schemas with oneOf.
     query_schema["type"] = json!("object");
     json!([
-        {"name":"patchweft_query","description":"Inspect permitted projects, profiles, revisions, actions, candidates, paginated events, logs, artifacts or a durable operation. Persist event cursors between calls.",
+        {"name":"patchweft_query","description":"Inspect permitted projects, profiles, revisions, actions, candidates, paginated events, logs, artifacts, a project's frontier certificate or a durable operation. Persist event cursors between calls.",
             "inputSchema":query_schema,"annotations":{"readOnlyHint":true}},
-        {"name":"patchweft_command","description":"Publish or compose revisions, request shared computation, submit validation, detach your interest, retry owned candidates, or perform an authorized review/promotion. Returns a durable handle promptly. Preserve idempotency_key when retrying a lost response. Closing this tool call never detaches accepted work.",
+        {"name":"patchweft_command","description":"Publish or compose revisions, request shared computation, submit validation, detach your interest, retry owned candidates, or perform an authorized review/promotion. Submit's optional retain_from keeps passed obligations of a candidate for the same revision whose job identity is unchanged; a retained pass is the earlier observation, not a fresh test. Returns a durable handle promptly. Preserve idempotency_key when retrying a lost response. Closing this tool call never detaches accepted work.",
             "inputSchema":schemars::schema_for!(CommandArguments),"annotations":{"readOnlyHint":false,"idempotentHint":true}}
     ])
 }

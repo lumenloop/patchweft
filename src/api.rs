@@ -55,6 +55,11 @@ pub enum Command {
         profile: String,
         #[serde(default)]
         requires: Vec<String>,
+        /// Retain passed obligations of a same-revision candidate whose job identity is
+        /// unchanged. Retained passes are earlier observations, not fresh tests.
+        // Skipped when absent: receipts hash the re-serialized command.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retain_from: Option<String>,
     },
     Cancel {
         action: String,
@@ -151,6 +156,9 @@ pub enum Query {
         id: String,
     },
     Metrics,
+    Frontier {
+        project: String,
+    },
 }
 fn default_limit() -> usize {
     100
@@ -428,12 +436,27 @@ fn authorize(store: &Store, principal: &Principal, command: &Command) -> ApiResu
                 } => {
                     profile(principal, id)?;
                     let p = revision_project(store, principal, revision)?;
-                    if let Command::Submit { requires, .. } = other {
+                    if let Command::Submit {
+                        requires,
+                        retain_from,
+                        ..
+                    } = other
+                    {
                         if requires.len() > 64 {
                             return Err(ApiError::new(400, "invalid", "Too many prerequisites."));
                         }
                         for id in requires {
                             candidate_projects(store, principal, id, &mut BTreeSet::new())?;
+                        }
+                        if let Some(source) = retain_from {
+                            if candidate_projects(store, principal, source, &mut BTreeSet::new())?
+                                != p
+                            {
+                                return Err(ApiError::forbidden());
+                            }
+                            // Retaining consumes evidence produced under the source's profile.
+                            let row = store.candidate(source).map_err(ApiError::internal)?;
+                            profile(principal, &row.profile)?;
                         }
                     }
                     Ok(p)
@@ -687,12 +710,14 @@ fn apply(store: &mut Store, principal: &Principal, command: &Command) -> Result<
             revision,
             profile,
             requires,
-        } => serde_json::to_value(engine::submit(
+            retain_from,
+        } => serde_json::to_value(engine::submit_retaining(
             store,
             revision,
             profile,
             &owner,
             requires.clone(),
+            retain_from.as_deref(),
         )?)?,
         Command::Cancel { action } => engine::cancel(store, action, &owner)?,
         Command::Retry { candidate, jobs } => {
@@ -833,9 +858,12 @@ fn query_inner(
             let mut values = vec![];
             for id in &principal.profiles {
                 let p = store.profile(id).map_err(ApiError::internal)?;
+                let recipes = engine::recipes(&p).map_err(ApiError::internal)?;
                 values.push(json!({"id":id,"name":p.definition.name,"certifying":p.definition.certifying,
                     "jobs":p.definition.jobs.iter().map(|j| json!({"name":j.name,"dependencies":j.dependencies,
-                        "slots":j.slots,"memory_mb":j.memory_mb,"reuse":j.reuse})).collect::<Vec<_>>()}));
+                        "slots":j.slots,"memory_mb":j.memory_mb,"reuse":j.reuse,
+                        "timeout_seconds":j.timeout_seconds,"export_slots":j.export_slots,
+                        "recipe":recipes[&j.name]})).collect::<Vec<_>>()}));
             }
             json!({"items":values})
         }
@@ -886,7 +914,8 @@ fn query_inner(
                 )
                 .map_err(ApiError::internal)?;
             json!({"id":action,"revision":row.revision,"profile":row.profile,"job":row.job,
-                "dependencies":row.dependencies,"state":state,"attempt":attempt})
+                "dependencies":row.dependencies,"state":state,"attempt":attempt,"key":row.key,
+                "identity":row.identity,"reservation":row.reservation,"origin":row.origin})
         }
         Query::Candidate { candidate } => {
             candidate_projects(store, principal, candidate, &mut BTreeSet::new())?;
@@ -991,6 +1020,12 @@ fn query_inner(
         Query::Metrics => {
             role(principal, "operator")?;
             metrics.value()
+        }
+        Query::Frontier { project: p } => {
+            project(principal, p)?;
+            engine::frontier(store, p)
+                .map_err(ApiError::internal)?
+                .unwrap_or_else(|| json!({"candidate":null,"certificate":null}))
         }
     };
     Ok(result)

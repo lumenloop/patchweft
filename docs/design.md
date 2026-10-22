@@ -10,10 +10,14 @@ names the base and changes explicitly, so the source being tested is inspectable
 Source composition remains within a repository; validation prerequisites may
 cross project boundaries.
 
-An action binds a revision, profile, job and dependency identities. Interests
-record who still needs it. Attempts record actual executions, including failures.
-A candidate groups the profile's obligations for a revision. The validated
-frontier advances only through the configured validation and review checks.
+An action binds a project, revision inputs, a job identity, an evidence class, a
+timeout and the dependency actions it consumes; it records the profile whose
+definition it executes. Interests record who still needs it. Attempts record
+actual executions, including failures. A candidate groups the profile's
+obligations for a revision. Retry keeps a candidate's successful obligations;
+retention lets a new candidate for the same revision keep a predecessor's passes
+whose job identity is unchanged, and records that it did. The validated frontier
+advances only through the configured validation and review checks.
 
 Content identity makes sharing possible, but does not prove that all inputs are
 known. Default sharing stops at outstanding work. Completed-result reuse requires

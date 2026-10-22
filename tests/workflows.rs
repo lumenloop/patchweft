@@ -172,6 +172,104 @@ impl Lab {
     fn drain(&self) {
         self.call(&["worker", "--drain"]);
     }
+    fn register(&self, name: &str, definition: Value) -> String {
+        let path = self.state.join(format!("{name}.json"));
+        fs::write(&path, serde_json::to_vec(&definition).unwrap()).unwrap();
+        self.call(&["register", path.to_str().unwrap()])["id"]
+            .as_str()
+            .unwrap()
+            .into()
+    }
+    fn retain(&self, revision: &str, profile: &str, owner: &str, from: &Value) -> Value {
+        self.call(&[
+            "submit",
+            "--revision",
+            revision,
+            "--profile",
+            profile,
+            "--owner",
+            owner,
+            "--retain-from",
+            from["id"].as_str().unwrap(),
+        ])
+    }
+    fn count(&self, kind: &str) -> usize {
+        self.call(&["events"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == kind)
+            .count()
+    }
+    fn database(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.state.join("state.sqlite")).unwrap()
+    }
+    fn body(&self, table: &str, id: &str) -> Value {
+        let body: String = self
+            .database()
+            .query_row(&format!("SELECT body FROM {table} WHERE id=?"), [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        serde_json::from_str(&body).unwrap()
+    }
+}
+
+fn job(name: &str, script: &str, extra: Value) -> Value {
+    let mut job = json!({"name":name,"command":["sh","-c",script],"report":{"kind":"command"}});
+    job.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    job
+}
+
+/// `build` feeds `test_a` and `test_b`; `lint` is independent and opts out of slot export.
+fn chain(build_script: &str, test_b_script: &str, tuning: &[(&str, Value)]) -> Value {
+    let tuned = |name: &str| {
+        tuning
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map_or(json!({}), |(_, v)| v.clone())
+    };
+    let with = |name: &str, base: Value| {
+        let mut value = base;
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(tuned(name).as_object().unwrap().clone());
+        value
+    };
+    json!([
+        job(
+            "build",
+            build_script,
+            with("build", json!({"artifacts":["dist"]}))
+        ),
+        job(
+            "test_a",
+            "test -s dist/out",
+            with("test_a", json!({"dependencies":["build"]}))
+        ),
+        job(
+            "test_b",
+            test_b_script,
+            with("test_b", json!({"dependencies":["build"]}))
+        ),
+        job("lint", "true", with("lint", json!({"export_slots":false}))),
+    ])
+}
+
+const BUILD: &str = "mkdir dist; echo built > dist/out";
+const TEST_B: &str = "grep -q built dist/out";
+
+fn names(value: &Value) -> Vec<String> {
+    let mut names: Vec<String> = match value {
+        Value::Array(items) => items.iter().map(|v| v.as_str().unwrap().into()).collect(),
+        Value::Object(map) => map.keys().cloned().collect(),
+        _ => vec![],
+    };
+    names.sort();
+    names
 }
 
 #[test]
@@ -1257,4 +1355,572 @@ fn executable_symlinks_preserve_multicall_dispatch_names() {
     let candidate = lab.submit(&lab.base, profile["id"].as_str().unwrap(), "agent");
     lab.drain();
     assert_eq!(lab.state(&candidate), "passed");
+}
+
+#[test]
+fn reservation_only_change_retains_every_passed_obligation() {
+    let lab = Lab::new();
+    let p1 = lab.profile(chain(BUILD, TEST_B, &[]));
+    let first = lab.submit(&lab.base, &p1, "agent");
+    lab.drain();
+    assert_eq!(lab.state(&first), "passed");
+    let p2 = lab.profile(chain(
+        BUILD,
+        TEST_B,
+        &[
+            ("test_a", json!({"memory_mb":2048})),
+            ("build", json!({"timeout_seconds":3600})),
+            ("lint", json!({"slots":2})),
+        ],
+    ));
+    assert_ne!(p1, p2);
+    let second = lab.retain(&lab.base, &p2, "agent", &first);
+    assert_eq!(second["required"], first["required"]);
+    assert_eq!(
+        names(&second["retained"]),
+        ["build", "lint", "test_a", "test_b"]
+    );
+    assert!(second.get("not_retained").is_none(), "{second}");
+    assert_eq!(second["retained_from"], first["id"]);
+    assert_eq!(lab.state(&second), "passed");
+    lab.drain();
+    assert_eq!(lab.count("attempt.started"), 4);
+    assert_eq!(lab.count("action.retained"), 4);
+}
+
+#[test]
+fn plain_resubmit_after_profile_change_is_a_fresh_observation() {
+    let lab = Lab::new();
+    let p1 = lab.profile(chain(BUILD, TEST_B, &[]));
+    let first = lab.submit(&lab.base, &p1, "agent");
+    lab.drain();
+    let p2 = lab.profile(chain(
+        BUILD,
+        TEST_B,
+        &[("test_a", json!({"memory_mb":2048}))],
+    ));
+    let second = lab.submit(&lab.base, &p2, "agent");
+    for (name, id) in second["required"].as_object().unwrap() {
+        assert_ne!(&first["required"][name], id, "{name}");
+    }
+    assert!(second.get("retained").is_none());
+    lab.drain();
+    assert_eq!(lab.state(&second), "passed");
+    assert_eq!(lab.count("attempt.started"), 8);
+}
+
+#[test]
+fn changed_command_reruns_only_that_job_and_its_consumers() {
+    let lab = Lab::new();
+    let p1 = lab.profile(chain(BUILD, TEST_B, &[]));
+    let first = lab.submit(&lab.base, &p1, "agent");
+    lab.drain();
+    let p2 = lab.profile(chain(BUILD, "grep -q '^built$' dist/out", &[]));
+    let second = lab.retain(&lab.base, &p2, "agent", &first);
+    assert_eq!(names(&second["retained"]), ["build", "lint", "test_a"]);
+    assert_eq!(
+        second["not_retained"],
+        json!({"test_b":"job identity changed"})
+    );
+    assert_ne!(second["required"]["test_b"], first["required"]["test_b"]);
+
+    let p3 = lab.profile(chain(
+        "mkdir dist; echo built again > dist/out",
+        TEST_B,
+        &[],
+    ));
+    let third = lab.retain(&lab.base, &p3, "agent", &first);
+    assert_eq!(names(&third["retained"]), ["lint"]);
+    assert_eq!(names(&third["not_retained"]), ["build", "test_a", "test_b"]);
+    let build = third["required"]["build"].as_str().unwrap();
+    assert_ne!(build, first["required"]["build"]);
+    for consumer in ["test_a", "test_b"] {
+        let action = lab.body("actions", third["required"][consumer].as_str().unwrap());
+        assert_eq!(action["dependencies"], json!([build]));
+    }
+    lab.drain();
+    assert_eq!(lab.state(&second), "passed");
+    assert_eq!(lab.state(&third), "passed");
+    assert_eq!(lab.count("attempt.started"), 4 + 1 + 3);
+}
+
+#[test]
+fn failed_upstream_then_reservation_fix_wires_consumers_to_new_upstream() {
+    let lab = Lab::new();
+    let gated = "test -f \"$PATCHWEFT_STATE/ready\" && mkdir dist && echo built > dist/out";
+    let p1 = lab.profile(chain(gated, TEST_B, &[]));
+    let first = lab.submit(&lab.base, &p1, "agent");
+    lab.drain();
+    assert_eq!(lab.state(&first), "failed");
+    let status = lab.call(&["status", first["id"].as_str().unwrap()]);
+    assert_eq!(status["jobs"]["test_a"]["state"], "queued");
+    assert_eq!(status["jobs"]["lint"]["state"], "passed");
+
+    fs::write(lab.state.join("ready"), "fixed").unwrap();
+    let p2 = lab.profile(chain(
+        gated,
+        TEST_B,
+        &[("build", json!({"memory_mb":2048}))],
+    ));
+    let second = lab.retain(&lab.base, &p2, "agent", &first);
+    assert_eq!(names(&second["retained"]), ["lint"]);
+    let build = second["required"]["build"].as_str().unwrap();
+    assert_ne!(build, first["required"]["build"]);
+    assert_eq!(lab.body("actions", build)["reservation"]["memory_mb"], 2048);
+    for consumer in ["test_a", "test_b"] {
+        assert_ne!(second["required"][consumer], first["required"][consumer]);
+        let action = lab.body("actions", second["required"][consumer].as_str().unwrap());
+        assert_eq!(action["dependencies"], json!([build]));
+    }
+    lab.drain();
+    assert_eq!(lab.state(&second), "passed");
+}
+
+#[test]
+fn any_declared_tool_byte_change_reruns_every_job() {
+    let lab = Lab::new();
+    let tool = lab.state.join("unused-adapter");
+    fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    let definition = json!({"version":1,"name":"tools","certifying":true,
+        "tools":{"sh":"/usr/bin/sh","adapter":tool},"jobs":chain(BUILD, TEST_B, &[])});
+    let p1 = lab.register("tools", definition.clone());
+    let first = lab.submit(&lab.base, &p1, "agent");
+    lab.drain();
+    assert_eq!(lab.state(&first), "passed");
+    fs::write(&tool, "#!/bin/sh\nexit 1\n").unwrap();
+    let p2 = lab.register("tools", definition);
+    assert_ne!(p1, p2);
+    let second = lab.retain(&lab.base, &p2, "agent", &first);
+    assert!(second.get("retained").is_none(), "{second}");
+    assert_eq!(
+        names(&second["not_retained"]),
+        ["build", "lint", "test_a", "test_b"]
+    );
+    for reason in second["not_retained"].as_object().unwrap().values() {
+        assert_eq!(reason, "job identity changed");
+    }
+}
+
+#[test]
+fn export_slots_false_hides_variable_and_leaves_identity() {
+    let lab = Lab::new();
+    let record = "mkdir out; env > out/env";
+    for export in [false, true] {
+        let name = format!("env-{export}");
+        let jobs = |slots: u32| {
+            json!([job(
+                &name,
+                record,
+                json!({"artifacts":["out"],"slots":slots,"export_slots":export})
+            )])
+        };
+        let p1 = lab.profile(jobs(1));
+        let first = lab.submit(&lab.base, &p1, "agent");
+        lab.drain();
+        assert_eq!(lab.state(&first), "passed");
+        let destination = lab.state.join(format!("delivered-{export}"));
+        lab.call(&[
+            "deliver",
+            first["required"][&name].as_str().unwrap(),
+            "--destination",
+            destination.to_str().unwrap(),
+        ]);
+        let environment = fs::read_to_string(destination.join("out/env")).unwrap();
+        assert_eq!(environment.contains("PATCHWEFT_SLOTS=1\n"), export);
+        assert!(environment.contains("PATCHWEFT_REVISION="));
+        let p2 = lab.profile(jobs(2));
+        let second = lab.retain(&lab.base, &p2, "agent", &first);
+        if export {
+            assert_eq!(second["not_retained"][&name], "job identity changed");
+        } else {
+            assert_eq!(second["retained"], json!([name]));
+        }
+    }
+}
+
+#[test]
+fn timeout_is_a_key_and_acceptance_budget_not_identity() {
+    let lab = Lab::new();
+    let jobs = |name: &str, script: &str, timeout: u64| {
+        json!([job(name, script, json!({"timeout_seconds":timeout}))])
+    };
+    // Case A: a pass that took about 1.5 s cannot certify a 1 s budget.
+    // Loose budgets stay far above source preparation (~5 s for a debug binary) under load.
+    let p10 = lab.profile(jobs("sleepy", "sleep 1.5", 120));
+    let first = lab.submit(&lab.base, &p10, "agent");
+    lab.drain();
+    assert_eq!(lab.state(&first), "passed");
+    let p1 = lab.profile(jobs("sleepy", "sleep 1.5", 1));
+    let tight = lab.retain(&lab.base, &p1, "agent", &first);
+    assert_eq!(
+        tight["not_retained"]["sleepy"],
+        "observation exceeded the timeout budget"
+    );
+    assert_ne!(tight["required"]["sleepy"], first["required"]["sleepy"]);
+    lab.drain();
+    assert_eq!(lab.state(&tight), "failed");
+    let failed = lab.body("actions", tight["required"]["sleepy"].as_str().unwrap());
+    assert_eq!(failed["identity"]["timeout_seconds"], 1);
+    let attempt: String = lab
+        .database()
+        .query_row(
+            "SELECT attempt FROM actions WHERE id=?",
+            [tight["required"]["sleepy"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(lab.body("attempts", &attempt)["exit_code"], 124);
+    let p20 = lab.profile(jobs("sleepy", "sleep 1.5", 240));
+    let loose = lab.retain(&lab.base, &p20, "agent", &first);
+    assert_eq!(loose["retained"], json!(["sleepy"]));
+    assert_eq!(loose["required"], first["required"]);
+
+    // Case B: the main process exits at once, but a detached descendant holds the timer.
+    let detached = "setsid sh -c 'sleep 3' >/dev/null 2>&1 & exit 0";
+    let p10 = lab.profile(jobs("detached", detached, 30));
+    let first = lab.submit(&lab.base, &p10, "agent");
+    lab.drain();
+    assert_eq!(lab.state(&first), "passed");
+    let attempt: String = lab
+        .database()
+        .query_row(
+            "SELECT attempt FROM actions WHERE id=?",
+            [first["required"]["detached"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let evidence = &lab.body("attempts", &attempt)["result"];
+    // The budget includes source preparation, which varies with host load. This budget
+    // exceeds preparation plus the main process by a second but not the descendant's 3 s.
+    let preparation = evidence["preparation"]["source_seconds"].as_f64().unwrap()
+        + evidence["preparation"]["dependency_seconds"]
+            .as_f64()
+            .unwrap();
+    assert!(
+        evidence["timer_seconds"].as_f64().unwrap() >= preparation + 3.0,
+        "{evidence}"
+    );
+    let budget = (preparation + 1.0).ceil() as u64;
+    let tight = lab.retain(
+        &lab.base,
+        &lab.profile(jobs("detached", detached, budget)),
+        "agent",
+        &first,
+    );
+    assert_eq!(
+        tight["not_retained"]["detached"],
+        "observation exceeded the timeout budget"
+    );
+
+    // Case C: equal recipes with different timeouts never share outstanding work.
+    let p10 = lab.profile(jobs("queued", "true", 10));
+    let p20 = lab.profile(jobs("queued", "true", 20));
+    let a = lab.submit(&lab.base, &p10, "agent");
+    let b = lab.submit(&lab.base, &p20, "agent");
+    assert_ne!(a["required"]["queued"], b["required"]["queued"]);
+}
+
+#[test]
+fn queued_share_raises_reservation_running_join_requires_enough() {
+    let lab = Lab::new();
+    let jobs = |memory: u32| json!([job("work", "true", json!({"memory_mb":memory}))]);
+    let p1 = lab.profile(jobs(512));
+    let p2 = lab.profile(jobs(1024));
+    let p3 = lab.profile(jobs(256));
+    let first = lab.submit(&lab.base, &p1, "one");
+    let second = lab.submit(&lab.base, &p2, "two");
+    let third = lab.submit(&lab.base, &p3, "three");
+    let action = first["required"]["work"].as_str().unwrap();
+    assert_eq!(second["required"]["work"], action);
+    assert_eq!(third["required"]["work"], action);
+    let raised: Vec<Value> = lab
+        .call(&["events"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "action.reservation_raised")
+        .cloned()
+        .collect();
+    assert_eq!(raised.len(), 1);
+    assert_eq!(raised[0]["detail"]["from"]["memory_mb"], 512);
+    assert_eq!(raised[0]["detail"]["to"]["memory_mb"], 1024);
+    assert_eq!(raised[0]["detail"]["requesting_profile"], p2);
+    assert_eq!(
+        lab.body("actions", action)["reservation"]["memory_mb"],
+        1024
+    );
+    lab.drain();
+    let claimed = lab
+        .call(&["events"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "attempt.claimed")
+        .cloned()
+        .unwrap();
+    assert_eq!(claimed["detail"]["memory_mb"], 1024);
+    let attempt = lab.body("attempts", claimed["subject"].as_str().unwrap());
+    assert_eq!(attempt["memory_mb"], 1024);
+    assert_eq!(attempt["result"]["budget"]["memory_mb"], 1024);
+
+    // A running attempt's reservation is fixed: only requesters it already covers join.
+    let gate = "touch \"$PATCHWEFT_STATE/gate-started\"; \
+                while [ ! -f \"$PATCHWEFT_STATE/gate-release\" ]; do sleep 0.05; done";
+    let gated = |memory: u32| json!([job("gate", gate, json!({"memory_mb":memory}))]);
+    let p1 = lab.profile(gated(512));
+    let running = lab.submit(&lab.base, &p1, "one");
+    let coordinator = lab
+        .command(&["worker", "--drain"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !lab.state.join("gate-started").exists() {
+        assert!(start.elapsed().as_secs() < 10, "worker did not start");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let larger = lab.submit(&lab.base, &lab.profile(gated(1024)), "two");
+    let smaller = lab.submit(&lab.base, &lab.profile(gated(256)), "three");
+    assert_ne!(larger["required"]["gate"], running["required"]["gate"]);
+    assert_eq!(smaller["required"]["gate"], running["required"]["gate"]);
+    fs::write(lab.state.join("gate-release"), "go").unwrap();
+    parsed(coordinator.wait_with_output().unwrap());
+    lab.drain();
+    assert_eq!(lab.state(&running), "passed");
+    assert_eq!(lab.state(&larger), "passed");
+}
+
+#[test]
+fn retry_raises_reservation_to_retrying_profile() {
+    let lab = Lab::new();
+    let jobs = |memory: u32| {
+        json!([job(
+            "flaky",
+            "test -f \"$PATCHWEFT_STATE/ready\"",
+            json!({"memory_mb":memory})
+        )])
+    };
+    let p1 = lab.profile(jobs(512));
+    let first = lab.submit(&lab.base, &p1, "one");
+    let action = first["required"]["flaky"].as_str().unwrap();
+    // Every public join already raises or guards the reservation, so seed a P2 candidate that
+    // holds the action without having raised it.
+    let p2 = lab.profile(jobs(1024));
+    let second = lab.submit(&lab.base, &p2, "two");
+    assert_eq!(second["required"]["flaky"], action);
+    lab.database()
+        .execute(
+            "UPDATE actions SET body=json_set(body,'$.reservation.memory_mb',512) WHERE id=?",
+            [action],
+        )
+        .unwrap();
+    lab.drain();
+    assert_eq!(lab.state(&second), "failed");
+    fs::write(lab.state.join("ready"), "repaired").unwrap();
+    let retry = lab.call(&["retry", second["id"].as_str().unwrap()]);
+    assert_eq!(retry["retried"], json!(["flaky"]));
+    assert_eq!(
+        lab.body("actions", action)["reservation"]["memory_mb"],
+        1024
+    );
+    lab.drain();
+    assert_eq!(lab.state(&second), "passed");
+    let attempt: String = lab
+        .database()
+        .query_row("SELECT attempt FROM actions WHERE id=?", [action], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(lab.body("attempts", &attempt)["memory_mb"], 1024);
+}
+
+#[test]
+fn certificate_v2_attributes_receipts_and_is_queryable() {
+    use patchweft::api::{self, Api, Principal, Query};
+    let lab = Lab::new();
+    let p1 = lab.profile(chain(BUILD, TEST_B, &[]));
+    let first = lab.submit(&lab.base, &p1, "agent");
+    lab.drain();
+    let p2 = lab.profile(chain(
+        BUILD,
+        TEST_B,
+        &[("test_a", json!({"memory_mb":2048}))],
+    ));
+    let second = lab.retain(&lab.base, &p2, "agent", &first);
+    lab.call(&["review", &lab.base, "--reviewer", "reviewer"]);
+    let certificate = lab.call(&["promote", second["id"].as_str().unwrap()]);
+    assert_eq!(certificate["certificate"], 2);
+    assert_eq!(certificate["profile"], p2);
+    assert_eq!(certificate["retained_from"], first["id"]);
+
+    let project = lab.call(&["list", "projects"])[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let store = patchweft::store::Store::open(&lab.state).unwrap();
+    let credential = lab.state.join("reader.credential");
+    api::grant(
+        &store,
+        Principal {
+            id: "reader".into(),
+            projects: [project.clone()].into(),
+            profiles: [p2.clone()].into(),
+            roles: ["read".to_owned()].into(),
+            max_pending: 1,
+        },
+        &credential,
+    )
+    .unwrap();
+    let token = fs::read_to_string(&credential).unwrap();
+    let api = Api::open(&lab.state).unwrap();
+    let profiles = api.query(&token, &Query::Profiles).unwrap();
+    let jobs = profiles["items"][0]["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 4);
+    for job in jobs {
+        let name = job["name"].as_str().unwrap();
+        let receipt = &certificate["receipts"][name];
+        assert_eq!(receipt["route"], "retained", "{name}");
+        assert_eq!(receipt["executed_under"], p1);
+        assert_eq!(receipt["evidence"]["profile"], p1);
+        assert_eq!(receipt["recipe"], job["recipe"]);
+        assert_eq!(receipt["evidence"]["identity"]["recipe"], job["recipe"]);
+        assert!(receipt["observed"]["started"].as_f64().is_some());
+        assert_eq!(receipt["attempts"]["total"], 1);
+        assert_eq!(receipt["attempts"]["failed"], 0);
+    }
+    let frontier = api
+        .query(
+            &token,
+            &Query::Frontier {
+                project: project.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(frontier["candidate"], second["id"]);
+    assert_eq!(frontier["certificate"], certificate);
+    assert_eq!(
+        lab.call(&["frontier", &project])["certificate"],
+        certificate
+    );
+}
+
+#[test]
+fn exploratory_and_certifying_never_share_or_retain() {
+    let lab = Lab::new();
+    let definition = |certifying: bool| {
+        json!({"version":1,"name":"classes","certifying":certifying,
+               "tools":{"sh":"/usr/bin/sh"},"jobs":[job("work", "true", json!({}))]})
+    };
+    let exploratory = lab.register("exploratory", definition(false));
+    let certifying = lab.register("certifying", definition(true));
+    let first = lab.submit(&lab.base, &exploratory, "explorer");
+    let second = lab.submit(&lab.base, &certifying, "certifier");
+    assert_ne!(first["required"]["work"], second["required"]["work"]);
+    lab.drain();
+    assert_eq!(lab.state(&first), "passed");
+    let third = lab.retain(&lab.base, &certifying, "certifier", &first);
+    assert_eq!(
+        third["not_retained"],
+        json!({"work":"evidence class differs"})
+    );
+    assert_ne!(third["required"]["work"], first["required"]["work"]);
+}
+
+#[test]
+fn never_jobs_are_not_retained() {
+    let lab = Lab::new();
+    let jobs = |memory: u32| {
+        json!([
+            job("fresh", "true", json!({"reuse":"never","memory_mb":memory})),
+            job("shared", "true", json!({"memory_mb":memory}))
+        ])
+    };
+    let first = lab.submit(&lab.base, &lab.profile(jobs(512)), "agent");
+    lab.drain();
+    let second = lab.retain(&lab.base, &lab.profile(jobs(1024)), "agent", &first);
+    assert_eq!(second["retained"], json!(["shared"]));
+    assert_eq!(
+        second["not_retained"],
+        json!({"fresh":"reuse policy is never"})
+    );
+}
+
+#[test]
+fn retention_refused_across_revisions_and_plain_ids_unchanged() {
+    let lab = Lab::new();
+    let profile = lab.profile(chain(BUILD, TEST_B, &[]));
+    let first = lab.submit(&lab.base, &profile, "agent");
+    assert_eq!(
+        first["id"],
+        patchweft::identity(&json!({"revision":lab.base,"profile":profile,"prerequisites":[]}))
+            .unwrap()
+    );
+    let (edited, _) = lab.edit(&lab.base, "author", "README", "edited\n");
+    lab.refuses(
+        &[
+            "submit",
+            "--revision",
+            &edited,
+            "--profile",
+            &profile,
+            "--owner",
+            "agent",
+            "--retain-from",
+            first["id"].as_str().unwrap(),
+        ],
+        "same revision",
+    );
+}
+
+#[test]
+fn legacy_rows_still_claim_status_promote_deliver() {
+    let lab = Lab::new();
+    let profile = lab.profile(chain(BUILD, TEST_B, &[]));
+    let candidate = lab.submit(&lab.base, &profile, "agent");
+    let project = lab.call(&["list", "projects"])[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let commit = lab.call(&["list", "revisions"])[0]["commit"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let database = lab.database();
+    for name in ["build", "test_a", "test_b", "lint"] {
+        let id = candidate["required"][name].as_str().unwrap();
+        let dependencies = lab.body("actions", id)["dependencies"].clone();
+        let key = patchweft::identity(&json!({"project":project,"profile":profile,"job":name,
+            "inputs":{"commit":commit},"dependencies":dependencies}))
+        .unwrap();
+        database
+            .execute(
+                "UPDATE actions SET key=?1,body=json_set(json_remove(body,'$.identity',
+                 '$.reservation','$.origin'),'$.key',?1) WHERE id=?2",
+                rusqlite::params![key, id],
+            )
+            .unwrap();
+        assert!(lab.body("actions", id).get("identity").is_none());
+    }
+    lab.drain();
+    assert_eq!(lab.state(&candidate), "passed");
+    lab.call(&["review", &lab.base, "--reviewer", "reviewer"]);
+    let certificate = lab.call(&["promote", candidate["id"].as_str().unwrap()]);
+    assert_eq!(
+        certificate["receipts"]["build"]["action"],
+        candidate["required"]["build"]
+    );
+    let destination = lab.state.join("legacy-delivery");
+    lab.call(&[
+        "deliver",
+        candidate["required"]["build"].as_str().unwrap(),
+        "--destination",
+        destination.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        fs::read_to_string(destination.join("dist/out")).unwrap(),
+        "built\n"
+    );
 }
