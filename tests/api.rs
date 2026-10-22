@@ -229,6 +229,7 @@ fn local_and_api_candidate_submission_share_one_transaction_order() {
                 revision: lab.a.clone(),
                 profile: lab.profile.clone(),
                 requires: vec![],
+                retain_from: None,
             },
         )
         .unwrap();
@@ -302,7 +303,8 @@ fn principal_scope_covers_replays_dependencies_roles_and_cancellation() {
                 &Command::Submit {
                     revision: lab.a.clone(),
                     profile: lab.profile.clone(),
-                    requires: vec![prerequisite.id]
+                    requires: vec![prerequisite.id],
+                    retain_from: None,
                 }
             )
             .unwrap_err()
@@ -896,6 +898,7 @@ fn shared_candidate_retry_uses_association_without_reviving_other_owners() {
                 revision: lab.a.clone(),
                 profile: lab.profile.clone(),
                 requires: vec![],
+                retain_from: None,
             },
         )
         .unwrap();
@@ -1235,4 +1238,110 @@ async fn failed_streams_and_revoked_uploads_leave_no_staging_files() {
         401
     );
     assert_eq!(pending_uploads(&lab), 0);
+}
+
+#[test]
+fn submit_without_retain_serializes_unchanged() {
+    // Pre-upgrade receipts hash this exact serialization; a changed form would turn a replay
+    // into an idempotency conflict.
+    let submit = Command::Submit {
+        revision: "r".into(),
+        profile: "p".into(),
+        requires: vec!["c".into()],
+        retain_from: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&submit).unwrap(),
+        r#"{"op":"submit","revision":"r","profile":"p","requires":["c"]}"#
+    );
+}
+
+fn register(lab: &Lab, name: &str, script: &str) -> String {
+    let path = lab.root.join(format!("{name}.json"));
+    fs::write(
+        &path,
+        json!({"version":1,"name":name,"certifying":true,"tools":{"sh":"/usr/bin/sh"},
+            "jobs":[{"name":"build","command":["sh","-c",script],"report":{"kind":"command"}}]})
+        .to_string(),
+    )
+    .unwrap();
+    engine::register(&mut Store::open(&lab.root).unwrap(), &path)
+        .unwrap()
+        .id
+}
+
+fn pass(store: &Store, action: &str) {
+    let attempt = patchweft::unique();
+    let body = json!({"id":attempt,"action":action,"worker_pid":0,"worker_start":"0",
+        "supervisor_pid":null,"supervisor_start":null,"slots":1,"memory_mb":1,"created":0.0,
+        "started":0.5,"ended":1.0,"exit_code":0,"result":{"timer_seconds":0.5}});
+    store
+        .db
+        .execute(
+            "INSERT INTO attempts VALUES (?,?,'passed',1,?)",
+            rusqlite::params![attempt, action, body.to_string()],
+        )
+        .unwrap();
+    store
+        .db
+        .execute(
+            "UPDATE actions SET state='passed',attempt=? WHERE id=?",
+            rusqlite::params![attempt, action],
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn submit_retain_from_is_project_scoped() {
+    let lab = Lab::new();
+    let granted = register(&lab, "granted", "true");
+    let ungranted = register(&lab, "ungranted", "exit 0");
+    let mut store = Store::open(&lab.root).unwrap();
+    store
+        .db
+        .execute(
+            "UPDATE api_principals SET body=json_set(body,'$.profiles',json(?)) WHERE id='alice'",
+            [json!([lab.profile, granted]).to_string()],
+        )
+        .unwrap();
+    let submit = |source: &str| Command::Submit {
+        revision: lab.a.clone(),
+        profile: granted.clone(),
+        requires: vec![],
+        retain_from: Some(source.into()),
+    };
+    let elsewhere = engine::submit(&mut store, &lab.b, &granted, "bob", vec![]).unwrap();
+    assert_eq!(
+        lab.api
+            .command(ALICE, "other-project", &submit(&elsewhere.id))
+            .unwrap_err()
+            .status,
+        403
+    );
+    // Retention consumes evidence produced under the source's profile, so it needs that grant.
+    let foreign = engine::submit(&mut store, &lab.a, &ungranted, "fixture", vec![]).unwrap();
+    pass(&store, &foreign.required["build"]);
+    assert_eq!(
+        lab.api
+            .command(ALICE, "other-profile", &submit(&foreign.id))
+            .unwrap_err()
+            .status,
+        403
+    );
+    let source = engine::submit(&mut store, &lab.a, &granted, "fixture", vec![]).unwrap();
+    pass(&store, &source.required["build"]);
+    let (status, body) = send(
+        lab.router(),
+        "/v1/commands",
+        json!({"op":"submit","revision":lab.a,"profile":granted,"retain_from":source.id}),
+        Some(ALICE),
+        &[("idempotency-key", "retain")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], 200, "{body}");
+    assert_eq!(body["result"]["required"], json!(source.required));
+    assert_eq!(body["result"]["retained"], json!(["build"]));
+    assert_eq!(body["result"]["retained_from"], source.id);
+    assert_ne!(body["result"]["id"], source.id);
 }

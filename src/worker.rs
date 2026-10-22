@@ -143,8 +143,16 @@ pub fn claim(store: &mut Store) -> Result<Option<Attempt>> {
     };
     let profile: RegisteredProfile = record(&transaction, "profiles", &action.profile)?;
     let job = engine::job(&profile, &action.job)?;
+    // Legacy actions carry neither field; their creating profile's job values apply.
+    let reservation = action.reservation.unwrap_or_else(|| Reservation::from(job));
+    let timeout_seconds = action
+        .identity
+        .as_ref()
+        .map_or(job.timeout_seconds, |i| i.timeout_seconds);
     // Drain for the next owner's action. Later tiny tasks cannot starve this reservation.
-    if used_slots + job.slots > capacity.0 || used_memory + job.memory_mb > capacity.1 {
+    if used_slots + reservation.slots > capacity.0
+        || used_memory + reservation.memory_mb > capacity.1
+    {
         return Ok(None);
     }
     let attempt = Attempt {
@@ -155,13 +163,14 @@ pub fn claim(store: &mut Store) -> Result<Option<Attempt>> {
             .context("Linux process identity unavailable")?,
         supervisor_pid: None,
         supervisor_start: None,
-        slots: job.slots,
-        memory_mb: job.memory_mb,
+        slots: reservation.slots,
+        memory_mb: reservation.memory_mb,
         created: now(),
         started: None,
         ended: None,
         exit_code: None,
         result: None,
+        timeout_seconds: Some(timeout_seconds),
     };
     transaction.execute(
         "INSERT INTO attempts VALUES (?,?,'claimed',0,?)",
@@ -179,7 +188,8 @@ pub fn claim(store: &mut Store) -> Result<Option<Attempt>> {
         &transaction,
         "attempt.claimed",
         &attempt.id,
-        &json!({"action":action.id,"owner":owner,"slots":job.slots,"memory_mb":job.memory_mb}),
+        &json!({"action":action.id,"owner":owner,"slots":reservation.slots,
+                "memory_mb":reservation.memory_mb,"timeout_seconds":timeout_seconds}),
     )?;
     transaction.commit()?;
     Ok(Some(attempt))
@@ -439,6 +449,16 @@ fn execute_command(
     directory: &Path,
 ) -> Result<(i32, Value)> {
     let started = Instant::now();
+    if let Some(identity) = &action.identity {
+        let current = engine::recipes_for(profile, &identity.version)
+            .ok()
+            .and_then(|r| r.get(&job.name).cloned());
+        ensure!(
+            current.as_ref() == Some(&identity.recipe),
+            "job identity changed since request"
+        );
+    }
+    let timeout_seconds = attempt.timeout_seconds.unwrap_or(job.timeout_seconds);
     let (view, preparation) = prepare(store, action, profile, job, directory)?;
     let scratch = directory.join("scratch");
     let home = directory.join("home");
@@ -480,12 +500,15 @@ fn execute_command(
         .env("PATCHWEFT_STATE", &store.root)
         .env("PATCHWEFT_ATTEMPT", &attempt.id)
         .env("PATCHWEFT_REVISION", &action.revision)
-        .env("PATCHWEFT_SLOTS", job.slots.to_string())
         .env("PATCHWEFT_REPORT", &job.report.path)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
+    if job.export_slots {
+        command.env("PATCHWEFT_SLOTS", job.slots.to_string());
+    }
     let command_started = Instant::now();
+    let timer_seconds;
     let mut child = command.spawn()?;
     let mut status = None;
     let mut terminating: Option<(Instant, &str)> = None;
@@ -500,7 +523,7 @@ fn execute_command(
                 Some("supervisor-stop")
             } else if active == 0 {
                 Some("no-requesters")
-            } else if started.elapsed().as_secs() >= job.timeout_seconds {
+            } else if started.elapsed().as_secs() >= timeout_seconds {
                 Some("timeout")
             } else {
                 None
@@ -543,6 +566,8 @@ fn execute_command(
         }
         reap_adopted(child.id());
         if status.is_some() && descendants(std::process::id()).is_empty() {
+            // Descendants keep the timer running, so this bounds every timeout check above.
+            timer_seconds = started.elapsed().as_secs_f64();
             break;
         }
         thread::sleep(Duration::from_millis(50));
@@ -573,8 +598,24 @@ fn execute_command(
                     "command_seconds":command_seconds,"preparation":preparation,
                     "artifact_capture_seconds":capture_started.elapsed().as_secs_f64(),
                     "report":report,"log_sha256":file_hash(&directory.join("output.log"))?,
-                    "artifacts":artifacts,"revision":action.revision,"profile":profile.id,"job":job.name}),
+                    "artifacts":artifacts,"revision":action.revision,"profile":profile.id,"job":job.name,
+                    "identity":evidence_identity(action),"timer_seconds":timer_seconds,"host":host(),
+                    "budget":{"slots":attempt.slots,"memory_mb":attempt.memory_mb,
+                              "timeout_seconds":timeout_seconds}}),
     ))
+}
+
+fn evidence_identity(action: &Action) -> Value {
+    action.identity.as_ref().map_or(
+        Value::Null,
+        |i| json!({"version":i.version,"recipe":i.recipe,"class":i.class,"key":action.key}),
+    )
+}
+
+fn host() -> Option<String> {
+    fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|name| name.trim().to_owned())
 }
 
 fn contained_parent(view: &Path, target: &Path) -> Result<()> {
@@ -667,7 +708,8 @@ pub fn execute(store: &mut Store, attempt_id: &str) -> Result<Value> {
         Err(error) => (
             125,
             json!({"error":format!("{error:#}"),"revision":action.revision,
-                                 "profile":profile.id,"job":job.name}),
+                                 "profile":profile.id,"job":job.name,
+                                 "identity":evidence_identity(&action),"key":action.key}),
         ),
     };
     let cleanup = cleanup_external(store, &attempt, &profile, &job, &directory);

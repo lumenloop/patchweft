@@ -58,7 +58,18 @@ it does not establish that the new candidate causally fixed the original defect.
 
 Frontier promotion requires a certifying profile, passing obligations, an
 exact-revision review, completed and drained evidence, ancestry from the previous
-frontier, and a matching expected frontier. The certificate records those identities.
+frontier, and a matching expected frontier. Promotion also recomputes each
+obligation's job identity, dependency wiring, inputs and action key from the
+certifying profile, and checks a retained pass against that profile's timeout.
+Exploratory work never serves certifying candidates.
+
+The certificate's `profile` is the certifying policy that accepted these job
+identities, not a claim that every job ran under it. The certificate also names
+the predecessor candidate when passes were retained. Each receipt records the
+executing profile, job identity, action key, route (`own`, `joined`, `retained`,
+or `legacy` for actions recorded before job identity), observation start and
+end, and attempt counts. Read it with `frontier PROJECT_ID` or the `frontier`
+query.
 
 Review records are assertions, not authenticated signatures or proof of reviewer
 independence. A certifying profile is an operator's policy decision. Registering
@@ -75,10 +86,27 @@ receipts belong together. Retain a copy of the exact runner binary and profile
 toolchain. Restore into a separate directory and inspect it before resuming.
 
 There is no automatic database migration or rolling-upgrade protocol. Back up
-before changing binaries. Profile identity binds runner bytes, so re-register
-profiles after changing the runner. Do not mix versions against a live store.
-Host power-loss recovery and backup/restore under arbitrary failures have not
-been established by the included tests.
+before changing binaries. Profile and job identity bind runner bytes, so
+re-register profiles after changing the runner. Do not mix versions against a
+live store. Host power-loss recovery and backup/restore under arbitrary failures
+have not been established by the included tests.
+
+To upgrade:
+
+1. Stop accepting work. Cancel queued actions or let them finish; after the
+   binary changes they fail in preparation with "runner binary changed", each
+   opening a repair.
+2. Drain active attempts and external resources.
+3. Back up the whole state directory.
+4. Upgrade the server and every remote client binary together. Clients and the
+   server must agree on the command format.
+5. Re-register profiles and grant the new profile IDs.
+6. Resume.
+
+Stored rows are not rewritten and no key migration runs. Actions recorded before
+job identity keep working by ID for status, delivery and dependencies, and
+promotion checks them against their original key. They are never shared or
+retained, so the first run of each profile after an upgrade executes every job.
 
 Logs, revisions, events, attempts and artifacts are retained. Automatic retention
 and garbage collection are not implemented. Monitor disk space. Deleting files

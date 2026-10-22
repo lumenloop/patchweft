@@ -77,7 +77,7 @@ a different command returns HTTP 409. No HTTP connection must stay open while a 
 | `op` | Fields | Result / authority |
 |---|---|---|
 | `request` | `revision`, `profile`, `job` | Action; write |
-| `submit` | `revision`, `profile`, optional `requires` candidate IDs | Candidate; write |
+| `submit` | `revision`, `profile`, optional `requires` candidate IDs, optional `retain_from` candidate of the same revision | Candidate; write, plus a grant for the `retain_from` candidate's profile |
 | `cancel` | `action` | Detaches only caller's interests; write |
 | `retry` | `candidate`, optional `jobs` | Retries unsuccessful obligations with confirmed drain; write plus caller association |
 | `compose` | `base`, `changes`, `message` | Revision, or durable conflict repair handle; write |
@@ -92,6 +92,12 @@ Other failed command preconditions produce a durable 409 receipt with
 `error.code="command_rejected"`; changing circumstances requires a new key. Validation,
 authorization, queue-budget and internal transaction failures do not create a receipt.
 Their responses carry `api_version` and structured `error.code`/`message`.
+
+`retain_from` keeps passing obligations of an earlier candidate for the same revision
+whose job identity is unchanged; see
+[retention](profiles.md#retain-passed-obligations-after-a-profile-change). A submit with
+`retain_from` is a different command from one without it, so derive the idempotency key
+from `retain_from` too; reusing a key from a plain submit returns HTTP 409.
 
 Retry preserves passing obligations. For shared candidates the requesting principal
 must have a recorded interest in that candidate; the API reactivates only that caller's
@@ -110,9 +116,10 @@ POST `/v1/query` with a typed JSON query. Responses contain `api_version` and `r
 | `op` | Fields |
 |---|---|
 | `projects` | optional `after`, `limit` |
-| `profiles` | none; returns permitted IDs, names, resource requirements and job dependencies |
+| `profiles` | none; returns permitted IDs, names, resource requirements, timeouts, job dependencies and job identities (`recipe`) |
 | `revisions`, `actions`, `repairs` | `project`, optional `after`, `limit` |
-| `action` / `candidate` / `repair` | corresponding ID field |
+| `action` / `candidate` / `repair` | corresponding ID field; an action includes its key, job identity, reservation and origin |
+| `frontier` | `project`; returns the validated candidate and its certificate |
 | `logs` | `attempt`, optional byte `offset`, byte `limit` |
 | `artifacts` | `action`; returns the passing attempt's file manifest |
 | `operation` | receipt `id`; caller-owned and currently authorized |

@@ -124,6 +124,10 @@ enum Operation {
         owner: String,
         #[arg(long)]
         requires: Vec<String>,
+        /// Retain passed obligations of a same-revision candidate whose job identity is
+        /// unchanged; retained passes are earlier observations, not fresh tests.
+        #[arg(long)]
+        retain_from: Option<String>,
     },
     /// Run a local coordinator; --drain exits when all currently runnable work is finished.
     Worker {
@@ -168,6 +172,8 @@ enum Operation {
         #[arg(long)]
         destination: PathBuf,
     },
+    /// Show a project's validated candidate and its certificate.
+    Frontier { project: String },
     /// Inspect failures that need repair.
     Repairs,
     /// Record a passing repair candidate, preserving the original failure.
@@ -392,8 +398,14 @@ fn run(cli: Cli) -> Result<Value> {
             profile,
             owner,
             requires,
-        } => serde_json::to_value(engine::submit(
-            &mut store, &revision, &profile, &owner, requires,
+            retain_from,
+        } => serde_json::to_value(engine::submit_retaining(
+            &mut store,
+            &revision,
+            &profile,
+            &owner,
+            requires,
+            retain_from.as_deref(),
         )?)?,
         Operation::Worker { drain } => worker::run(&mut store, drain)?,
         Operation::Status { candidate } => match candidate {
@@ -431,6 +443,8 @@ fn run(cli: Cli) -> Result<Value> {
             action,
             destination,
         } => worker::deliver(&store, &action, &destination)?,
+        Operation::Frontier { project } => engine::frontier(&store, &project)?
+            .unwrap_or_else(|| json!({"candidate":null,"certificate":null})),
         Operation::Repairs => serde_json::to_value(engine::repairs(&store)?)?,
         Operation::Resolve { repair, candidate } => {
             engine::resolve_repair(&mut store, &repair, &candidate)?
