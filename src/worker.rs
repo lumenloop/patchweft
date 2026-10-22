@@ -6,7 +6,7 @@ use crate::{
     unique,
 };
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -113,6 +113,7 @@ pub fn claim(store: &mut Store) -> Result<Option<Attempt>> {
             .map(|v| Ok(serde_json::from_str(&v?)?))
             .collect::<Result<_>>()?
     };
+    let priorities = owner_priorities(&transaction)?;
     let mut choices = Vec::new();
     for action in queued {
         if !engine::eligible(&transaction, &action)? {
@@ -130,15 +131,18 @@ pub fn claim(store: &mut Store) -> Result<Option<Attempt>> {
                 })
                 .optional()?
                 .unwrap_or(0.0);
-            choices.push((served, action.created, owner, action.clone()));
+            let priority = priorities.get(&owner).copied().unwrap_or(0);
+            choices.push((priority, served, action.created, owner, action.clone()));
         }
     }
+    // Higher operator priority first (a landing-ready train), then fair share between owners.
     choices.sort_by(|a, b| {
-        a.0.total_cmp(&b.0)
+        b.0.cmp(&a.0)
             .then(a.1.total_cmp(&b.1))
-            .then(a.2.cmp(&b.2))
+            .then(a.2.total_cmp(&b.2))
+            .then(a.3.cmp(&b.3))
     });
-    let Some((_, _, owner, action)) = choices.first() else {
+    let Some((_, _, _, owner, action)) = choices.first() else {
         return Ok(None);
     };
     let profile: RegisteredProfile = record(&transaction, "profiles", &action.profile)?;
@@ -183,6 +187,46 @@ pub fn claim(store: &mut Store) -> Result<Option<Attempt>> {
     )?;
     transaction.commit()?;
     Ok(Some(attempt))
+}
+
+fn owner_priorities(db: &Connection) -> Result<BTreeMap<String, i64>> {
+    let exists: i64 = db.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='owner_priorities'",
+        [],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        return Ok(BTreeMap::new());
+    }
+    let mut stmt = db.prepare("SELECT owner, priority FROM owner_priorities")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Operator scheduling priority for an owner; 0 (the default) removes it. Priority only orders
+/// admission: it never preempts running work or changes action identity.
+pub fn set_priority(store: &Store, owner: &str, priority: i64) -> Result<Value> {
+    ensure!(!owner.is_empty(), "owner must be nonempty");
+    store.db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS owner_priorities (owner TEXT PRIMARY KEY, priority INTEGER NOT NULL)",
+    )?;
+    if priority == 0 {
+        store
+            .db
+            .execute("DELETE FROM owner_priorities WHERE owner=?", [owner])?;
+    } else {
+        store.db.execute(
+            "INSERT INTO owner_priorities VALUES (?,?) ON CONFLICT(owner) DO UPDATE SET priority=excluded.priority",
+            params![owner, priority],
+        )?;
+    }
+    event(
+        &store.db,
+        "owner.priority",
+        owner,
+        &json!({"priority":priority}),
+    )?;
+    Ok(json!({"owner":owner,"priority":priority}))
 }
 
 fn launch(store: &Store, attempt: &Attempt) -> Result<std::process::Child> {
