@@ -286,6 +286,53 @@ fn concurrent_requests_share_one_execution_and_detachment_is_per_owner() {
 }
 
 #[test]
+fn operator_priority_admits_a_train_before_earlier_lane_work() {
+    let lab = Lab::new();
+    // Each job takes the whole two-slot budget, so admission order is observable.
+    let profile = lab.profile(json!([
+        {"name":"lane","command":["sh","-c","true"],"slots":2,"reuse":"never","report":{"kind":"command"}},
+        {"name":"train","command":["sh","-c","true"],"slots":2,"reuse":"never","report":{"kind":"command"}}
+    ]));
+    let request = |job: &str, owner: &str| {
+        lab.call(&[
+            "request",
+            "--revision",
+            &lab.base,
+            "--profile",
+            &profile,
+            "--job",
+            job,
+            "--owner",
+            owner,
+        ])["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let lane = request("lane", "api:claude-c");
+    let train = request("train", "api:maintainer");
+    assert_eq!(
+        lab.call(&["priority", "api:maintainer", "1"])["priority"],
+        1
+    );
+    lab.drain();
+    let claimed: Vec<String> = lab
+        .call(&["events"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "attempt.claimed")
+        .map(|e| e["detail"]["action"].as_str().unwrap().to_owned())
+        .collect();
+    // Without the priority, fair share and age would admit the earlier lane request first.
+    assert_eq!(claimed, vec![train, lane]);
+    assert_eq!(
+        lab.call(&["priority", "api:maintainer", "0"])["priority"],
+        0
+    );
+}
+
+#[test]
 fn successful_jobs_survive_retry_of_a_failed_obligation() {
     let lab = Lab::new();
     let profile = lab.profile(json!([

@@ -13,7 +13,10 @@ permissions constrain remote application operations; they do not isolate execute
 code from the worker account or other files that account can read.
 
 Initialize one shared slot and memory budget. Multiple local worker processes
-coordinate against that store. Jobs hold reservations until their supervised
+coordinate against that store. Admission is fair between owners; `priority OWNER N`
+admits a higher-priority owner's work first (for example a landing-ready merge train)
+and `0` clears it. Priority orders admission only: it never preempts running work or
+changes action identity. Jobs hold reservations until their supervised
 processes and declared cleanup finish. A coordinator exit does not imply that
 its jobs have stopped.
 

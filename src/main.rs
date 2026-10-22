@@ -45,6 +45,12 @@ enum Operation {
         #[arg(long)]
         credential_file: PathBuf,
     },
+    /// Set an owner's scheduling priority (higher is admitted first; 0 clears it).
+    Priority {
+        owner: String,
+        #[arg(allow_negative_numbers = true)]
+        priority: i64,
+    },
     /// Revoke all credentials for a principal.
     Revoke { principal: String },
     /// Use the remote API without exposing credential bytes in argv.
@@ -355,6 +361,7 @@ fn run(cli: Cli) -> Result<Value> {
             serde_json::from_slice(&fs::read(policy)?)?,
             &credential_file,
         )?,
+        Operation::Priority { owner, priority } => worker::set_priority(&store, &owner, priority)?,
         Operation::Revoke { principal } => api::revoke(&store, &principal)?,
         Operation::Import {
             name,
