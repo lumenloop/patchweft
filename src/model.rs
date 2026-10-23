@@ -218,6 +218,9 @@ pub struct Action {
     /// fail-safe path and for every other policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_inputs: Option<String>,
+    /// The base commit a declared job's `base_paths` were keyed at, exported as `PATCHWEFT_BASE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_base: Option<String>,
 }
 
 /// A declared job's earlier pass that a candidate requires instead of a new action.

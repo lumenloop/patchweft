@@ -155,6 +155,7 @@ impl Lab {
                 }),
                 origin: None,
                 declared_inputs: None,
+                declared_base: None,
             },
             profile,
             revision: RevisionRef {

@@ -75,7 +75,7 @@ pub fn validate_profile(profile: &Profile, capacity: (u32, u32)) -> Result<()> {
         }
         if [Reuse::Exact, Reuse::Files, Reuse::Declared].contains(&job.reuse) {
             ensure!(
-                job.audit.len() >= 20,
+                job.audit.trim().chars().count() >= 20,
                 "completed-result reuse requires a recorded input audit"
             );
         }
@@ -347,6 +347,51 @@ pub fn passed_key(
     )
 }
 
+/// What a job's action must answer to, and what it recorded: a pass reused under its passed key
+/// answers to that key (it excludes the dependency actions it consumed), any other action to its
+/// action key. A reused job that is no longer declared has no passed key, so it answers to nothing.
+/// The one owner of this choice for retention and promote (pw#11 gate P3-5).
+struct Answer<'a> {
+    project: &'a str,
+    recipe: &'a str,
+    class: &'a str,
+    timeout_seconds: u64,
+    inputs: &'a Value,
+    declared: Option<&'a Value>,
+    dependencies: &'a [String],
+}
+
+impl Answer<'_> {
+    fn matches(&self, db: &Connection, action: &Action, reused: bool) -> Result<bool> {
+        let (key, recorded) = if reused {
+            let key = self
+                .declared
+                .map(|declared| {
+                    passed_key(
+                        self.project,
+                        self.recipe,
+                        self.class,
+                        self.timeout_seconds,
+                        declared,
+                    )
+                })
+                .transpose()?;
+            (key, passed_key_of(db, &action.id)?)
+        } else {
+            let key = action_key(
+                self.project,
+                self.recipe,
+                self.class,
+                self.timeout_seconds,
+                self.inputs,
+                self.dependencies,
+            )?;
+            (Some(key), Some(action.key.clone()))
+        };
+        Ok(key.is_some() && key == recorded)
+    }
+}
+
 /// The pre-recipe key. Only promote reads it, to check actions recorded before the upgrade.
 fn legacy_key(
     project: &str,
@@ -381,19 +426,10 @@ pub fn declarations(store: &Store, revision: &Revision, profile: &Profile) -> De
     }
 }
 
-/// A declared job off the fail-safe path is keyed on its declared inputs; every other job not
-/// projected to files is keyed on the whole commit.
-pub fn input_identity(
-    store: &Store,
-    revision: &Revision,
-    job: &Job,
-    declared: &Declared,
-) -> Result<Value> {
-    if job.reuse == Reuse::Declared
-        && let Some(identity) = declared.identity(&job.name)
-    {
-        return Ok(identity.clone());
-    }
+/// The inputs of a job's action key, the key outstanding work is shared under: the whole commit
+/// unless the job is projected to files. A declared job's declared inputs key only its passed key
+/// (`passed_key`), so queued and running work never joins across revisions (pw#11 gate P2-1).
+pub fn input_identity(store: &Store, revision: &Revision, job: &Job) -> Result<Value> {
     if job.reuse != Reuse::Files {
         return Ok(json!({"commit":revision.commit}));
     }
@@ -536,29 +572,16 @@ fn retainable(
     if !reused && action.dependencies != dependencies {
         return refuse("dependency actions differ");
     }
-    let (key, recorded) = if reused {
-        (
-            passed_key(
-                &request.revision.project,
-                recipe,
-                &identity.class,
-                identity.timeout_seconds,
-                inputs,
-            )?,
-            passed_key_of(&store.db, id)?,
-        )
-    } else {
-        let key = action_key(
-            &request.revision.project,
-            recipe,
-            &identity.class,
-            identity.timeout_seconds,
-            inputs,
-            dependencies,
-        )?;
-        (key, Some(action.key.clone()))
+    let answer = Answer {
+        project: &request.revision.project,
+        recipe,
+        class: &identity.class,
+        timeout_seconds: identity.timeout_seconds,
+        inputs,
+        declared: request.declared.identity(&definition.name),
+        dependencies,
     };
-    if recorded.as_ref() != Some(&key) {
+    if !answer.matches(&store.db, &action, reused)? {
         return refuse("action key differs");
     }
     if !evidence["timer_seconds"]
@@ -579,7 +602,7 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
     for dependency in &definition.dependencies {
         dependencies.push(request_job(store, request, dependency)?);
     }
-    let inputs = input_identity(store, request.revision, &definition, &request.declared)?;
+    let inputs = input_identity(store, request.revision, &definition)?;
     let recipe = request
         .recipes
         .get(name)
@@ -595,16 +618,19 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
         &dependencies,
     )?;
     // Only a declared job off the fail-safe path has a passed key.
-    let passed = match request.declared.identity(name) {
-        Some(_) => Some(passed_key(
-            &request.revision.project,
-            &recipe,
-            class,
-            definition.timeout_seconds,
-            &inputs,
-        )?),
-        None => None,
-    };
+    let declared = request.declared.identity(name).cloned();
+    let passed = declared
+        .as_ref()
+        .map(|declared| {
+            passed_key(
+                &request.revision.project,
+                &recipe,
+                class,
+                definition.timeout_seconds,
+                declared,
+            )
+        })
+        .transpose()?;
     let (owner, context, profile) = (request.owner, request.context, request.profile);
     // Before the generic lookup, so an unrelated queued row cannot capture the job and break the chain.
     let outcome = match request.retention {
@@ -757,7 +783,8 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
                 owner: owner.into(),
                 context: context.into(),
             }),
-            declared_inputs: passed.as_ref().map(|_| identity(&inputs)).transpose()?,
+            declared_inputs: declared.as_ref().map(identity).transpose()?,
+            declared_base: request.declared.base(name).map(Into::into),
         };
         transaction.execute(
             "INSERT INTO actions VALUES (?,?,'queued',NULL,?,?)",
@@ -1236,7 +1263,7 @@ pub fn promote(store: &mut Store, candidate_id: &str, expected: Option<&str>) ->
             .iter()
             .map(|d| candidate.required.get(d).cloned().unwrap_or_default())
             .collect();
-        let inputs = input_identity(store, &revision, definition, &declared)?;
+        let inputs = input_identity(store, &revision, definition)?;
         obligations.insert(name.clone(), (definition.clone(), dependencies, inputs));
     }
     let transaction = store.transaction()?;
@@ -1316,33 +1343,19 @@ pub fn promote(store: &mut Store, candidate_id: &str, expected: Option<&str>) ->
             "{mismatch}"
         );
         if let Some(identity) = &row.identity {
-            let (key, recorded) = match reused {
-                Some(_) => (
-                    passed_key(
-                        &revision.project,
-                        &recipes[name],
-                        "certifying",
-                        identity.timeout_seconds,
-                        inputs,
-                    )?,
-                    passed_key_of(&transaction, action)?,
-                ),
-                None => {
-                    let key = action_key(
-                        &revision.project,
-                        &recipes[name],
-                        "certifying",
-                        identity.timeout_seconds,
-                        inputs,
-                        dependencies,
-                    )?;
-                    (key, Some(row.key.clone()))
-                }
+            let answer = Answer {
+                project: &revision.project,
+                recipe: &recipes[name],
+                class: "certifying",
+                timeout_seconds: identity.timeout_seconds,
+                inputs,
+                declared: declared.identity(name),
+                dependencies,
             };
             ensure!(
                 identity.version == JOB_RECIPE
                     && identity.class == "certifying"
-                    && recorded == Some(key),
+                    && answer.matches(&transaction, &row, reused.is_some())?,
                 "{mismatch}"
             );
             if identity.timeout_seconds != definition.timeout_seconds {
@@ -1890,6 +1903,9 @@ mod declared_tests {
         }
         /// Writes (Some) or deletes (None) files, commits and imports the commit.
         fn commit(&mut self, files: &[(&str, Option<&str>)]) -> Revision {
+            self.commit_with(files, "fixture")
+        }
+        fn commit_with(&mut self, files: &[(&str, Option<&str>)], message: &str) -> Revision {
             for (name, text) in files {
                 let target = self.repo.join(name);
                 match text {
@@ -1912,7 +1928,7 @@ mod declared_tests {
                     "--quiet",
                     "--allow-empty",
                     "-m",
-                    "fixture",
+                    message,
                 ],
             )
             .unwrap();
@@ -2325,5 +2341,146 @@ mod declared_tests {
             certificate["receipts"]["check"]["reused"],
             json!(b.reused["check"])
         );
+    }
+
+    #[test]
+    fn queued_work_never_joins_across_revisions() {
+        // pw#11 gate P2-1: the sharing key keeps {commit}; only the passed key is declared.
+        let mut lab = Lab::new();
+        let profile = lab.profile();
+        let first = lab.commit(&[(FILE, Some(DECLARATIONS)), ("src/a.ts", Some("a\n"))]);
+        let a = lab.submit(&first, &profile);
+        let outside = lab.commit(&[("README", Some("changed"))]);
+        let b = lab.submit(&outside, &profile);
+        assert_ne!(
+            b.required["solo"], a.required["solo"],
+            "a queued action joined across revisions"
+        );
+        assert!(b.reused.is_empty());
+        lab.pass_all(&a);
+        let later = lab.commit(&[("README", Some("changed again"))]);
+        let c = lab.submit(&later, &profile);
+        assert_eq!(
+            c.reused["solo"].action, a.required["solo"],
+            "a pass is reused by its passed key"
+        );
+        assert_eq!(lab.events("action.reused").len(), c.reused.len());
+    }
+
+    #[test]
+    fn gitattributes_over_a_matched_path_are_inputs_and_checkouts_ignore_autocrlf() {
+        // pw#11 gate P2-2: attributes change the bytes a checkout writes.
+        let mut lab = Lab::new();
+        let profile = lab.profile();
+        let first = lab.commit(&[(FILE, Some(DECLARATIONS)), ("src/a.ts", Some("a\n"))]);
+        let a = lab.submit(&first, &profile);
+        lab.pass_all(&a);
+        let elsewhere = lab.commit(&[("docs/.gitattributes", Some("*.md text eol=crlf\n"))]);
+        let b = lab.submit(&elsewhere, &profile);
+        assert_eq!(
+            b.reused["solo"].action, a.required["solo"],
+            "attributes on no matched path are not inputs"
+        );
+        for attributes in [".gitattributes", "src/.gitattributes"] {
+            let crlf = lab.commit(&[(attributes, Some("*.ts text eol=crlf\n"))]);
+            let c = lab.submit(&crlf, &profile);
+            assert!(
+                !c.reused.contains_key("solo"),
+                "{attributes} changes the checkout's bytes"
+            );
+            lab.pass_all(&c);
+            lab.commit(&[(attributes, None)]);
+        }
+        // checkout_from clones into a fresh repository, so a source repository's autocrlf never
+        // applies; git_command also pins core.autocrlf=false for every checkout path.
+        source::git(&lab.repo, &["config", "core.autocrlf", "true"]).unwrap();
+        let dest = lab.root.join("checkout");
+        source::checkout_from(&lab.repo, &first.commit, &dest).unwrap();
+        assert_eq!(
+            fs::read(dest.join("src/a.ts")).unwrap(),
+            b"a\n",
+            "a repository's autocrlf never rewrites a checkout"
+        );
+    }
+
+    #[test]
+    fn a_base_is_only_the_trailer_and_the_job_learns_it() {
+        // pw#11 gate P2-3: with no trailer the base would be a guess, so the job keeps the commit key.
+        let mut lab = Lab::new();
+        let based = r#"{"schema":"patchweft.inputs/1","common":["package.json"],
+            "jobs":{"solo":{"paths":["src/**"],"base_paths":["src/**"],"why":"solo diffs src against the base"}}}"#;
+        let profile = lab.register("based", json!([job("solo", "declared", &[])]));
+        let base = lab.commit(&[
+            (FILE, Some(based)),
+            ("package.json", Some("{}")),
+            ("src/a.ts", Some("a\n")),
+        ]);
+        let plain = lab.commit(&[("README", Some("x"))]);
+        let a = lab.submit(&plain, &profile);
+        let action: Action = record(&lab.store.db, "actions", &a.required["solo"]).unwrap();
+        assert_eq!(
+            (action.declared_inputs, action.declared_base),
+            (None, None),
+            "no trailer, no base"
+        );
+        let message = format!("train\n\nPatchweft-Base: {}\n", base.commit);
+        let trailed = lab.commit_with(&[("README", Some("y"))], &message);
+        let b = lab.submit(&trailed, &profile);
+        let action: Action = record(&lab.store.db, "actions", &b.required["solo"]).unwrap();
+        assert!(action.declared_inputs.is_some());
+        assert_eq!(
+            action.declared_base.as_deref(),
+            Some(base.commit.as_str()),
+            "PATCHWEFT_BASE is the keyed base"
+        );
+    }
+
+    #[test]
+    fn editing_another_jobs_entry_keeps_this_jobs_identity() {
+        // pw#11 gate P3-4 (schema rule 7): a job keys on common and its own entry, not the file's bytes.
+        let mut lab = Lab::new();
+        let profile = lab.profile();
+        let first = lab.commit(&[(FILE, Some(DECLARATIONS)), ("src/a.ts", Some("a\n"))]);
+        let a = lab.submit(&first, &profile);
+        lab.pass_all(&a);
+        let others = DECLARATIONS
+            .replace(
+                "check reads src and package.json",
+                "check reads src and package.json, reworded",
+            )
+            .replace(
+                "a job this profile does not have",
+                "still a job this profile lacks",
+            );
+        let revision = lab.commit(&[(FILE, Some(&others))]);
+        let b = lab.submit(&revision, &profile);
+        assert_eq!(
+            b.reused["solo"].action, a.required["solo"],
+            "another entry's edit reruns nothing here"
+        );
+        let own = others.replace(r#""exclude":["src/*.md"]"#, r#""exclude":["src/*.txt"]"#);
+        let revision = lab.commit(&[(FILE, Some(&own))]);
+        let c = lab.submit(&revision, &profile);
+        assert!(
+            !c.reused.contains_key("solo"),
+            "its own entry's edit reruns it"
+        );
+    }
+
+    #[test]
+    fn audit_floors_count_characters_not_whitespace() {
+        // pw#11 gate P3-7: twenty spaces are no audit.
+        let mut lab = Lab::new();
+        let mut blank = job("solo", "declared", &[]);
+        blank["audit"] = json!(" ".repeat(24));
+        let path = lab.root.join("blank.json");
+        fs::write(
+            &path,
+            json!({"version":1,"name":"blank","certifying":true,"tools":{"sh":"/usr/bin/sh"},
+                "inputs_file":FILE,"jobs":[blank]})
+            .to_string(),
+        )
+        .unwrap();
+        assert!(register(&mut lab.store, &path).is_err());
     }
 }

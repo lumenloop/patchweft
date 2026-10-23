@@ -175,12 +175,19 @@ pub struct Declared {
     pub invalid: Option<String>,
     /// Keys that name no job of the profile; ignored.
     pub unmatched: Vec<String>,
+    /// The base commit each job with `base_paths` was keyed at.
+    bases: BTreeMap<String, String>,
 }
 
 impl Declared {
     /// The job's declared input identity, or None on the fail-safe path.
     pub fn identity(&self, job: &str) -> Option<&Value> {
         self.identities.get(job)
+    }
+
+    /// The base commit the job's `base_paths` were keyed at, if it has any.
+    pub fn base(&self, job: &str) -> Option<&str> {
+        self.bases.get(job).map(String::as_str)
     }
 }
 
@@ -205,7 +212,7 @@ pub fn parse(text: &str) -> Result<Declarations> {
                 entry
                     .why
                     .as_ref()
-                    .is_some_and(|why| why.chars().count() >= 20),
+                    .is_some_and(|why| why.trim().chars().count() >= 20),
                 "job {key} needs a why of at least 20 characters"
             ),
             (None, Some(_)) => {}
@@ -232,6 +239,7 @@ pub fn parse(text: &str) -> Result<Declarations> {
 struct Matcher<'a> {
     tree: &'a [Tracked],
     memo: BTreeMap<String, BTreeSet<usize>>,
+    index: BTreeMap<&'a str, usize>,
 }
 
 impl<'a> Matcher<'a> {
@@ -239,7 +247,37 @@ impl<'a> Matcher<'a> {
         Self {
             tree,
             memo: BTreeMap::new(),
+            index: tree
+                .iter()
+                .enumerate()
+                .map(|(i, file)| (file.path.as_str(), i))
+                .collect(),
         }
+    }
+
+    /// The set plus every tracked `.gitattributes` on a matched file's ancestor path: checkout
+    /// applies their `eol`, `working-tree-encoding` and filters, so they change the bytes a job
+    /// reads (pw#11 gate P2-2).
+    fn with_attributes(&self, matched: &BTreeSet<usize>) -> BTreeSet<usize> {
+        let mut all = matched.clone();
+        for &i in matched {
+            let path = &self.tree[i].path;
+            let mut directory = path.as_str();
+            loop {
+                directory = directory.rsplit_once('/').map_or("", |(parent, _)| parent);
+                let attributes = match directory {
+                    "" => ".gitattributes".to_owned(),
+                    _ => format!("{directory}/.gitattributes"),
+                };
+                if let Some(&j) = self.index.get(attributes.as_str()) {
+                    all.insert(j);
+                }
+                if directory.is_empty() {
+                    break;
+                }
+            }
+        }
+        all
     }
 
     fn matched(&mut self, pattern: &str) -> Result<&BTreeSet<usize>> {
@@ -291,11 +329,11 @@ pub fn evaluate(
     declarations: &Declarations,
     file: &str,
     tree: &[Tracked],
-    base: Option<&[Tracked]>,
+    base: Option<(&str, &[Tracked])>,
     profile: &Profile,
 ) -> Result<Declared> {
     let mut revision = Matcher::new(tree);
-    let mut at_base = base.map(Matcher::new);
+    let mut at_base = base.map(|(_, tree)| Matcher::new(tree));
     for pattern in &declarations.common {
         revision.nonempty(pattern, "revision")?;
     }
@@ -309,10 +347,12 @@ pub fn evaluate(
             }
         }
     }
-    let own = tree
-        .iter()
-        .position(|tracked| tracked.path == file)
-        .context("declarations file is not tracked")?;
+    // Each job keys on `common` and its own entry (schema rule 7), so the file's other bytes are
+    // not an input: rewording a `why` or another job's entry reruns nothing here (pw#11 gate P3-4).
+    ensure!(
+        tree.iter().any(|tracked| tracked.path == file),
+        "declarations file is not tracked"
+    );
     let unmatched = declarations
         .entries
         .keys()
@@ -325,6 +365,7 @@ pub fn evaluate(
         .cloned()
         .collect();
     let mut identities = BTreeMap::new();
+    let mut bases = BTreeMap::new();
     for job in profile
         .jobs
         .iter()
@@ -341,8 +382,7 @@ pub fn evaluate(
         let mut inputs = revision.union(&declarations.common)?;
         inputs.extend(revision.union(paths)?.difference(&excluded));
         inputs.extend(revision.union(&entry.keep)?);
-        inputs.insert(own);
-        let Some(files) = revision.files(&inputs) else {
+        let Some(files) = revision.files(&revision.with_attributes(&inputs)) else {
             continue;
         };
         let base_files = if entry.base_paths.is_empty() {
@@ -352,9 +392,12 @@ pub fn evaluate(
                 continue;
             };
             let matched = at_base.union(&entry.base_paths)?;
-            let Some(base_files) = at_base.files(&matched) else {
+            let Some(base_files) = at_base.files(&at_base.with_attributes(&matched)) else {
                 continue;
             };
+            if let Some((commit, _)) = base {
+                bases.insert(job.name.clone(), commit.to_owned());
+            }
             base_files
         };
         let mut job_entry = raw.clone();
@@ -370,6 +413,7 @@ pub fn evaluate(
         identities,
         invalid: None,
         unmatched,
+        bases,
     })
 }
 
@@ -403,11 +447,14 @@ fn read(repo: &Path, commit: &str, profile: &Profile) -> Result<Declared> {
         .any(|(entry, _)| !entry.base_paths.is_empty());
     let base = match needs_base {
         true => base(repo, commit)?
-            .map(|base| list(repo, &base))
+            .map(|base| list(repo, &base).map(|tree| (base, tree)))
             .transpose()?,
         false => None,
     };
-    evaluate(&declarations, file, &tree, base.as_deref(), profile)
+    let base = base
+        .as_ref()
+        .map(|(commit, tree)| (commit.as_str(), tree.as_slice()));
+    evaluate(&declarations, file, &tree, base, profile)
 }
 
 /// `git ls-tree -r -z --full-tree`: every tracked file of `commit`.
@@ -429,8 +476,8 @@ fn list(repo: &Path, commit: &str) -> Result<Vec<Tracked>> {
         .collect()
 }
 
-/// The commit a `Patchweft-Base:` trailer names, else the first parent. A trailer that is
-/// ambiguous or names no commit here leaves no base rather than falling back to the parent.
+/// The commit a `Patchweft-Base:` trailer names. No trailer, or one that is ambiguous or names no
+/// commit here, leaves no base.
 fn base(repo: &Path, commit: &str) -> Result<Option<String>> {
     let trailers = source::git(
         repo,
@@ -468,12 +515,9 @@ fn base(repo: &Path, commit: &str) -> Result<Option<String>> {
             .success()
             .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned()));
     }
-    let parents = source::git(repo, &["show", "-s", "--format=%P", commit])?;
-    Ok(parents
-        .split(' ')
-        .next()
-        .filter(|parent| !parent.is_empty())
-        .map(Into::into))
+    // No trailer, no base: a composition's first parent is an intermediate step, not its base
+    // (pw#11 gate P2-3), so a job with `base_paths` keeps the commit key.
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -587,6 +631,8 @@ mod tests {
         base: Option<&[Tracked]>,
         p: &Profile,
     ) -> Result<Declared> {
+        let base = base.map(|tree| ("b".repeat(40), tree));
+        let base = base.as_ref().map(|(commit, tree)| (commit.as_str(), *tree));
         evaluate(&parse(&text.to_string())?, FILE, tree, base, p)
     }
 
@@ -697,21 +743,15 @@ mod tests {
         assert_eq!(result.unmatched, ["ghost", "ghost-*"]);
         assert_eq!(
             files(&result, "vitest-a"),
-            [
-                FILE,
-                "package.json",
-                "src/README.md",
-                "src/a.ts",
-                "src/b.ts"
-            ]
+            ["package.json", "src/README.md", "src/a.ts", "src/b.ts"]
         );
         assert_eq!(
             files(&result, "vitest-unit-b"),
-            [FILE, "package.json", "scripts/run.sh"]
+            ["package.json", "scripts/run.sh"]
         );
         assert_eq!(
             files(&result, "vitest-exact"),
-            [FILE, "docs/guide.md", "docs/keep.md", "package.json"]
+            ["docs/guide.md", "docs/keep.md", "package.json"]
         );
         assert_eq!(result.identity("other"), None, "absent from jobs");
         // A key naming only a job of another policy still names a job of the profile.
@@ -767,7 +807,6 @@ mod tests {
         assert_eq!(
             files(&result, "lint"),
             [
-                FILE,
                 "docs/guide.md",
                 "docs/keep.md",
                 "migrations/1.sql",
@@ -785,8 +824,12 @@ mod tests {
         assert!(entry["job"].get("why").is_none());
         assert_eq!(entry["job"]["keep"], json!(["docs/keep.md"]));
         assert_eq!(identity["declared"]["base_files"], json!([]));
+        let guide = tree
+            .iter()
+            .find(|file| file.path == "docs/guide.md")
+            .unwrap();
         let first = &identity["declared"]["files"][0];
-        assert_eq!(first, &json!([FILE, "100644", tree[0].oid]));
+        assert_eq!(first, &json!(["docs/guide.md", "100644", guide.oid]));
         // The reason is not identity; the entry is.
         let reworded = text
             .to_string()
@@ -925,45 +968,64 @@ mod tests {
             )],
             "reword",
         );
-        assert_ne!(
+        assert_eq!(
             lint(&repo, &reworded).unwrap(),
             first,
-            "the declarations file is always an input"
+            "a reworded why is not an input (schema rule 7)"
         );
     }
 
     #[test]
-    fn base_files_come_from_the_trailer_or_the_first_parent() {
+    fn base_files_come_only_from_the_trailer() {
         let (repo, seed) = seeded();
         let p = declared(&["lint", "proofs"]);
-        let proofs = |commit: &str| resolve(&repo.path, commit, &p).identity("proofs").cloned();
-        // A root commit has no base: `proofs` keeps the commit key.
+        let resolved = |commit: &str| resolve(&repo.path, commit, &p);
+        let proofs = |commit: &str| resolved(commit).identity("proofs").cloned();
+        // No trailer, no base: a composition's first parent is not its base (pw#11 gate P2-3).
         assert_eq!(proofs(&seed), None);
         let child = repo.commit(&[("README", Some("child"))], "child");
-        let parent_base = proofs(&child).unwrap();
+        assert_eq!(proofs(&child), None, "the parent is never guessed");
+        assert!(resolved(&child).identity("lint").is_some());
+        let named = repo.commit(
+            &[("README", Some("named"))],
+            &format!("named base\n\nPatchweft-Base: {seed}"),
+        );
+        let seeded_base = proofs(&named).unwrap();
         assert_eq!(
-            parent_base["declared"]["base_files"],
+            seeded_base["declared"]["base_files"],
             json!([[
                 "migrations/1.sql",
                 "100644",
                 repo.git(&["rev-parse", &format!("{seed}:migrations/1.sql")])
             ]])
         );
-        let migrated = repo.commit(&[("migrations/1.sql", Some("one, edited"))], "migrate");
-        let next = repo.commit(&[("README", Some("next"))], "next");
-        assert_ne!(
-            proofs(&next).unwrap(),
-            parent_base,
-            "the base's migrations changed"
+        assert_eq!(
+            resolved(&named).base("proofs"),
+            Some(seed.as_str()),
+            "the keyed base is recorded"
         );
-        // The trailer names another base and wins over the parent.
-        let trailer = format!("named base\n\nPatchweft-Base: {seed}");
-        let named = repo.commit(&[("README", Some("named"))], &trailer);
-        assert_eq!(proofs(&named).unwrap(), parent_base);
+        assert_eq!(
+            resolved(&named).base("lint"),
+            None,
+            "a job without base_paths keys no base"
+        );
+        let migrated = repo.commit(
+            &[("migrations/1.sql", Some("one, edited"))],
+            &format!("migrate\n\nPatchweft-Base: {seed}"),
+        );
         assert_eq!(
             proofs(&migrated).unwrap(),
-            parent_base,
+            seeded_base,
             "its own migrations are not base files"
+        );
+        let next = repo.commit(
+            &[("README", Some("next"))],
+            &format!("next\n\nPatchweft-Base: {migrated}"),
+        );
+        assert_ne!(
+            proofs(&next).unwrap(),
+            seeded_base,
+            "the base's migrations changed"
         );
         // A trailer that names no commit leaves no base rather than falling back.
         let unknown = repo.commit(
@@ -971,7 +1033,7 @@ mod tests {
             &format!("unknown base\n\nPatchweft-Base: {}", "0".repeat(40)),
         );
         assert_eq!(proofs(&unknown), None);
-        assert!(resolve(&repo.path, &unknown, &p).identity("lint").is_some());
+        assert!(resolved(&unknown).identity("lint").is_some());
     }
 
     #[test]

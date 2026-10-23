@@ -2832,6 +2832,7 @@ mod tests {
                 reservation: None,
                 origin: None,
                 declared_inputs: None,
+                declared_base: None,
             },
             profile: profile("p-ok", "e"),
             revision: RevisionRef {
@@ -3927,11 +3928,21 @@ mod tests {
             "an unrecorded process's listener is a host service: {refused:?}"
         );
         supervising(&root, &control, "a1", supervisor.id());
-        let coordinator = coordinator.guarded(Guards {
-            loopback: Some(others()),
-            ..Guards::default()
-        });
-        assert_eq!(coordinator.declining(None), None);
+        // Tests running alongside open listeners of their own between computing the allow list and
+        // the check; recompute it a few times. The probe's own listener is never allowed, so an
+        // unwired `declining()` still refuses every time.
+        let (mut coordinator, mut declined) = (coordinator, Some(String::new()));
+        for _ in 0..10 {
+            coordinator = coordinator.guarded(Guards {
+                loopback: Some(others()),
+                ..Guards::default()
+            });
+            declined = coordinator.declining(None);
+            if declined.is_none() {
+                break;
+            }
+        }
+        assert_eq!(declined, None);
         stop(supervisor);
     }
 

@@ -427,6 +427,10 @@ fn execute_command(
     if let Some(inputs) = &action.declared_inputs {
         command.env("PATCHWEFT_INPUTS", inputs);
     }
+    // The base the key read `base_paths` at, so a job diffs against the base it was keyed on.
+    if let Some(base) = &action.declared_base {
+        command.env("PATCHWEFT_BASE", base);
+    }
     // Preparing can take seconds; a stop recorded meanwhile wins before anything of the job runs.
     let pending = if STOP.load(Ordering::SeqCst) {
         Some("supervisor-stop".to_owned())
@@ -1206,6 +1210,7 @@ mod tests {
                 reservation: None,
                 origin: None,
                 declared_inputs: None,
+                declared_base: None,
             },
             profile: profile.clone(),
             revision: RevisionRef {
@@ -1304,6 +1309,7 @@ mod tests {
                 reservation: None,
                 origin: None,
                 declared_inputs: None,
+                declared_base: None,
             },
             profile: profile.clone(),
             revision: RevisionRef {

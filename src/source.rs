@@ -30,6 +30,10 @@ pub fn git_command(repo: &Path) -> Command {
             "core.hooksPath=/dev/null",
             "-c",
             "commit.gpgsign=false",
+            // Checkouts write the tree's bytes as declared inputs hash them: line-ending conversion
+            // comes only from tracked .gitattributes, which are inputs (pw#11 gate P2-2).
+            "-c",
+            "core.autocrlf=false",
             "-C",
         ])
         .arg(repo);

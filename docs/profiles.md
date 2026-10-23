@@ -149,10 +149,15 @@ submit from the revision under test:
 ```
 
 - A job's inputs are `common`, plus its `paths` less `exclude`, plus `keep`,
-  matched against the revision's tracked files. The declarations file is always
-  an input, and `exclude` never removes a `common` file. `base_paths` are matched
-  against the base: the commit a `Patchweft-Base:` trailer in the commit message
-  names, else the first parent.
+  matched against the revision's tracked files, plus every tracked
+  `.gitattributes` on an input's ancestor path (checkout applies their line
+  endings and filters). `exclude` never removes a `common` file. The job's own
+  entry and `common` are part of its identity; the rest of the declarations file
+  is not, so rewording a `why` or another job's entry reruns nothing.
+- `base_paths` are matched against the base: the commit a `Patchweft-Base:`
+  trailer in the commit message names. With no trailer, or one that names no
+  commit, there is no base and a job with `base_paths` keeps the commit key. The
+  job receives the base it was keyed at as `PATCHWEFT_BASE`.
 - A key names a job exactly or a family `prefix*`. An exact name wins, then the
   longest family. A key that names no job of the profile is ignored and recorded
   as an `inputs.unmatched` event.
@@ -165,15 +170,23 @@ The declared identity covers the job's entry without `why`, `common`, and the
 path, mode and object ID of every input and base file. A declared job reuses an
 earlier `passed` action with the same recipe, evidence class, timeout and
 declared identity from any revision of the project. Its dependency actions are
-not compared: the recipe already hashes the dependencies' recipes. Without such
-a pass, the job shares outstanding work and runs as under `inflight`. A failed,
-interrupted, canceled or stopping action is never reused.
+not compared: the recipe already hashes the dependencies' recipes. Only a
+`passed` action is reused this way. Queued and running work is still shared under
+the commit and dependency actions exactly as under `inflight`, so outstanding
+work never joins across revisions. A failed, interrupted, canceled or stopping
+action is never reused.
 
 A reused job is listed in the candidate's `reused` with the action and the
 candidate and revision it ran for, and emits `action.reused`. `status` shows the
 job as `passed` with its `reused` entry, and the frontier certificate marks the
 receipt `reused`. Declared jobs receive `PATCHWEFT_INPUTS`, the SHA-256 of their
 declared identity.
+
+Before registering a profile with `declared` jobs, every executor must run a
+binary that knows the policy, and the jobs themselves must not pass vacuously: a
+job that skips its checks when "nothing it covers changed" (an adapter's own
+applicability test) exits 0, and Patchweft cannot tell that skip from a pass, so
+the declared key must replace such a skip rather than sit beside it.
 
 Each of these keeps a job on today's `inflight` behaviour, keyed on the commit
 and its dependency actions with no completed reuse:
