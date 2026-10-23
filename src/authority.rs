@@ -205,9 +205,10 @@ pub struct Selection {
     /// Capacity held for prioritized work this executor could run once a running dependency
     /// passes (the train-first hold): what it needs, per priority.
     pub hold: BTreeMap<i64, Reservation>,
-    /// What the running dependencies being waited on hold here: it frees before the held jobs
-    /// start, so it is not counted beside the hold as well (gate P3-3).
-    pub freed: Reservation,
+    /// What the running dependencies being waited on hold here, with the highest priority of the
+    /// held jobs waiting on each: it frees before they start, so it is not counted beside the hold
+    /// as well (gate P3-3), and only for heads below that priority (re-gate P3-1).
+    pub freed: Vec<(i64, Reservation)>,
 }
 
 /// The head of one executor's queue: work it may run and could ever fit, ordered by owner
@@ -296,7 +297,12 @@ pub fn select(
                     };
                     if let Some((attempt, body)) = running {
                         let held: Attempt = serde_json::from_str(&body)?;
-                        waited_on.insert(attempt, (held.slots, held.memory_mb));
+                        let entry = waited_on.entry(attempt).or_insert((
+                            priority,
+                            held.slots,
+                            held.memory_mb,
+                        ));
+                        entry.0 = entry.0.max(priority);
                     }
                 }
             }
@@ -346,16 +352,10 @@ pub fn select(
         .next()
         .filter(|(_, _, trusted, _)| *trusted)
         .map(|(.., choice)| choice);
-    let freed = waited_on.values().fold(
-        Reservation {
-            slots: 0,
-            memory_mb: 0,
-        },
-        |sum, (slots, memory_mb)| Reservation {
-            slots: sum.slots.saturating_add(*slots),
-            memory_mb: sum.memory_mb.saturating_add(*memory_mb),
-        },
-    );
+    let freed = waited_on
+        .into_values()
+        .map(|(priority, slots, memory_mb)| (priority, Reservation { slots, memory_mb }))
+        .collect();
     Ok(Selection {
         choice,
         unverified,
@@ -530,6 +530,20 @@ pub fn claim_for(
     };
     let beside_hold = |choice: &Choice| {
         holding(choice.priority).is_none_or(|demand| {
+            // Only dependencies higher priorities wait on free room for this head.
+            let freed = freed
+                .iter()
+                .filter(|(priority, _)| *priority > choice.priority)
+                .fold(
+                    Reservation {
+                        slots: 0,
+                        memory_mb: 0,
+                    },
+                    |sum, (_, need)| Reservation {
+                        slots: sum.slots.saturating_add(need.slots),
+                        memory_mb: sum.memory_mb.saturating_add(need.memory_mb),
+                    },
+                );
             fits(
                 Reservation {
                     slots: held
@@ -2849,6 +2863,59 @@ mod tests {
         crate::worker::set_priority(&store, "b", 1).unwrap();
         assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("b-lint"));
         assert_eq!(mindy_claims(&mut store, "k2"), None);
+    }
+
+    /// A running attempt of `action` on mindy, so it counts in `held` and as a dependency waited on.
+    fn running_on_mindy(store: &Store, action: &str, need: (u32, u32)) {
+        let id = format!("{action}-a");
+        store
+            .db
+            .execute(
+                "INSERT INTO attempts VALUES (?,?,'running',0,?)",
+                rusqlite::params![
+                    id,
+                    action,
+                    json!({"id":id,"action":action,"worker_pid":1,"worker_start":"1","supervisor_pid":null,
+                           "supervisor_start":null,"slots":need.0,"memory_mb":need.1,"created":0.0,
+                           "started":null,"ended":null,"exit_code":null,"result":null,"executor":"mindy"})
+                    .to_string()
+                ],
+            )
+            .unwrap();
+        store
+            .db
+            .execute("UPDATE actions SET attempt=? WHERE id=?", [&id, action])
+            .unwrap();
+    }
+
+    #[test]
+    fn a_lower_train_never_counts_its_own_dependency_as_freed_for_a_higher_train() {
+        // Re-gate P3-1 on pw#10: train A (2) waits on a prepare elsewhere; train B (1) runs its
+        // prepare on mindy. B's lint must not take A's room because B's prepare will free.
+        let (_root, mut store) = hold_lab();
+        job_of(&store, "prepare-a", "a", "running", (1, 1), &[]);
+        job_of(&store, "a-shard", "a", "queued", (4, 1024), &["prepare-a"]);
+        job_of(&store, "prepare-b", "b", "running", (4, 1024), &[]);
+        running_on_mindy(&store, "prepare-b", (4, 1024));
+        job_of(&store, "b-shard", "b", "queued", (4, 1024), &["prepare-b"]);
+        job_of(&store, "b-lint", "b", "queued", (4, 1024), &[]);
+        crate::worker::set_priority(&store, "a", 2).unwrap();
+        crate::worker::set_priority(&store, "b", 1).unwrap();
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+    }
+
+    #[test]
+    fn a_dependency_two_held_jobs_wait_on_frees_its_capacity_once() {
+        // Re-gate P3-2 on pw#10: held 7 (prepare 4 + other 3) - freed 4 + demand 5 + lane 1 = 9 > 8.
+        let (_root, mut store) = hold_lab();
+        job_of(&store, "prepare", "train", "running", (4, 256), &[]);
+        running_on_mindy(&store, "prepare", (4, 256));
+        hold(&store.db, "other", Some("mindy"), 3, 256);
+        job_of(&store, "shard-1", "train", "queued", (3, 256), &["prepare"]);
+        job_of(&store, "shard-2", "train", "queued", (2, 256), &["prepare"]);
+        job_of(&store, "lane", "lane", "queued", (1, 256), &[]);
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
     }
 
     #[test]
