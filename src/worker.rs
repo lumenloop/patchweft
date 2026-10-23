@@ -1,6 +1,6 @@
 use crate::{
     authority::{self, Choice, Scope},
-    engine, file_hash,
+    engine, file_hash, identity,
     model::*,
     now, source,
     store::{Store, event},
@@ -614,7 +614,7 @@ fn execute_command(
     ))
 }
 
-fn evidence_identity(action: &Action) -> Value {
+pub(crate) fn evidence_identity(action: &Action) -> Value {
     action.identity.as_ref().map_or(
         Value::Null,
         |i| json!({"version":i.version,"recipe":i.recipe,"class":i.class,"key":action.key}),
@@ -727,52 +727,20 @@ pub fn execute(store: &mut Store, attempt_id: &str) -> Result<Value> {
         code = 125;
         evidence["cleanup_error"] = json!(format!("{error:#}"));
     }
-    attempt.ended = Some(now());
-    attempt.exit_code = Some(code);
-    attempt.result = Some(evidence.clone());
-    let state = if code == 0 {
-        "passed"
-    } else if evidence["reason"] == "no-requesters" {
-        "canceled"
-    } else {
-        "failed"
+    let request = CompleteRequest {
+        attempt: attempt_id.into(),
+        lease: attempt.lease.clone().unwrap_or_default(),
+        outcome: Outcome::Completed,
+        reason: evidence["reason"].as_str().map(String::from),
+        exit_code: code,
+        evidence,
+        drained,
+        log: None,
+        cleanup_log: None,
+        artifacts: BTreeMap::new(),
     };
     let transaction = store.transaction()?;
-    let current: Option<String> = transaction.query_row(
-        "SELECT attempt FROM actions WHERE id=?",
-        [&action.id],
-        |r| r.get(0),
-    )?;
-    ensure!(
-        current.as_deref() == Some(attempt_id),
-        "attempt result was fenced"
-    );
-    transaction.execute(
-        "UPDATE attempts SET state=?,drained=?,body=? WHERE id=?",
-        params![state, drained, serde_json::to_string(&attempt)?, attempt_id],
-    )?;
-    transaction.execute(
-        "UPDATE actions SET state=? WHERE id=? AND attempt=?",
-        params![state, action.id, attempt_id],
-    )?;
-    if state == "failed" {
-        transaction.execute(
-            "INSERT INTO repairs VALUES (?,?,?,'execution','open',?,NULL,?)",
-            params![
-                unique(),
-                action.revision,
-                action.id,
-                evidence.to_string(),
-                now()
-            ],
-        )?;
-    }
-    event(
-        &transaction,
-        "attempt.completed",
-        attempt_id,
-        &json!({"state":state,"evidence":evidence}),
-    )?;
+    let state = authority::record_result(&transaction, &request, &identity(&request)?)?;
     transaction.commit()?;
     Ok(json!({"attempt":attempt_id,"state":state}))
 }

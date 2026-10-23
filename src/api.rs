@@ -1137,6 +1137,10 @@ fn upload_path(store: &Store, principal: &str, sha256: &str) -> PathBuf {
 }
 pub const MAX_BUNDLE: usize = 1024 * 1024 * 1024;
 pub const MAX_RETAINED_UPLOADS: u64 = 4 * MAX_BUNDLE as u64;
+/// Per artifact or log file, so a result recorded on one host is deliverable from every host.
+pub const MAX_ARTIFACT_BYTES: u64 = MAX_BUNDLE as u64;
+/// Per attempt: artifacts and logs together.
+pub const MAX_ATTEMPT_OUTPUT_BYTES: u64 = MAX_RETAINED_UPLOADS;
 pub const TRANSFER_TIMEOUT_SECONDS: u64 = 600;
 impl Api {
     pub fn begin_upload(&self, token: &str, sha256: &str) -> ApiResult<tempfile::NamedTempFile> {

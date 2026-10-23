@@ -1,16 +1,20 @@
 //! The only code that changes attempt and lease state. The local worker calls it in-process;
 //! remote executors reach the same functions through the authenticated API.
 use crate::{
-    engine,
+    api, engine,
     model::*,
-    now,
+    now, source,
     store::{self, Store, event, record},
     unique,
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::{
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    fs,
+    path::PathBuf,
+};
 
 pub const LOCAL: &str = "local";
 pub const DEFAULT_LEASE_SECONDS: u64 = 300;
@@ -216,15 +220,8 @@ pub fn select(
         {
             continue;
         }
-        if scope.projects.is_some() {
-            let project: String = db.query_row(
-                "SELECT project FROM revisions WHERE id=?",
-                [&action.revision],
-                |r| r.get(0),
-            )?;
-            if !scope.allows_project(&project) {
-                continue;
-            }
+        if scope.projects.is_some() && !scope.allows_project(&project(db, &action.revision)?) {
+            continue;
         }
         let (reservation, timeout_seconds) = budget(db, &mut profiles, &action)?;
         // Work this executor can never fit must not idle it behind the head.
@@ -515,6 +512,682 @@ fn claim_of(db: &Connection, attempt: &Attempt, action: Action) -> Result<Claim>
         },
         dependencies,
     })
+}
+
+fn project(db: &Connection, revision: &str) -> Result<String> {
+    Ok(db.query_row(
+        "SELECT project FROM revisions WHERE id=?",
+        [revision],
+        |r| r.get(0),
+    )?)
+}
+
+/// The one writer of the stop transition. A reason the executor reports wins; otherwise the
+/// store stops a running action nobody requests any more. Returns the recorded reason.
+pub fn stopping(
+    db: &Connection,
+    action: &str,
+    attempt: &str,
+    reported: Option<&str>,
+) -> Result<Option<String>> {
+    let (state, current): (String, Option<String>) = db.query_row(
+        "SELECT state,attempt FROM actions WHERE id=?",
+        [action],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if current.as_deref() != Some(attempt) {
+        return Ok(None);
+    }
+    if state == "stopping" {
+        return Ok(db.query_row(
+            "SELECT json_extract(body,'$.stop') FROM attempts WHERE id=?",
+            [attempt],
+            |r| r.get(0),
+        )?);
+    }
+    if state != "running" {
+        return Ok(None);
+    }
+    let reason = match reported {
+        Some(reason) => reason.to_owned(),
+        None => {
+            let active: i64 = db.query_row(
+                "SELECT COUNT(*) FROM interests WHERE action=? AND active=1",
+                [action],
+                |r| r.get(0),
+            )?;
+            if active > 0 {
+                return Ok(None);
+            }
+            "no-requesters".to_owned()
+        }
+    };
+    db.execute(
+        "UPDATE actions SET state='stopping' WHERE id=? AND attempt=? AND state='running'",
+        params![action, attempt],
+    )?;
+    db.execute(
+        "UPDATE attempts SET body=json_set(body,'$.stop',?) WHERE id=?",
+        params![reason, attempt],
+    )?;
+    let executor: String = db.query_row(
+        &format!("SELECT {EXECUTOR} FROM attempts WHERE id=?"),
+        [attempt],
+        |r| r.get(0),
+    )?;
+    event(
+        db,
+        "attempt.stopping",
+        attempt,
+        &json!({"reason":reason,"executor":executor}),
+    )?;
+    Ok(Some(reason))
+}
+
+/// This executor's attempt under this lease, with its state and drained flag.
+fn owned(
+    db: &Connection,
+    executor: &str,
+    attempt: &str,
+    lease: &str,
+) -> Result<Option<(String, bool, Attempt)>> {
+    let row: Option<(String, bool, String)> = db
+        .query_row(
+            "SELECT state,drained,body FROM attempts WHERE id=?",
+            [attempt],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((state, drained, body)) = row else {
+        return Ok(None);
+    };
+    let attempt: Attempt = serde_json::from_str(&body)?;
+    let mine = attempt.executor.as_deref().unwrap_or(LOCAL) == executor
+        && attempt.lease.as_deref() == Some(lease);
+    Ok(mine.then_some((state, drained, attempt)))
+}
+
+/// The action of an attempt that is still held (A10), within the executor's current scope (A6),
+/// with the action's state. None means the attempt is fenced.
+fn holding(
+    db: &Connection,
+    scope: &Scope,
+    attempt: &Attempt,
+    state: &str,
+) -> Result<Option<(Action, String)>> {
+    if !["claimed", "running"].contains(&state) {
+        return Ok(None);
+    }
+    let row: Option<(String, Option<String>, String)> = db
+        .query_row(
+            "SELECT state,attempt,body FROM actions WHERE id=?",
+            [&attempt.action],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((action_state, current, body)) = row else {
+        return Ok(None);
+    };
+    if current.as_deref() != Some(attempt.id.as_str())
+        || !["running", "stopping"].contains(&action_state.as_str())
+    {
+        return Ok(None);
+    }
+    let action: Action = serde_json::from_str(&body)?;
+    if !scope.allows_profile(&action.profile)
+        || (scope.projects.is_some() && !scope.allows_project(&project(db, &action.revision)?))
+    {
+        return Ok(None);
+    }
+    Ok(Some((action, action_state)))
+}
+
+const MAX_LEASES: usize = 64;
+/// Stops a supervisor decides itself. `no-requesters` is decided by the store alone.
+const SUPERVISOR_STOPS: [&str; 2] = ["timeout", "supervisor-stop"];
+
+/// Extends the leases an executor still holds, registers its supervisors and relays stops in
+/// both directions. Entries it no longer holds are fenced and left untouched.
+pub fn renew(
+    store: &mut Store,
+    executor: &str,
+    scope: &Scope,
+    request: &RenewRequest,
+) -> Result<RenewResponse, AuthorityError> {
+    if request.leases.len() > MAX_LEASES {
+        return Err(AuthorityError::Invalid(format!(
+            "At most {MAX_LEASES} leases are renewed at once."
+        )));
+    }
+    if let Some(reason) = request
+        .leases
+        .iter()
+        .filter_map(|entry| entry.stopping.as_deref())
+        .find(|reason| !SUPERVISOR_STOPS.contains(reason))
+    {
+        return Err(AuthorityError::Invalid(format!(
+            "Unknown supervisor stop: {reason}."
+        )));
+    }
+    let transaction = store.transaction()?;
+    let mut record = load(&transaction, executor)?.ok_or(AuthorityError::Unregistered)?;
+    seen(&transaction, &mut record)?;
+    let mut leases = Vec::new();
+    for entry in &request.leases {
+        leases.push(renew_lease(&transaction, &record, scope, entry)?);
+    }
+    transaction.commit()?;
+    Ok(RenewResponse {
+        lease_seconds: record.lease_seconds,
+        leases,
+    })
+}
+
+fn renew_lease(
+    db: &Connection,
+    record: &ExecutorRecord,
+    scope: &Scope,
+    entry: &LeaseReport,
+) -> Result<LeaseStatus> {
+    let held = match owned(db, &record.id, &entry.attempt, &entry.lease)? {
+        Some((state, _, attempt)) => holding(db, scope, &attempt, &state)?
+            .map(|(action, action_state)| (state, attempt, action, action_state)),
+        None => None,
+    };
+    let Some((mut state, mut attempt, action, action_state)) = held else {
+        return Ok(LeaseStatus {
+            attempt: entry.attempt.clone(),
+            status: "fenced".into(),
+            stop: None,
+            registered: false,
+            lease_expires: None,
+        });
+    };
+    let expires = now() + record.lease_seconds as f64;
+    attempt.lease_expires = Some(expires);
+    // Nothing runs before the store records the attempt running, and nothing starts once the
+    // action is stopping.
+    if let Some(started) = &entry.started
+        && state == "claimed"
+        && action_state == "running"
+    {
+        state = "running".into();
+        attempt.started = Some(now());
+        attempt.supervisor_pid = Some(started.pid);
+        attempt.supervisor_start = Some(started.start.clone());
+        event(
+            db,
+            "attempt.started",
+            &attempt.id,
+            &json!({"pid":started.pid,"executor":record.id}),
+        )?;
+    }
+    db.execute(
+        "UPDATE attempts SET state=?,body=? WHERE id=?",
+        params![state, serde_json::to_string(&attempt)?, attempt.id],
+    )?;
+    let stop = stopping(db, &action.id, &attempt.id, entry.stopping.as_deref())?;
+    Ok(LeaseStatus {
+        attempt: attempt.id,
+        status: "ok".into(),
+        stop,
+        registered: state == "running",
+        lease_expires: Some(expires),
+    })
+}
+
+/// A heartbeat is a sign of life; like claims it rewrites the record at most every 30 s.
+fn seen(db: &Connection, record: &mut ExecutorRecord) -> Result<()> {
+    let seen = now();
+    if record
+        .observed
+        .last_seen
+        .is_some_and(|last| seen - last <= 30.0)
+    {
+        return Ok(());
+    }
+    record.observed.last_seen = Some(seen);
+    db.execute(
+        "UPDATE executors SET body=json_set(body,'$.observed',json(?)) WHERE id=?",
+        params![serde_json::to_string(&record.observed)?, record.id],
+    )?;
+    Ok(())
+}
+
+pub enum Outputs {
+    /// The attempt's files are already in `state/attempts/ID` (the local executor).
+    InPlace,
+    /// Verified uploads, moved into `state/attempts/ID` only when the result is recorded.
+    Staged(PathBuf),
+}
+
+/// Records an executor's report of its attempt. A replay of the recorded report is answered
+/// again; a fenced attempt's result is never recorded, though its drain may be.
+pub fn complete(
+    store: &mut Store,
+    executor: &str,
+    scope: &Scope,
+    request: &CompleteRequest,
+    outputs: Outputs,
+) -> Result<CompleteResponse, AuthorityError> {
+    let result = record_completion(store, executor, scope, request, &outputs);
+    // Uploads of an unrecorded completion are consumed, never kept. serve's purge of stale
+    // staging covers a removal that fails here.
+    if let Outputs::Staged(directory) = &outputs
+        && directory.exists()
+    {
+        let _ = fs::remove_dir_all(directory);
+    }
+    result
+}
+
+fn record_completion(
+    store: &mut Store,
+    executor: &str,
+    scope: &Scope,
+    request: &CompleteRequest,
+    outputs: &Outputs,
+) -> Result<CompleteResponse, AuthorityError> {
+    let hash = crate::identity(request)?;
+    let root = store.root.clone();
+    let transaction = store.transaction()?;
+    let Some((state, drained, attempt)) =
+        owned(&transaction, executor, &request.attempt, &request.lease)?
+    else {
+        return Err(AuthorityError::Fenced);
+    };
+    // Before fencing: the answer to a lost response must not depend on what happened since.
+    if let Some(completion) = &attempt.completion {
+        if *completion != hash {
+            return Err(AuthorityError::CompletionConflict);
+        }
+        return Ok(CompleteResponse {
+            attempt: attempt.id,
+            status: "recorded".into(),
+            state: Some(state),
+            drained,
+            replayed: true,
+            drain_recorded: false,
+        });
+    }
+    let Some((action, _)) = holding(&transaction, scope, &attempt, &state)? else {
+        // A2: the holder of an expired lease may still report that its attempt drained.
+        if state == "interrupted" && !drained && request.drained {
+            transaction.execute("UPDATE attempts SET drained=1 WHERE id=?", [&attempt.id])?;
+            event(
+                &transaction,
+                "attempt.drain_reported",
+                &attempt.id,
+                &json!({"executor":executor}),
+            )?;
+            transaction.commit()?;
+            return Ok(CompleteResponse {
+                attempt: attempt.id,
+                status: "fenced".into(),
+                state: Some(state),
+                drained: true,
+                replayed: false,
+                drain_recorded: true,
+            });
+        }
+        return Err(AuthorityError::Fenced);
+    };
+    let evidence = verified_evidence(request, &attempt, &action)?;
+    if let Outputs::Staged(directory) = outputs {
+        let target = root.join("attempts").join(&attempt.id);
+        if fs::symlink_metadata(&target).is_ok() {
+            // Left by a commit that failed after the move; this completion replaces it.
+            let stale = root.join(format!(".incoming-stale-{}", unique()));
+            fs::rename(&target, &stale).context("set aside stale attempt outputs")?;
+            fs::remove_dir_all(&stale).context("remove stale attempt outputs")?;
+        }
+        fs::rename(directory, &target).context("move staged attempt outputs")?;
+    }
+    let recorded = CompleteRequest {
+        evidence,
+        ..request.clone()
+    };
+    let state = record_result(&transaction, &recorded, &hash)?;
+    transaction.commit()?;
+    Ok(CompleteResponse {
+        attempt: attempt.id,
+        status: "recorded".into(),
+        state: Some(state.into()),
+        drained: request.drained,
+        replayed: false,
+        drain_recorded: false,
+    })
+}
+
+/// A11: identity fields come from the store, and the blobs a completion names must be the ones
+/// its evidence names. Reports are accepted: executors are trusted like the local worker.
+fn verified_evidence(
+    request: &CompleteRequest,
+    attempt: &Attempt,
+    action: &Action,
+) -> Result<Value, AuthorityError> {
+    let invalid = |message: String| Err(AuthorityError::InvalidEvidence(message));
+    let mut evidence = request.evidence.clone();
+    let Some(fields) = evidence.as_object_mut() else {
+        return invalid("Evidence must be a JSON object.".into());
+    };
+    for (field, value) in [
+        ("revision", json!(action.revision)),
+        ("profile", json!(action.profile)),
+        ("job", json!(action.job)),
+        ("identity", crate::worker::evidence_identity(action)),
+        (
+            "executor",
+            json!(attempt.executor.as_deref().unwrap_or(LOCAL)),
+        ),
+    ] {
+        fields.insert(field.into(), value);
+    }
+    let mut total = 0;
+    for blob in [&request.log, &request.cleanup_log].into_iter().flatten() {
+        if blob.bytes > api::MAX_ARTIFACT_BYTES {
+            return invalid(format!("A log exceeds {} bytes.", api::MAX_ARTIFACT_BYTES));
+        }
+        total += blob.bytes;
+    }
+    for (path, entry) in &request.artifacts {
+        if let Err(error) = source::relative_path(path) {
+            return invalid(format!("{error:#}"));
+        }
+        if entry.mode > 0o777 {
+            return invalid(format!("Artifact {path} has mode {:o}.", entry.mode));
+        }
+        if entry.bytes > api::MAX_ARTIFACT_BYTES {
+            return invalid(format!(
+                "Artifact {path} exceeds {} bytes.",
+                api::MAX_ARTIFACT_BYTES
+            ));
+        }
+        total += entry.bytes;
+    }
+    if total > api::MAX_ATTEMPT_OUTPUT_BYTES {
+        return invalid(format!(
+            "Attempt outputs exceed {} bytes.",
+            api::MAX_ATTEMPT_OUTPUT_BYTES
+        ));
+    }
+    if request.outcome == Outcome::Completed {
+        // A failure after the command keeps the command's own code beside the error.
+        let failed_after = ["error", "cleanup_error"]
+            .iter()
+            .any(|field| fields.get(*field).is_some_and(|v| !v.is_null()));
+        let implied = if failed_after {
+            Some(125)
+        } else {
+            fields.get("exit_code").and_then(Value::as_i64)
+        };
+        if implied != Some(i64::from(request.exit_code)) {
+            return invalid("Evidence exit_code does not match the completion.".into());
+        }
+        if let Some(log) = fields.get("log_sha256").filter(|v| !v.is_null())
+            && request.log.as_ref().map(|blob| blob.sha256.as_str()) != log.as_str()
+        {
+            return invalid("Evidence log_sha256 does not match the completion's log.".into());
+        }
+        let artifacts: BTreeMap<String, ArtifactEntry> = match fields.get("artifacts") {
+            None | Some(Value::Null) => BTreeMap::new(),
+            Some(value) => match serde_json::from_value(value.clone()) {
+                Ok(artifacts) => artifacts,
+                Err(_) => return invalid("Evidence artifacts are malformed.".into()),
+            },
+        };
+        if artifacts != request.artifacts {
+            return invalid("Evidence artifacts do not match the completion.".into());
+        }
+    }
+    Ok(evidence)
+}
+
+/// Stops after which the action may simply be retried: nothing about the revision failed.
+const INTERRUPTIONS: [&str; 4] = ["supervisor-stop", "partition", "fenced", "revoked"];
+
+/// The one writer of a result: every finished attempt, local or remote, ends here.
+/// `request.evidence` is recorded as given; `hash` identifies the completion for replays.
+pub fn record_result(
+    db: &Connection,
+    request: &CompleteRequest,
+    hash: &str,
+) -> Result<&'static str> {
+    let mut attempt: Attempt = record(db, "attempts", &request.attempt)?;
+    let action: Action = record(db, "actions", &attempt.action)?;
+    let current: Option<String> = db.query_row(
+        "SELECT attempt FROM actions WHERE id=?",
+        [&action.id],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        current.as_deref() == Some(attempt.id.as_str()),
+        "attempt result was fenced"
+    );
+    let evidence = &request.evidence;
+    let reason = request.reason.as_deref();
+    let executor = attempt.executor.as_deref().unwrap_or(LOCAL);
+    let (state, action_state, kind, detail) = match request.outcome {
+        Outcome::Completed => {
+            let state = if request.exit_code == 0 {
+                "passed"
+            } else if reason == Some("no-requesters") {
+                "canceled"
+            } else if reason.is_some_and(|reason| INTERRUPTIONS.contains(&reason)) {
+                "interrupted"
+            } else {
+                "failed"
+            };
+            let detail = json!({"state":state,"evidence":evidence});
+            (state, state, "attempt.completed", detail)
+        }
+        Outcome::NotStarted => {
+            let (state, action_state) = match reason {
+                Some("no-requesters") => ("canceled", "canceled"),
+                // Tool drift on one host says nothing about the revision: the action waits.
+                Some("runtime-mismatch") => ("interrupted", "queued"),
+                _ => ("interrupted", "interrupted"),
+            };
+            let detail = json!({"reason":reason,"error":evidence["error"],
+                                "requeued":action_state == "queued"});
+            (state, action_state, "attempt.launch_failed", detail)
+        }
+        Outcome::Lost => (
+            "interrupted",
+            "interrupted",
+            "attempt.interrupted",
+            json!({"drained":request.drained,"operator_confirmed":false,
+                   "reason":"supervisor-lost","executor":executor}),
+        ),
+        Outcome::Undeliverable => (
+            "interrupted",
+            "interrupted",
+            "attempt.interrupted",
+            json!({"drained":request.drained,"reason":"undeliverable",
+                   "error":evidence["error"],"executor":executor}),
+        ),
+    };
+    attempt.ended = Some(now());
+    attempt.exit_code = Some(request.exit_code);
+    attempt.result = Some(evidence.clone());
+    attempt.completion = Some(hash.into());
+    db.execute(
+        "UPDATE attempts SET state=?,drained=?,body=? WHERE id=?",
+        params![
+            state,
+            request.drained,
+            serde_json::to_string(&attempt)?,
+            attempt.id
+        ],
+    )?;
+    if action_state == "queued" {
+        db.execute(
+            "UPDATE actions SET state='queued',attempt=NULL WHERE id=? AND attempt=?",
+            params![action.id, attempt.id],
+        )?;
+    } else {
+        db.execute(
+            "UPDATE actions SET state=? WHERE id=? AND attempt=?",
+            params![action_state, action.id, attempt.id],
+        )?;
+    }
+    if state == "failed" {
+        db.execute(
+            "INSERT INTO repairs VALUES (?,?,?,'execution','open',?,NULL,?)",
+            params![
+                unique(),
+                action.revision,
+                action.id,
+                evidence.to_string(),
+                now()
+            ],
+        )?;
+    }
+    event(db, kind, &attempt.id, &detail)?;
+    Ok(state)
+}
+
+/// A held attempt whose lease ran out, with the expiry applied after the API's startup grace.
+struct Lapsed {
+    attempt: String,
+    action: String,
+    executor: String,
+    lease_expires: f64,
+    effective: f64,
+}
+
+/// Interrupts attempts whose executor stopped renewing. Only the API process expires leases.
+pub fn expire(store: &mut Store, now: f64, api_start: f64) -> Result<Vec<String>> {
+    let mut expired = Vec::new();
+    for lease in lapsed(&store.db, now, api_start)? {
+        if expire_lease(store, &lease)? {
+            expired.push(lease.attempt);
+        }
+    }
+    Ok(expired)
+}
+
+/// A restarted API first gives every executor one full lease to renew, so the API's own
+/// downtime never expires healthy work. Attempts without a lease predate executors.
+fn lapsed(db: &Connection, now: f64, api_start: f64) -> Result<Vec<Lapsed>> {
+    let rows: Vec<(String, String, String, f64)> = {
+        let mut stmt = db.prepare(&format!(
+            "SELECT id,action,{EXECUTOR},json_extract(body,'$.lease_expires') FROM attempts
+             WHERE drained=0 AND state IN ('claimed','running')
+             AND json_extract(body,'$.lease_expires') IS NOT NULL"
+        ))?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    let mut leases = BTreeMap::new();
+    let mut due = Vec::new();
+    for (attempt, action, executor, lease_expires) in rows {
+        let lease_seconds = match leases.entry(executor.clone()) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => *entry
+                .insert(load(db, &executor)?.map_or(DEFAULT_LEASE_SECONDS, |r| r.lease_seconds)),
+        };
+        let effective = lease_expires.max(api_start + lease_seconds as f64);
+        if now > effective {
+            due.push(Lapsed {
+                attempt,
+                action,
+                executor,
+                lease_expires,
+                effective,
+            });
+        }
+    }
+    Ok(due)
+}
+
+/// Expiry never drains: the store cannot know whether anything ran. A renewal that moved the
+/// lease after it was read wins.
+fn expire_lease(store: &mut Store, lapsed: &Lapsed) -> Result<bool> {
+    let transaction = store.transaction()?;
+    let expired = transaction.execute(
+        "UPDATE attempts SET state='interrupted',drained=0 WHERE id=?
+         AND state IN ('claimed','running') AND json_extract(body,'$.lease_expires')=?",
+        params![lapsed.attempt, lapsed.lease_expires],
+    )? == 1;
+    if expired {
+        transaction.execute(
+            "UPDATE actions SET state='interrupted' WHERE id=? AND attempt=?",
+            params![lapsed.action, lapsed.attempt],
+        )?;
+        event(
+            &transaction,
+            "attempt.lease_expired",
+            &lapsed.attempt,
+            &json!({"executor":lapsed.executor,"lease_expires":lapsed.lease_expires,
+                    "effective":lapsed.effective}),
+        )?;
+    }
+    transaction.commit()?;
+    Ok(expired)
+}
+
+/// An operator's assertion that an attempt's processes and external resources are gone (A3).
+/// It releases the attempt's capacity and keeps its state, result and action state.
+pub fn confirm_drained(store: &mut Store, id: &str) -> Result<()> {
+    let transaction = store.transaction()?;
+    let (state, drained, body): (String, bool, String) = transaction
+        .query_row(
+            "SELECT state,drained,body FROM attempts WHERE id=?",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .with_context(|| format!("unknown attempt: {id}"))?;
+    ensure!(!drained, "attempt is already drained");
+    let attempt: Attempt = serde_json::from_str(&body)?;
+    let executor = attempt.executor.as_deref().unwrap_or(LOCAL);
+    if executor == LOCAL
+        && let (Some(pid), Some(start)) = (attempt.supervisor_pid, &attempt.supervisor_start)
+    {
+        ensure!(
+            !crate::worker::alive(pid, start),
+            "supervisor is still alive; cannot confirm drain"
+        );
+    }
+    if ["claimed", "running"].contains(&state.as_str()) {
+        ensure!(
+            attempt.lease.is_none(),
+            "attempt is held by executor {executor} until its coordinator reports it or its lease expires"
+        );
+        // A dead supervisor of the previous binary never reports.
+        transaction.execute(
+            "UPDATE attempts SET state='interrupted',drained=1 WHERE id=?",
+            [id],
+        )?;
+        transaction.execute(
+            "UPDATE actions SET state='interrupted' WHERE id=? AND attempt=?",
+            params![attempt.action, id],
+        )?;
+    } else {
+        ensure!(
+            ["interrupted", "failed", "canceled", "passed"].contains(&state.as_str()),
+            "attempt in state {state} cannot be confirmed drained"
+        );
+        transaction.execute("UPDATE attempts SET drained=1 WHERE id=?", [id])?;
+    }
+    if ["failed", "canceled", "passed"].contains(&state.as_str()) {
+        event(
+            &transaction,
+            "attempt.drain_confirmed",
+            id,
+            &json!({"state":state,"operator_confirmed":true}),
+        )?;
+    } else {
+        event(
+            &transaction,
+            "attempt.interrupted",
+            id,
+            &json!({"drained":true,"operator_confirmed":true}),
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1359,5 +2032,1297 @@ mod tests {
                 "train", "bob-1", "carol", "alice-1", "lane", "bob-2", "alice-2"
             ]
         );
+    }
+
+    fn queued(db: &Connection, id: &str, created: f64) {
+        queue(
+            db,
+            Queue {
+                id,
+                created,
+                ..Queue::default()
+            },
+        );
+    }
+
+    /// mindy claims the head of its queue.
+    fn grant(store: &mut Store, key: &str) -> Claim {
+        claim_for(store, "mindy", &Scope::all(), &ask(key, &["f-1"]))
+            .unwrap()
+            .claim
+            .unwrap()
+    }
+
+    fn lease(claim: &Claim) -> LeaseReport {
+        LeaseReport {
+            attempt: claim.attempt.id.clone(),
+            lease: claim.attempt.lease.clone(),
+            started: None,
+            stopping: None,
+        }
+    }
+
+    fn supervisor(pid: u32) -> Option<SupervisorIdentity> {
+        Some(SupervisorIdentity {
+            pid,
+            start: format!("{pid}0"),
+        })
+    }
+
+    fn heartbeat(
+        store: &mut Store,
+        executor: &str,
+        scope: &Scope,
+        leases: Vec<LeaseReport>,
+    ) -> Vec<LeaseStatus> {
+        renew(store, executor, scope, &RenewRequest { leases })
+            .unwrap()
+            .leases
+    }
+
+    fn register_supervisor(store: &mut Store, claim: &Claim) {
+        let started = LeaseReport {
+            started: supervisor(4242),
+            ..lease(claim)
+        };
+        assert!(heartbeat(store, "mindy", &Scope::all(), vec![started])[0].registered);
+    }
+
+    fn finish(
+        claim: &Claim,
+        outcome: Outcome,
+        reason: Option<&str>,
+        exit_code: i32,
+        evidence: Value,
+    ) -> CompleteRequest {
+        CompleteRequest {
+            attempt: claim.attempt.id.clone(),
+            lease: claim.attempt.lease.clone(),
+            outcome,
+            reason: reason.map(String::from),
+            exit_code,
+            evidence,
+            drained: true,
+            log: None,
+            cleanup_log: None,
+            artifacts: BTreeMap::new(),
+        }
+    }
+
+    fn passing(claim: &Claim) -> CompleteRequest {
+        finish(
+            claim,
+            Outcome::Completed,
+            None,
+            0,
+            json!({"exit_code":0,"reason":null,"artifacts":{}}),
+        )
+    }
+
+    fn row(db: &Connection, attempt: &str) -> (String, bool) {
+        db.query_row(
+            "SELECT state,drained FROM attempts WHERE id=?",
+            [attempt],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    fn body(db: &Connection, attempt: &str) -> String {
+        db.query_row("SELECT body FROM attempts WHERE id=?", [attempt], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    fn repairs(db: &Connection, action: &str) -> i64 {
+        db.query_row(
+            "SELECT COUNT(*) FROM repairs WHERE action=? AND kind='execution' AND state='open'",
+            [action],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Verified uploads moved out of the upload area, as the API stages them.
+    fn stage(store: &Store, log: &str) -> std::path::PathBuf {
+        let directory = store.root.join(format!(".incoming-{}", unique()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("output.log"), log).unwrap();
+        directory
+    }
+
+    fn idle() -> Reservation {
+        Reservation {
+            slots: 0,
+            memory_mb: 0,
+        }
+    }
+
+    fn one() -> Reservation {
+        Reservation {
+            slots: 1,
+            memory_mb: 512,
+        }
+    }
+
+    #[test]
+    fn stopping_is_recorded_once_by_one_function() {
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        queued(&store.db, "first", 1.0);
+        let claim = grant(&mut store, "k1");
+        let attempt = claim.attempt.id.clone();
+        let before = store.attempt(&attempt).unwrap();
+        // A requested action has no reason to stop, and another attempt never stops this one.
+        assert_eq!(stopping(&store.db, "first", &attempt, None).unwrap(), None);
+        assert_eq!(
+            stopping(&store.db, "first", "other", Some("timeout")).unwrap(),
+            None
+        );
+        assert_eq!(state(&store.db, "first"), "running");
+        assert_eq!(
+            stopping(&store.db, "first", &attempt, Some("timeout"))
+                .unwrap()
+                .as_deref(),
+            Some("timeout")
+        );
+        assert_eq!(state(&store.db, "first"), "stopping");
+        // Recording the reason leaves every other byte of the attempt body as it was.
+        let expected = Attempt {
+            stop: Some("timeout".into()),
+            ..before
+        };
+        assert_eq!(
+            body(&store.db, &attempt),
+            serde_json::to_string(&expected).unwrap()
+        );
+        // Later reports, relayed or not, and the store's own decision return the recorded reason.
+        store
+            .db
+            .execute("UPDATE interests SET active=0 WHERE action='first'", [])
+            .unwrap();
+        for reported in [None, Some("supervisor-stop"), Some("timeout")] {
+            assert_eq!(
+                stopping(&store.db, "first", &attempt, reported)
+                    .unwrap()
+                    .as_deref(),
+                Some("timeout")
+            );
+        }
+        let relayed = LeaseReport {
+            stopping: Some("supervisor-stop".into()),
+            ..lease(&claim)
+        };
+        let status = heartbeat(&mut store, "mindy", &Scope::all(), vec![relayed]);
+        assert_eq!(status[0].stop.as_deref(), Some("timeout"));
+        assert_eq!(
+            events(&store.db, "attempt.stopping"),
+            [(
+                attempt.clone(),
+                json!({"reason":"timeout","executor":"mindy"})
+            )]
+        );
+        // Without requesters the store alone decides; executors cannot report that reason.
+        queued(&store.db, "second", 2.0);
+        let second = grant(&mut store, "k2");
+        store
+            .db
+            .execute("UPDATE interests SET active=0 WHERE action='second'", [])
+            .unwrap();
+        let forged = LeaseReport {
+            stopping: Some("no-requesters".into()),
+            ..lease(&second)
+        };
+        let refused = renew(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &RenewRequest {
+                leases: vec![forged],
+            },
+        );
+        assert!(matches!(refused, Err(AuthorityError::Invalid(_))));
+        assert_eq!(state(&store.db, "second"), "running");
+        let status = heartbeat(&mut store, "mindy", &Scope::all(), vec![lease(&second)]);
+        assert_eq!(status[0].stop.as_deref(), Some("no-requesters"));
+        assert_eq!(state(&store.db, "second"), "stopping");
+        let stops = events(&store.db, "attempt.stopping");
+        assert_eq!(stops.len(), 2);
+        assert_eq!(
+            stops[1],
+            (
+                second.attempt.id.clone(),
+                json!({"reason":"no-requesters","executor":"mindy"})
+            )
+        );
+        // A finished action is never stopped.
+        store
+            .db
+            .execute("UPDATE actions SET state='passed' WHERE id='second'", [])
+            .unwrap();
+        assert_eq!(
+            stopping(&store.db, "second", &second.attempt.id, Some("timeout")).unwrap(),
+            None
+        );
+        assert_eq!(events(&store.db, "attempt.stopping").len(), 2);
+    }
+
+    #[test]
+    fn renew_fences_wrong_lease_executor_state_and_scope() {
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 8, 8192);
+        register(&store.db, "other", 8, 8192);
+        let base = Queue::default();
+        queue(&store.db, Queue { id: "held", ..base });
+        for (n, id) in ["expired", "replaced", "canceled"].into_iter().enumerate() {
+            queue(
+                &store.db,
+                Queue {
+                    id,
+                    created: 2.0 + n as f64,
+                    ..base
+                },
+            );
+        }
+        queue(
+            &store.db,
+            Queue {
+                id: "profile",
+                profile: "f-2",
+                created: 6.0,
+                ..base
+            },
+        );
+        queue(
+            &store.db,
+            Queue {
+                id: "project",
+                revision: "r-b",
+                created: 7.0,
+                ..base
+            },
+        );
+        let mut claims = BTreeMap::new();
+        for n in 0..6 {
+            let request = ask(&format!("k{n}"), &["f-1", "f-2"]);
+            let claim = claim_for(&mut store, "mindy", &Scope::all(), &request)
+                .unwrap()
+                .claim
+                .unwrap();
+            claims.insert(claim.action.id.clone(), claim);
+        }
+        // The attempt lost its lease; the action moved to a newer attempt; the action ended.
+        store
+            .db
+            .execute(
+                "UPDATE attempts SET state='interrupted' WHERE id=?",
+                [&claims["expired"].attempt.id],
+            )
+            .unwrap();
+        store
+            .db
+            .execute("UPDATE actions SET attempt='newer' WHERE id='replaced'", [])
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE actions SET state='canceled' WHERE id='canceled'",
+                [],
+            )
+            .unwrap();
+        let bodies = |db: &Connection| -> Vec<String> {
+            let mut stmt = db.prepare("SELECT body FROM attempts ORDER BY id").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let before = bodies(&store.db);
+        let scope = Scope {
+            projects: Some(["p-a".to_owned()].into()),
+            profiles: Some(["f-1".to_owned()].into()),
+        };
+        let other = heartbeat(&mut store, "other", &scope, vec![lease(&claims["held"])]);
+        let wrong = LeaseReport {
+            lease: "stolen".into(),
+            ..lease(&claims["held"])
+        };
+        let ghost = LeaseReport {
+            attempt: "ghost".into(),
+            ..lease(&claims["held"])
+        };
+        let mut reports = vec![wrong, ghost];
+        for id in ["expired", "replaced", "canceled", "profile", "project"] {
+            reports.push(lease(&claims[id]));
+        }
+        for report in &mut reports {
+            report.started = supervisor(4242);
+        }
+        let statuses = heartbeat(&mut store, "mindy", &scope, reports);
+        assert_eq!(statuses.len(), 7);
+        for status in other.iter().chain(&statuses) {
+            assert_eq!(
+                (
+                    status.status.as_str(),
+                    status.stop.as_deref(),
+                    status.registered,
+                    status.lease_expires
+                ),
+                ("fenced", None, false, None),
+                "{}",
+                status.attempt
+            );
+        }
+        // Fenced entries are never mutated.
+        assert_eq!(bodies(&store.db), before);
+        assert!(events(&store.db, "attempt.started").is_empty());
+        let held = &claims["held"].attempt;
+        let renewed = heartbeat(&mut store, "mindy", &scope, vec![lease(&claims["held"])]);
+        assert_eq!(renewed[0].status, "ok");
+        assert!(renewed[0].lease_expires.unwrap() > held.lease_expires);
+        let too_many = RenewRequest {
+            leases: vec![lease(&claims["held"]); 65],
+        };
+        assert!(matches!(
+            renew(&mut store, "mindy", &scope, &too_many),
+            Err(AuthorityError::Invalid(_))
+        ));
+        let nobody = RenewRequest { leases: vec![] };
+        assert!(matches!(
+            renew(&mut store, "ghost", &scope, &nobody),
+            Err(AuthorityError::Unregistered)
+        ));
+        // An attempt from before executors has no lease to renew.
+        hold(&store.db, "legacy", None, 1, 512);
+        let legacy = LeaseReport {
+            attempt: "legacy".into(),
+            lease: String::new(),
+            started: None,
+            stopping: None,
+        };
+        let status = heartbeat(&mut store, LOCAL, &Scope::all(), vec![legacy]);
+        assert_eq!(status[0].status, "fenced");
+    }
+
+    #[test]
+    fn renew_registers_supervisor_once_with_pid() {
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        queued(&store.db, "first", 1.0);
+        let claim = grant(&mut store, "k1");
+        let id = claim.attempt.id.clone();
+        // Heartbeats while the coordinator prepares keep the claim without registering it.
+        let status = heartbeat(&mut store, "mindy", &Scope::all(), vec![lease(&claim)]);
+        assert_eq!(
+            (
+                status[0].status.as_str(),
+                status[0].registered,
+                status[0].stop.as_deref()
+            ),
+            ("ok", false, None)
+        );
+        assert_eq!(row(&store.db, &id).0, "claimed");
+        register_supervisor(&mut store, &claim);
+        assert_eq!(row(&store.db, &id).0, "running");
+        let attempt = store.attempt(&id).unwrap();
+        assert_eq!(
+            (attempt.supervisor_pid, attempt.supervisor_start.as_deref()),
+            (Some(4242), Some("42420"))
+        );
+        assert!(attempt.started.is_some());
+        assert_eq!(
+            events(&store.db, "attempt.started"),
+            [(id.clone(), json!({"pid":4242,"executor":"mindy"}))]
+        );
+        // Repeated reports, even naming another process, change nothing.
+        for started in [supervisor(4242), supervisor(5151), None] {
+            let report = LeaseReport {
+                started,
+                ..lease(&claim)
+            };
+            let status = heartbeat(&mut store, "mindy", &Scope::all(), vec![report]);
+            assert!(status[0].registered);
+        }
+        let again = store.attempt(&id).unwrap();
+        assert_eq!(
+            (again.supervisor_pid, again.started),
+            (Some(4242), attempt.started)
+        );
+        assert_eq!(events(&store.db, "attempt.started").len(), 1);
+        // Leases follow the executor's current lease length; a heartbeat is a sign of life.
+        let mut mindy = load(&store.db, "mindy").unwrap().unwrap();
+        mindy.lease_seconds = 60;
+        mindy.observed.last_seen = Some(1.0);
+        save(&store.db, &mindy).unwrap();
+        let response = renew(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &RenewRequest {
+                leases: vec![lease(&claim)],
+            },
+        )
+        .unwrap();
+        assert_eq!(response.lease_seconds, 60);
+        let expires = response.leases[0].lease_expires.unwrap();
+        assert!((expires - now() - 60.0).abs() < 5.0);
+        assert_eq!(store.attempt(&id).unwrap().lease_expires, Some(expires));
+        let seen = load(&store.db, "mindy")
+            .unwrap()
+            .unwrap()
+            .observed
+            .last_seen;
+        assert!(seen.unwrap() > now() - 5.0);
+    }
+
+    #[test]
+    fn renew_refuses_registration_when_stopping() {
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        queued(&store.db, "first", 1.0);
+        let claim = grant(&mut store, "k1");
+        let id = claim.attempt.id.clone();
+        // Canceled while the coordinator was still preparing the attempt.
+        store
+            .db
+            .execute("UPDATE interests SET active=0 WHERE action='first'", [])
+            .unwrap();
+        assert_eq!(
+            stopping(&store.db, "first", &id, None).unwrap().as_deref(),
+            Some("no-requesters")
+        );
+        let started = LeaseReport {
+            started: supervisor(4242),
+            ..lease(&claim)
+        };
+        let status = heartbeat(&mut store, "mindy", &Scope::all(), vec![started]);
+        assert_eq!(
+            (
+                status[0].status.as_str(),
+                status[0].registered,
+                status[0].stop.as_deref()
+            ),
+            ("ok", false, Some("no-requesters"))
+        );
+        assert_eq!(row(&store.db, &id).0, "claimed");
+        let attempt = store.attempt(&id).unwrap();
+        assert_eq!((attempt.supervisor_pid, attempt.started), (None, None));
+        assert!(events(&store.db, "attempt.started").is_empty());
+        // The supervisor exits without running anything and the attempt drains as canceled.
+        let request = finish(
+            &claim,
+            Outcome::NotStarted,
+            Some("no-requesters"),
+            125,
+            json!({}),
+        );
+        let response = complete(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &request,
+            Outputs::InPlace,
+        )
+        .unwrap();
+        assert_eq!(response.state.as_deref(), Some("canceled"));
+        assert_eq!(row(&store.db, &id), ("canceled".into(), true));
+        assert_eq!(state(&store.db, "first"), "canceled");
+        assert_eq!(held(&store.db, "mindy").unwrap(), idle());
+    }
+
+    #[test]
+    fn complete_replays_identical_request_before_fencing() {
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        register(&store.db, "other", 4, 4096);
+        queued(&store.db, "first", 1.0);
+        let claim = grant(&mut store, "k1");
+        let id = claim.attempt.id.clone();
+        register_supervisor(&mut store, &claim);
+        // A directory left by a commit that failed after the move is replaced.
+        let directory = store.root.join("attempts").join(&id);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("stale"), "").unwrap();
+        let staged = stage(&store, "log\n");
+        let mut request = passing(&claim);
+        let log = crate::hash(b"log\n");
+        request.log = Some(BlobRef {
+            sha256: log.clone(),
+            bytes: 4,
+        });
+        request.evidence["log_sha256"] = json!(log);
+        let first = complete(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &request,
+            Outputs::Staged(staged.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            first,
+            CompleteResponse {
+                attempt: id.clone(),
+                status: "recorded".into(),
+                state: Some("passed".into()),
+                drained: true,
+                replayed: false,
+                drain_recorded: false,
+            }
+        );
+        assert!(!staged.exists());
+        assert_eq!(
+            std::fs::read_to_string(directory.join("output.log")).unwrap(),
+            "log\n"
+        );
+        assert!(!directory.join("stale").exists());
+        let recorded = body(&store.db, &id);
+        assert_eq!(
+            store.attempt(&id).unwrap().completion,
+            Some(crate::identity(&request).unwrap())
+        );
+        // The response was lost: the same report is answered again, although the attempt is no
+        // longer held and the executor's scope has since narrowed.
+        let none = Scope {
+            projects: Some(BTreeSet::new()),
+            profiles: Some(BTreeSet::new()),
+        };
+        let again = stage(&store, "log\n");
+        let replay = complete(
+            &mut store,
+            "mindy",
+            &none,
+            &request,
+            Outputs::Staged(again.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            replay,
+            CompleteResponse {
+                replayed: true,
+                ..first
+            }
+        );
+        assert!(!again.exists());
+        assert_eq!(
+            std::fs::read_to_string(directory.join("output.log")).unwrap(),
+            "log\n"
+        );
+        assert_eq!(body(&store.db, &id), recorded);
+        assert_eq!(events(&store.db, "attempt.completed").len(), 1);
+        // Only the lease holder's executor is answered.
+        let stolen = CompleteRequest {
+            lease: "stolen".into(),
+            ..request.clone()
+        };
+        for (executor, request) in [("mindy", &stolen), ("other", &request)] {
+            let result = complete(
+                &mut store,
+                executor,
+                &Scope::all(),
+                request,
+                Outputs::InPlace,
+            );
+            assert!(matches!(result, Err(AuthorityError::Fenced)), "{executor}");
+        }
+    }
+
+    #[test]
+    fn complete_conflicting_request_is_rejected() {
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        queued(&store.db, "first", 1.0);
+        let claim = grant(&mut store, "k1");
+        let id = claim.attempt.id.clone();
+        register_supervisor(&mut store, &claim);
+        let request = passing(&claim);
+        complete(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &request,
+            Outputs::InPlace,
+        )
+        .unwrap();
+        let recorded = body(&store.db, &id);
+        let mut failed = finish(
+            &claim,
+            Outcome::Completed,
+            None,
+            1,
+            json!({"exit_code":1,"artifacts":{}}),
+        );
+        failed.drained = request.drained;
+        let undrained = CompleteRequest {
+            drained: false,
+            ..request.clone()
+        };
+        for different in [failed, undrained] {
+            let staged = stage(&store, "other\n");
+            let result = complete(
+                &mut store,
+                "mindy",
+                &Scope::all(),
+                &different,
+                Outputs::Staged(staged.clone()),
+            );
+            assert!(matches!(result, Err(AuthorityError::CompletionConflict)));
+            assert!(!staged.exists());
+        }
+        assert_eq!(body(&store.db, &id), recorded);
+        assert_eq!(row(&store.db, &id), ("passed".into(), true));
+        assert_eq!(state(&store.db, "first"), "passed");
+        assert_eq!(repairs(&store.db, "first"), 0);
+        assert_eq!(events(&store.db, "attempt.completed").len(), 1);
+    }
+
+    #[test]
+    fn drain_report_requires_executor_lease_and_undrained() {
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        register(&store.db, "other", 4, 4096);
+        queued(&store.db, "first", 1.0);
+        let claim = grant(&mut store, "k1");
+        let id = claim.attempt.id.clone();
+        register_supervisor(&mut store, &claim);
+        // The coordinator was partitioned past its lease: interrupted, capacity still held.
+        let lapsed = expire(&mut store, now() + 3600.0, 0.0).unwrap();
+        assert_eq!(lapsed, [id.as_str()]);
+        assert_eq!(row(&store.db, &id), ("interrupted".into(), false));
+        let report = passing(&claim);
+        let stolen = CompleteRequest {
+            lease: "stolen".into(),
+            ..report.clone()
+        };
+        let undrained = CompleteRequest {
+            drained: false,
+            ..report.clone()
+        };
+        for (executor, request) in [
+            ("mindy", &stolen),
+            ("other", &report),
+            ("mindy", &undrained),
+        ] {
+            let staged = stage(&store, "late\n");
+            let result = complete(
+                &mut store,
+                executor,
+                &Scope::all(),
+                request,
+                Outputs::Staged(staged.clone()),
+            );
+            assert!(matches!(result, Err(AuthorityError::Fenced)), "{executor}");
+            assert!(!staged.exists());
+            assert_eq!(row(&store.db, &id), ("interrupted".into(), false));
+        }
+        assert_eq!(held(&store.db, "mindy").unwrap(), one());
+        let staged = stage(&store, "late\n");
+        let response = complete(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &report,
+            Outputs::Staged(staged.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            response,
+            CompleteResponse {
+                attempt: id.clone(),
+                status: "fenced".into(),
+                state: Some("interrupted".into()),
+                drained: true,
+                replayed: false,
+                drain_recorded: true,
+            }
+        );
+        // The late result is never recorded; only the drain is.
+        assert!(!staged.exists());
+        assert!(!store.root.join("attempts").join(&id).exists());
+        assert_eq!(row(&store.db, &id), ("interrupted".into(), true));
+        assert_eq!(state(&store.db, "first"), "interrupted");
+        let attempt = store.attempt(&id).unwrap();
+        assert_eq!(
+            (attempt.result, attempt.exit_code, attempt.completion),
+            (None, None, None)
+        );
+        assert!(events(&store.db, "attempt.completed").is_empty());
+        assert_eq!(
+            events(&store.db, "attempt.drain_reported"),
+            [(id.clone(), json!({"executor":"mindy"}))]
+        );
+        assert_eq!(held(&store.db, "mindy").unwrap(), idle());
+        let result = complete(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &report,
+            Outputs::InPlace,
+        );
+        assert!(matches!(result, Err(AuthorityError::Fenced)));
+        assert_eq!(events(&store.db, "attempt.drain_reported").len(), 1);
+    }
+
+    #[test]
+    fn expire_honours_startup_grace_and_never_drains() {
+        let (_root, mut store) = lab();
+        let mut mindy = register(&store.db, "mindy", 4, 4096);
+        mindy.lease_seconds = 10;
+        save(&store.db, &mindy).unwrap();
+        hold(&store.db, "legacy", None, 1, 512);
+        queued(&store.db, "first", 1.0);
+        let claim = grant(&mut store, "k1");
+        let id = claim.attempt.id.clone();
+        queued(&store.db, "local", 2.0);
+        let local = crate::worker::claim(&mut store).unwrap().unwrap();
+        let expires = claim.attempt.lease_expires;
+        // An API restarted 5 s before the lease ran out gives the executor a full lease to renew.
+        let restarted = expires - 5.0;
+        for early in [1.0, 4.9] {
+            assert!(
+                expire(&mut store, expires + early, restarted)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(state(&store.db, "first"), "running");
+        assert_eq!(
+            expire(&mut store, expires + 5.1, restarted).unwrap(),
+            [id.as_str()]
+        );
+        // The store cannot know whether anything ran, so capacity stays held.
+        assert_eq!(row(&store.db, &id), ("interrupted".into(), false));
+        assert_eq!(state(&store.db, "first"), "interrupted");
+        assert_eq!(held(&store.db, "mindy").unwrap(), one());
+        let lapsed = events(&store.db, "attempt.lease_expired");
+        assert_eq!(lapsed.len(), 1);
+        assert_eq!(
+            (lapsed[0].0.as_str(), &lapsed[0].1["executor"]),
+            (id.as_str(), &json!("mindy"))
+        );
+        assert!((lapsed[0].1["lease_expires"].as_f64().unwrap() - expires).abs() < 1e-3);
+        assert!((lapsed[0].1["effective"].as_f64().unwrap() - expires - 5.0).abs() < 1e-3);
+        // Expiry happens once, and attempts without a lease are never expired.
+        assert!(
+            expire(&mut store, expires + 3600.0, 0.0)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(row(&store.db, "legacy"), ("running".into(), false));
+        assert_eq!(row(&store.db, &local.id), ("claimed".into(), false));
+        assert_eq!(events(&store.db, "attempt.lease_expired").len(), 1);
+        // An executor whose record is gone gets the default lease as grace.
+        queued(&store.db, "second", 3.0);
+        let orphan = grant(&mut store, "k2");
+        store
+            .db
+            .execute("DELETE FROM executors WHERE id='mindy'", [])
+            .unwrap();
+        let expires = orphan.attempt.lease_expires;
+        let restarted = expires - 250.0;
+        assert!(
+            expire(&mut store, expires + 49.0, restarted)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            expire(&mut store, expires + 51.0, restarted).unwrap(),
+            [orphan.attempt.id]
+        );
+    }
+
+    #[test]
+    fn expire_loses_to_concurrent_renew() {
+        let (_root, mut store) = lab();
+        let mut mindy = register(&store.db, "mindy", 4, 4096);
+        mindy.lease_seconds = 10;
+        save(&store.db, &mindy).unwrap();
+        queued(&store.db, "first", 1.0);
+        let claim = grant(&mut store, "k1");
+        let id = claim.attempt.id.clone();
+        register_supervisor(&mut store, &claim);
+        // Expiry reads a lapsed lease; the executor renews before expiry writes.
+        let due = lapsed(&store.db, now() + 3600.0, 0.0).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].attempt, id);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        heartbeat(&mut store, "mindy", &Scope::all(), vec![lease(&claim)]);
+        assert!(!expire_lease(&mut store, &due[0]).unwrap());
+        assert_eq!(row(&store.db, &id), ("running".into(), false));
+        assert_eq!(state(&store.db, "first"), "running");
+        assert!(events(&store.db, "attempt.lease_expired").is_empty());
+        // The renewed lease is judged on its own expiry.
+        let renewed = store.attempt(&id).unwrap().lease_expires.unwrap();
+        assert!(expire(&mut store, renewed - 1.0, 0.0).unwrap().is_empty());
+        assert_eq!(expire(&mut store, renewed + 1.0, 0.0).unwrap(), [id]);
+    }
+
+    #[test]
+    fn outcomes_map_to_states_events_and_repairs() {
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 16, 16384);
+        let exited = |code: i32| json!({"exit_code":code,"reason":null,"artifacts":{}});
+        let stopped = |reason: &str| json!({"exit_code":124,"reason":reason,"artifacts":{}});
+        let error = |message: &str| json!({"error":message});
+        use Outcome::*;
+        let stop = |reason: &'static str, state: &'static str| {
+            (Completed, Some(reason), 124, stopped(reason), true, state)
+        };
+        // (outcome, reason, exit code, evidence, drained, attempt and action state)
+        let cases = [
+            (Completed, None, 0, exited(0), true, "passed"),
+            (Completed, None, 2, exited(2), true, "failed"),
+            stop("timeout", "failed"),
+            (
+                Completed,
+                None,
+                125,
+                error("input unavailable"),
+                false,
+                "failed",
+            ),
+            stop("no-requesters", "canceled"),
+            stop("supervisor-stop", "interrupted"),
+            stop("partition", "interrupted"),
+            stop("fenced", "interrupted"),
+            stop("revoked", "interrupted"),
+            (
+                NotStarted,
+                Some("no-requesters"),
+                125,
+                json!({}),
+                true,
+                "canceled",
+            ),
+            (
+                NotStarted,
+                Some("launch-failed"),
+                125,
+                error("spawn"),
+                true,
+                "interrupted",
+            ),
+            (
+                Lost,
+                None,
+                125,
+                error("supervisor exited"),
+                false,
+                "interrupted",
+            ),
+            (
+                Undeliverable,
+                None,
+                125,
+                error("too_large"),
+                true,
+                "interrupted",
+            ),
+        ];
+        for (n, (outcome, reason, exit_code, evidence, drained, attempt_state)) in
+            cases.into_iter().enumerate()
+        {
+            let id = format!("action-{n:02}");
+            queued(&store.db, &id, n as f64);
+            let claim = grant(&mut store, &format!("k{n}"));
+            assert_eq!(claim.action.id, id);
+            register_supervisor(&mut store, &claim);
+            let request = CompleteRequest {
+                drained,
+                ..finish(&claim, outcome, reason, exit_code, evidence.clone())
+            };
+            let response = complete(
+                &mut store,
+                "mindy",
+                &Scope::all(),
+                &request,
+                Outputs::InPlace,
+            )
+            .unwrap();
+            assert_eq!(response.state.as_deref(), Some(attempt_state), "{id}");
+            assert_eq!(response.drained, drained, "{id}");
+            let attempt = &claim.attempt.id;
+            assert_eq!(
+                row(&store.db, attempt),
+                (attempt_state.into(), drained),
+                "{id}"
+            );
+            assert_eq!(state(&store.db, &id), attempt_state, "{id}");
+            // Only a failure says something about the revision.
+            let repaired = i64::from(attempt_state == "failed");
+            assert_eq!(repairs(&store.db, &id), repaired, "{id}");
+            // Identity fields come from the store, whatever the executor reported.
+            let mut recorded = evidence.clone();
+            for (field, value) in [
+                ("revision", json!("r-a")),
+                ("profile", json!("f-1")),
+                ("job", json!("test")),
+                (
+                    "identity",
+                    json!({"version":JOB_RECIPE,"recipe":"recipe","class":"class","key":id}),
+                ),
+                ("executor", json!("mindy")),
+            ] {
+                recorded[field] = value;
+            }
+            let stored = store.attempt(attempt).unwrap();
+            assert_eq!(stored.result.as_ref(), Some(&recorded), "{id}");
+            assert_eq!(stored.exit_code, Some(exit_code), "{id}");
+            assert!(stored.ended.is_some(), "{id}");
+            assert_eq!(stored.completion, Some(crate::identity(&request).unwrap()));
+            let (kind, detail) = match outcome {
+                Completed => (
+                    "attempt.completed",
+                    json!({"state":attempt_state,"evidence":recorded}),
+                ),
+                NotStarted => (
+                    "attempt.launch_failed",
+                    json!({"reason":reason,"error":evidence["error"],"requeued":false}),
+                ),
+                Lost => (
+                    "attempt.interrupted",
+                    json!({"drained":drained,"operator_confirmed":false,
+                           "reason":"supervisor-lost","executor":"mindy"}),
+                ),
+                Undeliverable => (
+                    "attempt.interrupted",
+                    json!({"drained":drained,"reason":"undeliverable",
+                           "error":evidence["error"],"executor":"mindy"}),
+                ),
+            };
+            let recorded_events: Vec<Value> = events(&store.db, kind)
+                .into_iter()
+                .filter(|(subject, _)| subject == attempt)
+                .map(|(_, detail)| detail)
+                .collect();
+            assert_eq!(recorded_events, [detail], "{id}");
+        }
+    }
+
+    #[test]
+    fn runtime_mismatch_requeues_without_repair() {
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        queued(&store.db, "first", 1.0);
+        let claim = grant(&mut store, "k1");
+        let id = claim.attempt.id.clone();
+        register_supervisor(&mut store, &claim);
+        // Tool drift on this host says nothing about the revision.
+        let error = "declared tool bytes changed; register a new profile";
+        let request = finish(
+            &claim,
+            Outcome::NotStarted,
+            Some("runtime-mismatch"),
+            125,
+            json!({"error":error}),
+        );
+        let response = complete(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &request,
+            Outputs::InPlace,
+        )
+        .unwrap();
+        assert_eq!(response.state.as_deref(), Some("interrupted"));
+        assert_eq!(row(&store.db, &id), ("interrupted".into(), true));
+        let action: (String, Option<String>) = store
+            .db
+            .query_row(
+                "SELECT state,attempt FROM actions WHERE id='first'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(action, ("queued".into(), None));
+        assert_eq!(repairs(&store.db, "first"), 0);
+        assert_eq!(
+            events(&store.db, "attempt.launch_failed"),
+            [(
+                id.clone(),
+                json!({"reason":"runtime-mismatch","error":error,"requeued":true})
+            )]
+        );
+        assert_eq!(held(&store.db, "mindy").unwrap(), idle());
+        // The executor that refuses the profile is not handed it again; one that verifies it is.
+        let mut refusing = ask("k2", &[]);
+        refusing.refused.insert("f-1".into(), error.into());
+        let response = claim_for(&mut store, "mindy", &Scope::all(), &refusing).unwrap();
+        assert!(response.claim.is_none());
+        let again = grant(&mut store, "k3");
+        assert_eq!(again.action.id, "first");
+        assert_ne!(again.attempt.id, id);
+        // The requeued attempt can no longer renew.
+        let status = heartbeat(&mut store, "mindy", &Scope::all(), vec![lease(&claim)]);
+        assert_eq!(status[0].status, "fenced");
+    }
+
+    #[test]
+    fn confirm_drained_preserves_terminal_state() {
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 8, 8192);
+        // Remote cleanup failed: the result stands and the capacity stays held.
+        for (n, (id, exit_code, evidence, terminal)) in [
+            (
+                "failed",
+                125,
+                json!({"exit_code":0,"cleanup_error":"external cleanup failed","artifacts":{}}),
+                "failed",
+            ),
+            ("passed", 0, json!({"exit_code":0,"artifacts":{}}), "passed"),
+            (
+                "canceled",
+                124,
+                json!({"exit_code":124,"reason":"no-requesters","artifacts":{}}),
+                "canceled",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            queued(&store.db, id, n as f64);
+            let claim = grant(&mut store, &format!("k{n}"));
+            register_supervisor(&mut store, &claim);
+            let reason = evidence["reason"].as_str().map(String::from);
+            let request = CompleteRequest {
+                reason,
+                drained: false,
+                ..finish(&claim, Outcome::Completed, None, exit_code, evidence)
+            };
+            complete(
+                &mut store,
+                "mindy",
+                &Scope::all(),
+                &request,
+                Outputs::InPlace,
+            )
+            .unwrap();
+            let attempt = claim.attempt.id;
+            let before = body(&store.db, &attempt);
+            assert_eq!(held(&store.db, "mindy").unwrap(), one());
+            confirm_drained(&mut store, &attempt).unwrap();
+            assert_eq!(row(&store.db, &attempt), (terminal.into(), true));
+            assert_eq!(state(&store.db, id), terminal);
+            assert_eq!(body(&store.db, &attempt), before);
+            assert_eq!(held(&store.db, "mindy").unwrap(), idle());
+            let confirmed = events(&store.db, "attempt.drain_confirmed");
+            assert_eq!(
+                confirmed.last().unwrap(),
+                &(
+                    attempt.clone(),
+                    json!({"state":terminal,"operator_confirmed":true})
+                )
+            );
+            let again = confirm_drained(&mut store, &attempt).unwrap_err();
+            assert!(
+                format!("{again:#}").contains("already drained"),
+                "{again:#}"
+            );
+        }
+        // A held attempt belongs to its coordinator until it reports or its lease expires.
+        queued(&store.db, "held", 3.0);
+        let held_claim = grant(&mut store, "k3");
+        let attempt = held_claim.attempt.id.clone();
+        let refused = confirm_drained(&mut store, &attempt).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("held by executor mindy"),
+            "{refused:#}"
+        );
+        assert_eq!(row(&store.db, &attempt), ("claimed".into(), false));
+        assert_eq!(
+            expire(&mut store, now() + 3600.0, 0.0).unwrap(),
+            [attempt.as_str()]
+        );
+        confirm_drained(&mut store, &attempt).unwrap();
+        assert_eq!(row(&store.db, &attempt), ("interrupted".into(), true));
+        assert_eq!(
+            events(&store.db, "attempt.interrupted"),
+            [(
+                attempt.clone(),
+                json!({"drained":true,"operator_confirmed":true})
+            )]
+        );
+        // A local supervisor that is still alive is never confirmed drained.
+        let me = std::process::id();
+        let alive = json!({"id":"alive","action":"elsewhere","worker_pid":me,"worker_start":"0",
+            "supervisor_pid":me,"supervisor_start":crate::worker::process_start(me).unwrap(),
+            "slots":1,"memory_mb":512,"created":0.0,"started":0.0,"ended":1.0,"exit_code":125,
+            "result":null});
+        store
+            .db
+            .execute(
+                "INSERT INTO attempts VALUES ('alive','elsewhere','failed',0,?)",
+                [alive.to_string()],
+            )
+            .unwrap();
+        let refused = confirm_drained(&mut store, "alive").unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("supervisor is still alive"),
+            "{refused:#}"
+        );
+        assert_eq!(row(&store.db, "alive"), ("failed".into(), false));
+        // A held attempt of the previous binary never reports; once its supervisor is gone the
+        // operator interrupts and drains it.
+        queued(&store.db, "upgrade", 4.0);
+        hold(&store.db, "legacy", None, 1, 512);
+        store
+            .db
+            .execute_batch(
+                "UPDATE attempts SET action='upgrade',body=json_set(body,'$.action','upgrade')
+                 WHERE id='legacy';
+                 UPDATE actions SET state='running',attempt='legacy' WHERE id='upgrade';",
+            )
+            .unwrap();
+        confirm_drained(&mut store, "legacy").unwrap();
+        assert_eq!(row(&store.db, "legacy"), ("interrupted".into(), true));
+        assert_eq!(state(&store.db, "upgrade"), "interrupted");
+        assert_eq!(events(&store.db, "attempt.interrupted").len(), 2);
+        assert!(confirm_drained(&mut store, "ghost").is_err());
+    }
+
+    #[test]
+    fn complete_rederives_identity_and_checks_evidence() {
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        queued(&store.db, "first", 1.0);
+        let claim = grant(&mut store, "k1");
+        let id = claim.attempt.id.clone();
+        register_supervisor(&mut store, &claim);
+        let log = BlobRef {
+            sha256: "a".repeat(64),
+            bytes: 10,
+        };
+        let artifact = ArtifactEntry {
+            sha256: "b".repeat(64),
+            mode: 0o644,
+            bytes: 3,
+        };
+        let with = |artifacts: BTreeMap<String, ArtifactEntry>| {
+            let mut request = finish(
+                &claim,
+                Outcome::Completed,
+                None,
+                0,
+                json!({"exit_code":0,"reason":null,"log_sha256":log.sha256,"artifacts":artifacts}),
+            );
+            request.log = Some(log.clone());
+            request.artifacts = artifacts;
+            request
+        };
+        let good = || with([("dist/value".to_owned(), artifact.clone())].into());
+        let entry = |mode: u32, bytes: u64| ArtifactEntry {
+            mode,
+            bytes,
+            ..artifact.clone()
+        };
+        let limit = crate::api::MAX_ARTIFACT_BYTES;
+        let huge: BTreeMap<String, ArtifactEntry> = (0..5)
+            .map(|n| (format!("part-{n}"), entry(0o644, limit)))
+            .collect();
+        let invalid = [
+            (
+                "exit code",
+                CompleteRequest {
+                    exit_code: 1,
+                    ..good()
+                },
+            ),
+            (
+                "log digest",
+                CompleteRequest {
+                    log: Some(BlobRef {
+                        sha256: "c".repeat(64),
+                        bytes: 10,
+                    }),
+                    ..good()
+                },
+            ),
+            (
+                "missing log",
+                CompleteRequest {
+                    log: None,
+                    ..good()
+                },
+            ),
+            (
+                "artifacts",
+                CompleteRequest {
+                    artifacts: BTreeMap::new(),
+                    ..good()
+                },
+            ),
+            (
+                "traversal",
+                with([("../escape".to_owned(), artifact.clone())].into()),
+            ),
+            ("mode", with([("tool".to_owned(), entry(0o4755, 3))].into())),
+            (
+                "file size",
+                with([("big".to_owned(), entry(0o644, limit + 1))].into()),
+            ),
+            ("attempt size", with(huge)),
+            ("cleanup failure", {
+                let mut request = good();
+                request.evidence["cleanup_error"] = json!("external cleanup failed");
+                request
+            }),
+            (
+                "not an object",
+                CompleteRequest {
+                    evidence: json!("passed"),
+                    ..good()
+                },
+            ),
+        ];
+        for (case, request) in invalid {
+            let staged = stage(&store, "log\n");
+            let result = complete(
+                &mut store,
+                "mindy",
+                &Scope::all(),
+                &request,
+                Outputs::Staged(staged.clone()),
+            );
+            assert!(
+                matches!(result, Err(AuthorityError::InvalidEvidence(_))),
+                "{case}: {result:?}"
+            );
+            assert!(!staged.exists(), "{case}");
+            assert_eq!(row(&store.db, &id), ("running".into(), false), "{case}");
+        }
+        assert!(store.attempt(&id).unwrap().completion.is_none());
+        // A failed cleanup keeps the command's own code beside the error; the attempt fails 125.
+        let mut request = good();
+        request.exit_code = 125;
+        request.evidence["cleanup_error"] = json!("external cleanup failed");
+        for field in ["revision", "profile", "job", "identity", "executor"] {
+            request.evidence[field] = json!("forged");
+        }
+        let response = complete(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &request,
+            Outputs::InPlace,
+        )
+        .unwrap();
+        assert_eq!(response.state.as_deref(), Some("failed"));
+        let evidence = store.attempt(&id).unwrap().result.unwrap();
+        for (field, value) in [
+            ("revision", "r-a"),
+            ("profile", "f-1"),
+            ("job", "test"),
+            ("executor", "mindy"),
+        ] {
+            assert_eq!(evidence[field], value, "{field}");
+        }
+        assert_eq!(
+            evidence["identity"],
+            json!({"version":JOB_RECIPE,"recipe":"recipe","class":"class","key":"first"})
+        );
+        // The report itself is accepted as the executor gave it.
+        assert_eq!(evidence["exit_code"], 0);
+        assert_eq!(evidence["log_sha256"], json!(log.sha256));
     }
 }
