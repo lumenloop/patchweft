@@ -75,9 +75,10 @@ patchweft --state /path/to/state worker --drain --no-loopback-check
 patchweft --state /path/to/state status CANDIDATE_ID
 ```
 
-`--no-loopback-check` is for a machine whose jobs run no containers. A host whose
-jobs use rootless Docker runs `worker` without it, so job containers can never reach
-an unlisted loopback service ([operations](operations.md)).
+`--no-loopback-check` is for a machine whose every loopback service may be reached
+by jobs, such as a laptop trying the example. Jobs run natively, so on a shared host
+`worker` runs without it and refuses work while an unlisted loopback service listens
+([operations](operations.md)).
 
 Use IDs returned by the preceding commands. `worker --drain` exits when runnable
 work finishes. A long-running `worker` command also waits for future requests.

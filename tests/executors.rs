@@ -164,9 +164,6 @@ struct Lab {
     /// mindy's work directory, `PATCHWEFT_STATE` for its jobs.
     work: PathBuf,
     credential: PathBuf,
-    /// mindy's `XDG_RUNTIME_DIR`: a rootless daemon that keeps containers off host loopback.
-    runtime: PathBuf,
-    _daemon: Daemon,
     server: Option<Server>,
     address: String,
     starts: usize,
@@ -199,12 +196,9 @@ impl Lab {
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "--quiet", "-m", "fixture"]);
         let state = temp.path().join("state");
-        let runtime = temp.path().join("runtime");
         let mut lab = Self {
-            _daemon: Daemon::start(&runtime, "--disable-host-loopback"),
             work: temp.path().join("mindy"),
             credential: temp.path().join("mindy.credential"),
-            runtime,
             state,
             base: String::new(),
             profiles: vec![],
@@ -261,13 +255,7 @@ impl Lab {
 
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(AW);
-        // The local worker checks loopback by default; this lab's daemon keeps it off.
-        command
-            .arg("--state")
-            .arg(&self.state)
-            .args(args)
-            .env("XDG_RUNTIME_DIR", &self.runtime)
-            .env_remove("DOCKER_HOST");
+        command.arg("--state").arg(&self.state).args(args);
         command
     }
 
@@ -430,8 +418,16 @@ impl Lab {
         )
     }
 
-    /// mindy's coordinator in `work`: fast polls, one-second heartbeats, no disk floor.
+    /// mindy's coordinator in `work`: fast polls, one-second heartbeats, no disk floor, and no
+    /// loopback check (this host's own listeners are not the subject; `checked_executor` is).
     fn executor(&self, work: &Path, args: &[&str]) -> Command {
+        let mut command = self.checked_executor(work, args);
+        command.arg("--no-loopback-check");
+        command
+    }
+
+    /// mindy's coordinator as `executor` runs it on a host, loopback check included.
+    fn checked_executor(&self, work: &Path, args: &[&str]) -> Command {
         let mut command = Command::new(AW);
         command
             .args([
@@ -445,9 +441,7 @@ impl Lab {
             .arg(work)
             .args(["--poll-ms", "100", "--heartbeat-seconds", "1"])
             .args(["--min-free-gb", "0"])
-            .args(args)
-            .env("XDG_RUNTIME_DIR", &self.runtime)
-            .env_remove("DOCKER_HOST");
+            .args(args);
         command
     }
 
@@ -559,7 +553,7 @@ fn remote_capacity_is_per_executor_and_local_budget_unaffected() {
     });
     // The local worker admits a job needing both local slots while mindy holds one of its own.
     assert_eq!(
-        lab.call(&["worker", "--drain"]),
+        lab.call(&["worker", "--drain", "--no-loopback-check"]),
         json!({"executor":"local","launched":1})
     );
     let wide = candidate["required"]["wide"].as_str().unwrap();
@@ -608,7 +602,7 @@ fn local_coordinator_never_touches_remote_attempts() {
     wait_until("the remote job", || started(&lab.work, "remote"));
     // The local coordinator and `recover` settle only the local executor's own attempts.
     assert_eq!(
-        lab.call(&["worker", "--drain"]),
+        lab.call(&["worker", "--drain", "--no-loopback-check"]),
         json!({"executor":"local","launched":0})
     );
     let recovered = lab.call(&["recover"]);
@@ -842,7 +836,7 @@ fn placement_never_changes_action_identity() {
     lab.call(&["executor-set", "local", "--allow-job", "build"]);
     let first = lab.submit("agent");
     assert_eq!(
-        lab.call(&["worker", "--drain"]),
+        lab.call(&["worker", "--drain", "--no-loopback-check"]),
         json!({"executor":"local","launched":1})
     );
     assert_eq!(lab.drain_remote(), json!({"executor":"mindy","launched":2}));
@@ -876,7 +870,7 @@ fn placement_never_changes_action_identity() {
         .map(|name| (name, request(name)))
         .collect();
     assert_eq!(
-        lab.call(&["worker", "--drain"]),
+        lab.call(&["worker", "--drain", "--no-loopback-check"]),
         json!({"executor":"local","launched":2})
     );
     for (name, local) in &local {
@@ -1069,16 +1063,11 @@ fn executor_upload_quota_frees_after_complete() {
 
 #[test]
 fn local_worker_checks_loopback_by_default() {
-    // The gate's probe: mauve's worker ran a job beside an exposed, unlisted listener (P2-2).
+    // The gate's probe: mauve's worker ran a job beside an unlisted listener (P2-2). The lab API
+    // itself listens on 127.0.0.1, which every job on this host can reach.
     let lab = Lab::new(json!([job("work", "true", json!({}))]), &["work"]);
     let candidate = lab.submit("agent");
-    let exposed = lab.temp.path().join("exposed");
-    let _daemon = Daemon::start(&exposed, "--port-driver=builtin");
-    let output = lab
-        .command(&["worker", "--drain"])
-        .env("XDG_RUNTIME_DIR", &exposed)
-        .output()
-        .unwrap();
+    let output = lab.command(&["worker", "--drain"]).output().unwrap();
     assert_eq!(
         lab.count("attempt.claimed"),
         0,
@@ -1088,12 +1077,10 @@ fn local_worker_checks_loopback_by_default() {
     assert_ne!(lab.state_of(&candidate), "passed");
     // Allowlisting nothing is not an opt-out; only --no-loopback-check is.
     lab.command(&["worker", "--drain", "--loopback-allow", "1"])
-        .env("XDG_RUNTIME_DIR", &exposed)
         .output()
         .unwrap();
     assert_eq!(lab.count("attempt.claimed"), 0);
-    // The same worker beside a daemon that keeps containers off host loopback works.
-    lab.call(&["worker", "--drain"]);
+    lab.call(&["worker", "--drain", "--no-loopback-check"]);
     assert_eq!(lab.state_of(&candidate), "passed");
 }
 
@@ -1101,12 +1088,14 @@ fn local_worker_checks_loopback_by_default() {
 fn executor_refuses_to_register_with_an_unlisted_loopback_listener() {
     let lab = Lab::new(json!([job("work", "true", json!({}))]), &["work"]);
     let candidate = lab.submit("agent");
-    // Host loopback reaches every listener on this host, the API's own among them.
-    let exposed = lab.temp.path().join("exposed");
-    let _daemon = Daemon::start(&exposed, "--port-driver=builtin");
+    // Follow-up 1 (#4204): a daemon that keeps containers off host loopback (mindy's) changes
+    // nothing, since jobs run natively and reach the API's own listener directly.
+    let runtime = lab.temp.path().join("runtime");
+    let _daemon = Daemon::start(&runtime, "--disable-host-loopback");
     let output = lab
-        .executor(&lab.work, &["--drain"])
-        .env("XDG_RUNTIME_DIR", &exposed)
+        .checked_executor(&lab.work, &["--drain"])
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("DOCKER_HOST")
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1121,7 +1110,7 @@ fn executor_refuses_to_register_with_an_unlisted_loopback_listener() {
         "{reason}"
     );
     assert_eq!(lab.count("attempt.claimed"), 0);
-    // A daemon that keeps containers off host loopback lets the same executor work.
+    // Only the explicit opt-out lets the same executor work.
     assert_eq!(lab.drain_remote(), json!({"executor":"mindy","launched":1}));
     assert_eq!(lab.state_of(&candidate), "passed");
     assert!(lab.mindy()["observed"]["refused"].get("*").is_none());

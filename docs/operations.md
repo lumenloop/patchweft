@@ -71,19 +71,15 @@ launching; a profile that does not match is refused and listed under
 `observed.refused` by `patchweft executors`, with `verified`, `last_seen`, the
 reported memory limit and free disk.
 
-Before registering and before every claim, a coordinator checks whether job
-containers can reach host loopback: the rootless Docker daemon behind
-`DOCKER_HOST` (or `$XDG_RUNTIME_DIR/docker.sock`) exposes it unless its
-`rootlesskit` runs with `--disable-host-loopback`, and an unidentified daemon
-counts as exposing it. While it is exposed, every TCP listener on `127.0.0.0/8`
-or `::1` must be in `--loopback-allow PORT[,PORT…]`; otherwise the executor
-refuses all work and its record shows `refused: {"*": "loopback listener … not
-allowlisted"}`. Both `executor` and `worker` check by default; `worker
---no-loopback-check` skips it, only for a host that runs no job containers. The
-check covers TCP listeners bound to loopback. A listener on a wildcard address
-(`0.0.0.0`, `::`) is reachable on the host's own addresses whatever this check
-says, so it is outside its model: keep such services off executor hosts or
-firewall them.
+Before registering and before every claim, a coordinator checks the host's loopback: jobs run
+natively, so they reach every loopback listener directly, whatever a Docker daemon exposes to
+containers. Every TCP listener on `127.0.0.0/8` or `::1` must be in
+`--loopback-allow PORT[,PORT…]`; otherwise the executor refuses all work and its record shows
+`refused: {"*": "loopback listener … not allowlisted"}`. Both `executor` and `worker` check by
+default; `worker --no-loopback-check` skips it, only for a host whose every loopback service may be
+reached by jobs. The check covers TCP listeners bound to loopback. A listener on a wildcard address
+(`0.0.0.0`, `::`) is reachable on the host's own addresses whatever this check says, so it is
+outside its model: keep such services off executor hosts or firewall them.
 
 Attempts hold leases: 300 seconds by default for a remote executor and 3600 seconds
 for `local`, whose supervisors keep running while its worker is stopped

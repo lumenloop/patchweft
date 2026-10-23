@@ -156,12 +156,12 @@ enum Operation {
         /// Claims wait while less is free under the state directory.
         #[arg(long, default_value_t = 0)]
         min_free_gb: u64,
-        /// Host loopback ports job containers may reach when the rootless Docker daemon exposes
-        /// host loopback; any other loopback listener refuses all work. Checked by default
-        /// (MUST-FIX 8), so it cannot regress silently.
+        /// Loopback ports jobs may reach; any other loopback listener refuses all work. Checked by
+        /// default (MUST-FIX 8, follow-up 1), so it cannot regress silently.
         #[arg(long, value_delimiter = ',')]
         loopback_allow: Vec<u16>,
-        /// Skip the loopback check: only for hosts that run no job containers.
+        /// Skip the loopback check: only for a host whose every loopback service may be reached by
+        /// jobs.
         #[arg(long)]
         no_loopback_check: bool,
     },
@@ -188,10 +188,14 @@ enum Operation {
         /// Fenced or undrained attempt directories are kept this long.
         #[arg(long, default_value_t = 72)]
         retain_hours: u64,
-        /// Host loopback ports job containers may reach when the rootless Docker daemon exposes
-        /// host loopback; any other loopback listener refuses all work.
+        /// Loopback ports jobs may reach; any other loopback listener refuses all work. Jobs run
+        /// natively, so this holds whatever the Docker daemon exposes (follow-up 1).
         #[arg(long, value_delimiter = ',')]
         loopback_allow: Vec<u16>,
+        /// Skip the loopback check: only for a host whose every loopback service may be reached by
+        /// jobs.
+        #[arg(long)]
+        no_loopback_check: bool,
     },
     /// Register or reconfigure an executor. `local` sets the store's own budget; a remote
     /// executor runs only the jobs placed on it with --allow-job.
@@ -434,6 +438,7 @@ fn run(cli: Cli) -> Result<Value> {
             cas_max_gb,
             retain_hours,
             loopback_allow,
+            no_loopback_check,
         } => {
             return executor::remote(
                 || connection.open(),
@@ -448,7 +453,7 @@ fn run(cli: Cli) -> Result<Value> {
                     cas_max: cas_max_gb * GIB,
                     retain: Duration::from_secs(retain_hours * 3600),
                 },
-                loopback_allow.iter().copied().collect(),
+                (!no_loopback_check).then(|| loopback_allow.iter().copied().collect()),
             );
         }
         Operation::Mcp { .. } => unreachable!("stdio is handled before JSON output"),
