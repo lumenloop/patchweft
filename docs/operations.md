@@ -20,8 +20,13 @@ admits a higher-priority owner's work first (for example a landing-ready merge t
 and `0` clears it. Priority orders admission only: it never preempts running work or
 changes action identity. A higher-priority owner's job that waits only on a running dependency
 (every dependency passed or running) holds the capacity it will need on each executor that may
-run it: a lower-priority job is admitted only if it fits beside that demand. The hold ends when
-the dependency passes, fails or is interrupted. Jobs hold reservations until their supervised
+run it: a lower-priority job is admitted only if it fits beside the demand of the priorities
+above its own, counting the host's running work but not the dependencies being waited on, whose
+capacity frees first. Every executor that may run a waiting job holds its full demand, so for a
+whole train the fleet keeps that capacity until its prepare passes. The hold ends when the
+dependency passes, fails, is interrupted or stopped, or nobody still wants the job. While a hold
+keeps a lower-priority head back, the executor's record shows `holding` (priority, slots,
+memory), with `executor.held` and `executor.hold_released` events. Jobs hold reservations until their supervised
 processes and declared cleanup finish. A coordinator exit does not imply that
 its jobs have stopped.
 
