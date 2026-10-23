@@ -302,6 +302,17 @@ pub fn grant(store: &Store, principal: Principal, token_file: &Path) -> Result<V
     file.sync_all()?;
     store.db.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<()> {
+        // A re-grant replaces a policy: the audit event keeps the one it replaced.
+        let before: Option<Value> = store
+            .db
+            .query_row(
+                "SELECT body FROM api_principals WHERE id=?",
+                [&principal.id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|body| serde_json::from_str(&body))
+            .transpose()?;
         store.db.execute("INSERT INTO api_principals VALUES (?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body",
             params![principal.id, serde_json::to_string(&principal)?])?;
         // Re-granting a principal rotates credentials and replaces its scope.
@@ -317,7 +328,7 @@ pub fn grant(store: &Store, principal: Principal, token_file: &Path) -> Result<V
             &store.db,
             "principal.granted",
             &principal.id,
-            &json!({"after":principal,"rotated":true}),
+            &json!({"before":before,"after":principal,"rotated":true}),
         )?;
         store.db.execute_batch("COMMIT")?;
         Ok(())
@@ -332,7 +343,8 @@ pub fn grant(store: &Store, principal: Principal, token_file: &Path) -> Result<V
 
 /// Replace an existing principal's scope; its issued credentials keep working. A policy without
 /// `max_pending` keeps the current limit. Read, validation, write and the `{before, after}` audit
-/// event are one immediate transaction, so concurrent edits cannot lose an update.
+/// event are one immediate transaction, so every overwrite of a concurrent edit is visible via
+/// before/after.
 pub fn update_policy(store: &Store, policy: Value) -> Result<Value> {
     prepare(store)?;
     store.db.execute_batch("BEGIN IMMEDIATE")?;

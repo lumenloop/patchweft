@@ -457,14 +457,21 @@ fn policy_update_keeps_max_pending_when_omitted_and_grant_and_revoke_are_audited
             .unwrap();
         serde_json::from_str::<Value>(&body).unwrap()["max_pending"].clone()
     };
-    let current = limit(&store);
+    // A non-default limit first, so a reset to the default would show (gate N1).
+    api::update_policy(
+        &store,
+        json!({"id":"alice","projects":[lab.pa],"profiles":[lab.profile],"roles":["read"],
+               "max_pending":77}),
+    )
+    .unwrap();
+    assert_eq!(limit(&store), 77);
     api::update_policy(
         &store,
         json!({"id":"alice","projects":[lab.pa],"profiles":[lab.profile],"roles":["read"]}),
     )
     .unwrap();
-    // A policy without max_pending keeps the limit instead of resetting it (gate P3).
-    assert_eq!(limit(&store), current);
+    // A policy without max_pending keeps the limit instead of resetting it.
+    assert_eq!(limit(&store), 77);
     let dave = Principal {
         id: "dave".into(),
         projects: BTreeSet::from([lab.pa.clone()]),
@@ -487,6 +494,25 @@ fn policy_update_keeps_max_pending_when_omitted_and_grant_and_revoke_are_audited
         ),
         (&json!("dave"), &json!(8))
     );
+    assert!(granted[0]["detail"]["before"].is_null());
+    // A re-grant records the policy it replaces (gate N3).
+    let wider = Principal {
+        id: "dave".into(),
+        projects: BTreeSet::from([lab.pa.clone()]),
+        profiles: BTreeSet::new(),
+        roles: BTreeSet::from(["read".into()]),
+        max_pending: 9,
+    };
+    std::fs::remove_file(lab.root.join("dave.credential")).unwrap();
+    api::grant(&store, wider, &lab.root.join("dave.credential")).unwrap();
+    let regranted: Vec<Value> = store
+        .events(0)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e["kind"] == "principal.granted")
+        .collect();
+    assert_eq!(regranted[1]["detail"]["before"]["max_pending"], 8);
+    assert_eq!(regranted[1]["detail"]["after"]["max_pending"], 9);
     api::revoke(&store, "alice").unwrap();
     let revoked: Vec<Value> = store
         .events(0)
