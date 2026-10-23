@@ -478,6 +478,55 @@ pub struct CompleteResponse {
     pub drain_recorded: bool,
 }
 
+/// Version of the control files a coordinator and its supervisor exchange.
+pub const CONTROL_VERSION: u32 = 1;
+
+/// `control/claim.json`: everything a supervisor needs, written by its coordinator. The
+/// supervisor reads nothing else from the store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimFile {
+    pub version: u32,
+    pub executor: String,
+    /// `PATCHWEFT_STATE` for the job: the store root locally, the work directory remotely.
+    pub root: PathBuf,
+    pub attempt: Grant,
+    pub action: Action,
+    pub profile: RegisteredProfile,
+    pub revision: RevisionRef,
+    /// A repository holding `revision.commit`.
+    pub repository: PathBuf,
+    pub dependencies: Vec<DependencyFile>,
+    /// `{"seconds":f64,"bytes":u64}` the coordinator spent fetching inputs before launch.
+    pub transfer: serde_json::Value,
+}
+
+/// One dependency artifact and the local file the supervisor copies it from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyFile {
+    pub action: String,
+    pub attempt: String,
+    pub name: String,
+    pub sha256: String,
+    pub mode: u32,
+    pub bytes: u64,
+    pub path: PathBuf,
+}
+
+/// `control/result.json`: the supervisor's final word, published by its coordinator.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorResult {
+    pub version: u32,
+    /// `Completed` or `NotStarted`.
+    pub outcome: Outcome,
+    pub reason: Option<String>,
+    pub exit_code: i32,
+    pub evidence: serde_json::Value,
+    pub drained: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

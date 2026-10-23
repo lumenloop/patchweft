@@ -217,6 +217,9 @@ enum Operation {
     },
     #[command(name = "_execute", hide = true)]
     Execute { attempt: String },
+    /// Supervise one claimed attempt from its control files; never opens the store.
+    #[command(name = "_supervise", hide = true)]
+    Supervise { root: PathBuf, attempt: String },
 }
 
 #[derive(Args)]
@@ -346,6 +349,7 @@ fn run(cli: Cli) -> Result<Value> {
             connection,
             operation,
         } => return remote(connection, operation),
+        Operation::Supervise { root, attempt } => return worker::supervise(root, attempt),
         Operation::Mcp { .. } => unreachable!("stdio is handled before JSON output"),
         _ => {}
     }
@@ -356,9 +360,10 @@ fn run(cli: Cli) -> Result<Value> {
     let mut store = Store::open(&cli.state)?;
     Ok(match cli.command {
         Operation::Init { .. } => unreachable!(),
-        Operation::Serve { .. } | Operation::Remote { .. } | Operation::Mcp { .. } => {
-            unreachable!()
-        }
+        Operation::Serve { .. }
+        | Operation::Remote { .. }
+        | Operation::Mcp { .. }
+        | Operation::Supervise { .. } => unreachable!(),
         Operation::Grant {
             policy,
             credential_file,

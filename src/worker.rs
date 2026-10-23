@@ -1,4 +1,5 @@
 use crate::{
+    api,
     authority::{self, Choice, Scope},
     engine, file_hash, identity,
     model::*,
@@ -7,11 +8,12 @@ use crate::{
     unique,
 };
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::params;
+use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
+    io::{ErrorKind, Write},
     os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -345,97 +347,65 @@ pub fn run(store: &mut Store, drain: bool) -> Result<Value> {
     Ok(json!({"launched":launched}))
 }
 
-fn prepare(
-    store: &Store,
-    action: &Action,
-    profile: &RegisteredProfile,
-    job: &Job,
-    directory: &Path,
-) -> Result<(PathBuf, Value)> {
+/// Source and dependencies for the job, from the repository and files the claim names.
+fn prepare(claim: &ClaimFile, job: &Job, directory: &Path) -> Result<(PathBuf, Value)> {
     let source_started = Instant::now();
-    engine::verify_runtime(profile)?;
+    engine::verify_runtime(&claim.profile).map_err(RuntimeMismatch)?;
     let view = directory.join("work");
+    let (repo, commit) = (&claim.repository, &claim.revision.commit);
     if job.reuse == Reuse::Files {
         fs::create_dir(&view)?;
-        let revision = store.revision(&action.revision)?;
-        let repo = source::repository(store, &revision.project);
         for input in &job.inputs {
             let path = source::relative_path(input)?;
-            let output = source::git_command(&repo)
-                .args(["show", &format!("{}:{input}", revision.commit)])
+            let output = source::git_command(repo)
+                .args(["show", &format!("{commit}:{input}")])
                 .output()?;
             ensure!(output.status.success(), "declared source input unavailable");
             let target = view.join(path);
             fs::create_dir_all(target.parent().context("input parent")?)?;
             fs::write(&target, output.stdout)?;
-            let entry = source::git(&repo, &["ls-tree", &revision.commit, "--", input])?;
+            let entry = source::git(repo, &["ls-tree", commit, "--", input])?;
             if entry.starts_with("100755 ") {
                 fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
             }
         }
     } else {
-        source::checkout(store, &action.revision, &view)?;
+        source::checkout_from(repo, commit, &view)?;
     }
     let source_seconds = source_started.elapsed().as_secs_f64();
     let dependencies_started = Instant::now();
     let mut copied_bytes = 0_u64;
     let mut copy_seconds = 0.0;
     let mut restored = BTreeMap::new();
-    for dependency in &action.dependencies {
+    for dependency in &claim.dependencies {
+        let name = &dependency.name;
+        let relative = source::relative_path(name)?;
         ensure!(
-            engine::action_state(&store.db, dependency)? == "passed",
-            "dependency no longer passes"
+            !fs::symlink_metadata(&dependency.path)?
+                .file_type()
+                .is_symlink(),
+            "dependency artifact is a symlink"
         );
-        let attempt_id: String = store.db.query_row(
-            "SELECT attempt FROM actions WHERE id=?",
-            [dependency],
-            |r| r.get(0),
-        )?;
-        let receipt = store
-            .attempt(&attempt_id)?
-            .result
-            .context("dependency lacks evidence")?;
-        let artifacts = receipt["artifacts"]
-            .as_object()
-            .context("dependency lacks artifacts")?;
-        for (name, expected) in artifacts {
-            let relative = source::relative_path(name)?;
-            let source = store
-                .root
-                .join("attempts")
-                .join(&attempt_id)
-                .join("artifacts")
-                .join(&relative);
-            ensure!(
-                !fs::symlink_metadata(&source)?.file_type().is_symlink(),
-                "dependency artifact is a symlink"
-            );
-            let hash = file_hash(&source)?;
-            ensure!(
-                expected["sha256"] == hash,
-                "dependency artifact is corrupt: {name}"
-            );
-            if let Some(old) = restored.get(name) {
-                ensure!(old == &hash, "dependency artifacts conflict: {name}");
-                continue;
-            }
-            let target = view.join(&relative);
-            ensure!(
-                matches!(fs::symlink_metadata(&target),Err(error) if error.kind()==std::io::ErrorKind::NotFound),
-                "dependency artifact would overwrite source: {name}"
-            );
-            contained_parent(&view, &target)?;
-            let copy_started = Instant::now();
-            copied_bytes += fs::copy(&source, &target)?;
-            fs::set_permissions(
-                &target,
-                fs::Permissions::from_mode(
-                    expected["mode"].as_u64().context("artifact mode")? as u32
-                ),
-            )?;
-            copy_seconds += copy_started.elapsed().as_secs_f64();
-            restored.insert(name.clone(), hash);
+        let hash = file_hash(&dependency.path)?;
+        ensure!(
+            dependency.sha256 == hash,
+            "dependency artifact is corrupt: {name}"
+        );
+        if let Some(old) = restored.get(name) {
+            ensure!(old == &hash, "dependency artifacts conflict: {name}");
+            continue;
         }
+        let target = view.join(&relative);
+        ensure!(
+            matches!(fs::symlink_metadata(&target),Err(error) if error.kind()==ErrorKind::NotFound),
+            "dependency artifact would overwrite source: {name}"
+        );
+        contained_parent(&view, &target)?;
+        let copy_started = Instant::now();
+        copied_bytes += fs::copy(&dependency.path, &target)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(dependency.mode))?;
+        copy_seconds += copy_started.elapsed().as_secs_f64();
+        restored.insert(name.clone(), hash);
     }
     Ok((
         view,
@@ -444,19 +414,188 @@ fn prepare(
             "dependency_seconds": dependencies_started.elapsed().as_secs_f64(),
             "dependency_copy_seconds": copy_seconds,
             "dependency_copy_bytes": copied_bytes,
-            "dependency_files": restored.len()
+            "dependency_files": restored.len(),
+            "transfer_seconds": claim.transfer["seconds"].as_f64().unwrap_or(0.0),
+            "transfer_bytes": claim.transfer["bytes"].as_u64().unwrap_or(0)
         }),
     ))
 }
 
+/// How a running job hears of stops decided elsewhere and reports the stops its supervisor
+/// decides: `_execute` through the store, `_supervise` through its attempt's control files.
+trait Control {
+    fn command_started(&mut self) -> Result<()>;
+    /// A stop decided outside the supervisor, once one is recorded.
+    fn requested(&mut self) -> Result<Option<String>>;
+    /// Reports a stop the supervisor decided itself: `supervisor-stop` or `timeout`.
+    fn stopping(&mut self, reason: &str) -> Result<()>;
+}
+
+/// `_execute`: the supervisor records stops in the store itself.
+struct StoreControl<'a> {
+    db: &'a Connection,
+    action: &'a str,
+    attempt: &'a str,
+}
+
+impl StoreControl<'_> {
+    fn active(&self, db: &Connection) -> Result<i64> {
+        Ok(db.query_row(
+            "SELECT COUNT(*) FROM interests WHERE action=? AND active=1",
+            [self.action],
+            |r| r.get(0),
+        )?)
+    }
+    fn record(&self, db: &Connection, reason: &str) -> Result<()> {
+        db.execute(
+            "UPDATE actions SET state='stopping' WHERE id=? AND attempt=?",
+            params![self.action, self.attempt],
+        )?;
+        event(
+            db,
+            "attempt.stopping",
+            self.attempt,
+            &json!({"reason":reason}),
+        )
+    }
+}
+
+impl Control for StoreControl<'_> {
+    fn command_started(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn requested(&mut self) -> Result<Option<String>> {
+        if self.active(self.db)? != 0 {
+            return Ok(None);
+        }
+        let transaction = rusqlite::Transaction::new_unchecked(
+            self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        // A requester may have joined since.
+        let stopped = self.active(&transaction)? == 0;
+        if stopped {
+            self.record(&transaction, "no-requesters")?;
+        }
+        transaction.commit()?;
+        Ok(stopped.then(|| "no-requesters".to_owned()))
+    }
+    fn stopping(&mut self, reason: &str) -> Result<()> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        self.record(&transaction, reason)?;
+        Ok(transaction.commit()?)
+    }
+}
+
+/// `_supervise`: the coordinator relays stops both ways through `control/`.
+struct FileControl<'a> {
+    control: &'a Path,
+}
+
+impl Control for FileControl<'_> {
+    fn command_started(&mut self) -> Result<()> {
+        write_atomically(&self.control.join("command-started"), b"")
+    }
+    fn requested(&mut self) -> Result<Option<String>> {
+        stop_reason(self.control)
+    }
+    fn stopping(&mut self, reason: &str) -> Result<()> {
+        write_atomically(
+            &self.control.join("stopping"),
+            json!({"reason":reason}).to_string().as_bytes(),
+        )
+    }
+}
+
+/// Readers of a control file never see it half written.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut temp = tempfile::NamedTempFile::new_in(path.parent().context("control directory")?)?;
+    temp.write_all(bytes)?;
+    temp.persist(path)?;
+    Ok(())
+}
+
+/// The reason in `control/stop`, once the coordinator wrote one.
+fn stop_reason(control: &Path) -> Result<Option<String>> {
+    let bytes = match fs::read(control.join("stop")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let stop: Value = serde_json::from_slice(&bytes)?;
+    Ok(Some(
+        stop["reason"]
+            .as_str()
+            .context("stop file lacks a reason")?
+            .to_owned(),
+    ))
+}
+
+/// Tool drift on this host: nothing of the job ran and nothing about the revision failed.
+#[derive(Debug)]
+struct RuntimeMismatch(anyhow::Error);
+
+impl std::fmt::Display for RuntimeMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+impl std::error::Error for RuntimeMismatch {}
+
+/// Output a result may carry, per file (artifacts and logs) and per attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Limits {
+    file: u64,
+    attempt: u64,
+}
+
+/// Every host enforces the same limits, so a result recorded on one is deliverable from all.
+const LIMITS: Limits = Limits {
+    file: api::MAX_ARTIFACT_BYTES,
+    attempt: api::MAX_ATTEMPT_OUTPUT_BYTES,
+};
+
+/// The attempt's logs so far, each within the per-file limit; returns their total size.
+fn logs_within(directory: &Path, limits: Limits) -> Result<u64> {
+    let mut total = 0;
+    for log in ["output.log", "cleanup.log"] {
+        let bytes = match fs::metadata(directory.join(log)) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(bytes <= limits.file, "{log} exceeds {} bytes", limits.file);
+        total += bytes;
+    }
+    Ok(total)
+}
+
+/// Rechecked after cleanup, whose log counts toward the attempt's output.
+fn outputs_within(directory: &Path, evidence: &Value, limits: Limits) -> Result<()> {
+    let artifacts: u64 = evidence["artifacts"]
+        .as_object()
+        .into_iter()
+        .flat_map(|artifacts| artifacts.values())
+        .filter_map(|artifact| artifact["bytes"].as_u64())
+        .sum();
+    ensure!(
+        logs_within(directory, limits)? + artifacts <= limits.attempt,
+        "attempt outputs exceed {} bytes",
+        limits.attempt
+    );
+    Ok(())
+}
+
 fn execute_command(
-    store: &Store,
-    attempt: &Attempt,
-    action: &Action,
-    profile: &RegisteredProfile,
+    claim: &ClaimFile,
     job: &Job,
     directory: &Path,
+    control: &mut dyn Control,
 ) -> Result<(i32, Value)> {
+    let (action, profile) = (&claim.action, &claim.profile);
     let started = Instant::now();
     if let Some(identity) = &action.identity {
         let current = engine::recipes_for(profile, &identity.version)
@@ -467,8 +606,8 @@ fn execute_command(
             "job identity changed since request"
         );
     }
-    let timeout_seconds = attempt.timeout_seconds.unwrap_or(job.timeout_seconds);
-    let (view, preparation) = prepare(store, action, profile, job, directory)?;
+    let timeout_seconds = claim.attempt.timeout_seconds;
+    let (view, preparation) = prepare(claim, job, directory)?;
     let scratch = directory.join("scratch");
     let home = directory.join("home");
     fs::create_dir(&scratch)?;
@@ -506,8 +645,8 @@ fn execute_command(
         .env("GIT_TERMINAL_PROMPT", "0")
         .envs(&profile.definition.environment)
         .envs(&job.environment)
-        .env("PATCHWEFT_STATE", &store.root)
-        .env("PATCHWEFT_ATTEMPT", &attempt.id)
+        .env("PATCHWEFT_STATE", &claim.root)
+        .env("PATCHWEFT_ATTEMPT", &claim.attempt.id)
         .env("PATCHWEFT_REVISION", &action.revision)
         .env("PATCHWEFT_REPORT", &job.report.path)
         .stdin(Stdio::null())
@@ -518,52 +657,27 @@ fn execute_command(
     }
     let command_started = Instant::now();
     let timer_seconds;
+    control.command_started()?;
     let mut child = command.spawn()?;
     let mut status = None;
-    let mut terminating: Option<(Instant, &str)> = None;
+    let mut terminating: Option<(Instant, String)> = None;
     loop {
-        let active: i64 = store.db.query_row(
-            "SELECT COUNT(*) FROM interests WHERE action=? AND active=1",
-            [&action.id],
-            |r| r.get(0),
-        )?;
         if terminating.is_none() {
+            // A stop recorded elsewhere wins over this supervisor's own timeout.
             let reason = if STOP.load(Ordering::SeqCst) {
-                Some("supervisor-stop")
-            } else if active == 0 {
-                Some("no-requesters")
+                control.stopping("supervisor-stop")?;
+                Some("supervisor-stop".to_owned())
+            } else if let Some(reason) = control.requested()? {
+                Some(reason)
             } else if started.elapsed().as_secs() >= timeout_seconds {
-                Some("timeout")
+                control.stopping("timeout")?;
+                Some("timeout".to_owned())
             } else {
                 None
             };
-            if let Some(reason) = reason {
-                let transaction = rusqlite::Transaction::new_unchecked(
-                    &store.db,
-                    rusqlite::TransactionBehavior::Immediate,
-                )?;
-                let current_active: i64 = transaction.query_row(
-                    "SELECT COUNT(*) FROM interests WHERE action=? AND active=1",
-                    [&action.id],
-                    |r| r.get(0),
-                )?;
-                if reason != "no-requesters" || current_active == 0 {
-                    transaction.execute(
-                        "UPDATE actions SET state='stopping' WHERE id=? AND attempt=?",
-                        params![action.id, attempt.id],
-                    )?;
-                    event(
-                        &transaction,
-                        "attempt.stopping",
-                        &attempt.id,
-                        &json!({"reason":reason}),
-                    )?;
-                    terminating = Some((Instant::now(), reason));
-                }
-                transaction.commit()?;
-            }
+            terminating = reason.map(|reason| (Instant::now(), reason));
         }
-        if let Some((time, _)) = terminating {
+        if let Some((time, _)) = &terminating {
             signal_tree(if time.elapsed().as_secs() < 3 {
                 libc::SIGTERM
             } else {
@@ -590,6 +704,7 @@ fn execute_command(
     if reason.is_some() {
         code = 124;
     }
+    logs_within(directory, LIMITS)?;
     let report = if code == 0 {
         validate_report(job, &view, &directory.join("output.log"))?
     } else {
@@ -597,7 +712,7 @@ fn execute_command(
     };
     let capture_started = Instant::now();
     let artifacts = if code == 0 {
-        capture_artifacts(job, &view, directory)?
+        capture_artifacts(job, &view, directory, LIMITS)?
     } else {
         BTreeMap::new()
     };
@@ -609,7 +724,8 @@ fn execute_command(
                     "report":report,"log_sha256":file_hash(&directory.join("output.log"))?,
                     "artifacts":artifacts,"revision":action.revision,"profile":profile.id,"job":job.name,
                     "identity":evidence_identity(action),"timer_seconds":timer_seconds,"host":host(),
-                    "budget":{"slots":attempt.slots,"memory_mb":attempt.memory_mb,
+                    "executor":claim.executor,
+                    "budget":{"slots":claim.attempt.slots,"memory_mb":claim.attempt.memory_mb,
                               "timeout_seconds":timeout_seconds}}),
     ))
 }
@@ -651,7 +767,9 @@ fn contained_parent(view: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn execute(store: &mut Store, attempt_id: &str) -> Result<Value> {
+/// Makes this process the dedicated supervisor of one job: it adopts the job's descendants,
+/// turns SIGTERM and SIGINT into a stop and yields the CPU to coordinators.
+fn dedicate() -> Result<()> {
     STOP.store(false, Ordering::SeqCst);
     unsafe {
         // The dedicated process owns all adopted descendants; shared coordinators are never reapers.
@@ -671,10 +789,97 @@ pub fn execute(store: &mut Store, attempt_id: &str) -> Result<Value> {
         libc::signal(libc::SIGINT, stop_signal as *const () as libc::sighandler_t);
         libc::nice(10);
     }
+    Ok(())
+}
+
+/// Evidence of an attempt whose command produced no result.
+fn failure(claim: &ClaimFile, job: &Job, error: Option<String>) -> Value {
+    let action = &claim.action;
+    json!({"error":error,"revision":action.revision,"profile":claim.profile.id,"job":job.name,
+           "identity":evidence_identity(action),"key":action.key,"executor":claim.executor})
+}
+
+fn not_started(
+    claim: &ClaimFile,
+    job: &Job,
+    reason: &str,
+    error: Option<String>,
+) -> SupervisorResult {
+    SupervisorResult {
+        version: CONTROL_VERSION,
+        outcome: Outcome::NotStarted,
+        reason: Some(reason.into()),
+        exit_code: 125,
+        evidence: failure(claim, job, error),
+        drained: true,
+    }
+}
+
+/// Ends a registered attempt. Even after an error nothing is reported before the job's
+/// processes are gone and its external cleanup ran.
+fn conclude(
+    claim: &ClaimFile,
+    job: &Job,
+    directory: &Path,
+    result: Result<(i32, Value)>,
+) -> SupervisorResult {
+    let deadline = Instant::now();
+    while !descendants(std::process::id()).is_empty() {
+        signal_tree(if deadline.elapsed().as_secs() < 3 {
+            libc::SIGTERM
+        } else {
+            libc::SIGKILL
+        });
+        reap_adopted(0);
+        thread::sleep(Duration::from_millis(50));
+    }
+    let (outcome, reason, mut code, mut evidence) = match result {
+        Ok((code, evidence)) => {
+            let reason = evidence["reason"].as_str().map(String::from);
+            (Outcome::Completed, reason, code, evidence)
+        }
+        Err(error) if error.is::<RuntimeMismatch>() => (
+            Outcome::NotStarted,
+            Some("runtime-mismatch".into()),
+            125,
+            failure(claim, job, Some(format!("{error:#}"))),
+        ),
+        Err(error) => (
+            Outcome::Completed,
+            None,
+            125,
+            failure(claim, job, Some(format!("{error:#}"))),
+        ),
+    };
+    let cleanup = cleanup_external(claim, job, directory);
+    let drained = cleanup.is_ok();
+    if let Err(error) = cleanup {
+        code = 125;
+        evidence["cleanup_error"] = json!(format!("{error:#}"));
+    }
+    if let Err(error) = outputs_within(directory, &evidence, LIMITS) {
+        code = 125;
+        if evidence["error"].is_null() {
+            evidence["error"] = json!(format!("{error:#}"));
+        }
+    }
+    SupervisorResult {
+        version: CONTROL_VERSION,
+        outcome,
+        reason,
+        exit_code: code,
+        evidence,
+        drained,
+    }
+}
+
+pub fn execute(store: &mut Store, attempt_id: &str) -> Result<Value> {
+    dedicate()?;
     let mut attempt = store.attempt(attempt_id)?;
     let action = store.action(&attempt.action)?;
     let profile = store.profile(&action.profile)?;
     let job = engine::job(&profile, &action.job)?.clone();
+    let revision = store.revision(&action.revision)?;
     let transaction = store.transaction()?;
     let state: String =
         transaction.query_row("SELECT state FROM attempts WHERE id=?", [attempt_id], |r| {
@@ -700,41 +905,27 @@ pub fn execute(store: &mut Store, attempt_id: &str) -> Result<Value> {
     transaction.commit()?;
     let directory = store.root.join("attempts").join(attempt_id);
     fs::create_dir_all(&directory)?;
-    let result = execute_command(store, &attempt, &action, &profile, &job, &directory);
-    // Even an I/O/database error cannot release resources before the job's children are drained.
-    let deadline = Instant::now();
-    while !descendants(std::process::id()).is_empty() {
-        signal_tree(if deadline.elapsed().as_secs() < 3 {
-            libc::SIGTERM
-        } else {
-            libc::SIGKILL
-        });
-        reap_adopted(0);
-        thread::sleep(Duration::from_millis(50));
-    }
-    let (mut code, mut evidence) = match result {
-        Ok(value) => value,
-        Err(error) => (
-            125,
-            json!({"error":format!("{error:#}"),"revision":action.revision,
-                                 "profile":profile.id,"job":job.name,
-                                 "identity":evidence_identity(&action),"key":action.key}),
-        ),
-    };
-    let cleanup = cleanup_external(store, &attempt, &profile, &job, &directory);
-    let drained = cleanup.is_ok();
-    if let Err(error) = cleanup {
-        code = 125;
-        evidence["cleanup_error"] = json!(format!("{error:#}"));
-    }
+    let mut claim = local_claim(store, &attempt, action, profile, revision, &job);
+    let result = local_dependencies(store, &claim.action).and_then(|dependencies| {
+        claim.dependencies = dependencies;
+        let mut control = StoreControl {
+            db: &store.db,
+            action: &claim.action.id,
+            attempt: attempt_id,
+        };
+        execute_command(&claim, &job, &directory, &mut control)
+    });
+    let result = conclude(&claim, &job, &directory, result);
+    // This worker keeps no refused profiles and would claim a drifted one again at once, so
+    // here a runtime mismatch still fails the attempt.
     let request = CompleteRequest {
         attempt: attempt_id.into(),
-        lease: attempt.lease.clone().unwrap_or_default(),
+        lease: claim.attempt.lease,
         outcome: Outcome::Completed,
-        reason: evidence["reason"].as_str().map(String::from),
-        exit_code: code,
-        evidence,
-        drained,
+        reason: result.evidence["reason"].as_str().map(String::from),
+        exit_code: result.exit_code,
+        evidence: result.evidence,
+        drained: result.drained,
         log: None,
         cleanup_log: None,
         artifacts: BTreeMap::new(),
@@ -745,13 +936,152 @@ pub fn execute(store: &mut Store, attempt_id: &str) -> Result<Value> {
     Ok(json!({"attempt":attempt_id,"state":state}))
 }
 
-fn cleanup_external(
+/// The claim `_execute` runs: the store's own repository and attempt directories.
+fn local_claim(
     store: &Store,
     attempt: &Attempt,
-    profile: &RegisteredProfile,
+    action: Action,
+    profile: RegisteredProfile,
+    revision: Revision,
     job: &Job,
-    directory: &Path,
-) -> Result<()> {
+) -> ClaimFile {
+    ClaimFile {
+        version: CONTROL_VERSION,
+        executor: attempt
+            .executor
+            .clone()
+            .unwrap_or_else(|| authority::LOCAL.into()),
+        root: store.root.clone(),
+        attempt: Grant {
+            id: attempt.id.clone(),
+            lease: attempt.lease.clone().unwrap_or_default(),
+            lease_expires: attempt.lease_expires.unwrap_or_default(),
+            slots: attempt.slots,
+            memory_mb: attempt.memory_mb,
+            timeout_seconds: attempt.timeout_seconds.unwrap_or(job.timeout_seconds),
+        },
+        action,
+        profile,
+        repository: source::repository(store, &revision.project),
+        revision: RevisionRef {
+            id: revision.id,
+            project: revision.project,
+            commit: revision.commit,
+        },
+        dependencies: Vec::new(),
+        transfer: json!({"seconds":0.0,"bytes":0}),
+    }
+}
+
+/// Dependency artifacts in their producers' attempt directories.
+fn local_dependencies(store: &Store, action: &Action) -> Result<Vec<DependencyFile>> {
+    let mut files = Vec::new();
+    for dependency in &action.dependencies {
+        ensure!(
+            engine::action_state(&store.db, dependency)? == "passed",
+            "dependency no longer passes"
+        );
+        let attempt_id: String = store.db.query_row(
+            "SELECT attempt FROM actions WHERE id=?",
+            [dependency],
+            |r| r.get(0),
+        )?;
+        let receipt = store
+            .attempt(&attempt_id)?
+            .result
+            .context("dependency lacks evidence")?;
+        let artifacts = receipt["artifacts"]
+            .as_object()
+            .context("dependency lacks artifacts")?;
+        for (name, expected) in artifacts {
+            files.push(DependencyFile {
+                action: dependency.clone(),
+                attempt: attempt_id.clone(),
+                name: name.clone(),
+                // A missing digest is refused as corrupt when the file is checked.
+                sha256: expected["sha256"].as_str().unwrap_or_default().into(),
+                mode: expected["mode"].as_u64().context("artifact mode")? as u32,
+                bytes: expected["bytes"].as_u64().unwrap_or_default(),
+                path: store
+                    .root
+                    .join("attempts")
+                    .join(&attempt_id)
+                    .join("artifacts")
+                    .join(source::relative_path(name)?),
+            });
+        }
+    }
+    Ok(files)
+}
+
+/// The coordinator gave up on a supervisor it never registered.
+const REGISTRATION_SECONDS: u64 = 3600;
+
+/// `_supervise ROOT ATTEMPT`: runs one claimed attempt from its control files alone. It never
+/// opens the store and holds no credentials; its coordinator relays registration and stops.
+pub fn supervise(root: &Path, attempt: &str) -> Result<Value> {
+    dedicate()?;
+    let root = root.canonicalize()?;
+    let directory = root.join("attempts").join(attempt);
+    let control = directory.join("control");
+    let mut claim: ClaimFile = serde_json::from_slice(&fs::read(control.join("claim.json"))?)?;
+    ensure!(
+        claim.version == CONTROL_VERSION,
+        "unsupported claim version {}",
+        claim.version
+    );
+    ensure!(
+        claim.attempt.id == attempt && claim.root.canonicalize()? == root,
+        "claim belongs to another attempt"
+    );
+    // Jobs find their attempt directory as `$PATCHWEFT_STATE/attempts/$PATCHWEFT_ATTEMPT`.
+    claim.root = root.clone();
+    let job = engine::job(&claim.profile, &claim.action.job)?;
+    let result = match registration(&claim, job, &control)? {
+        Some(result) => result,
+        None => {
+            let result = execute_command(
+                &claim,
+                job,
+                &directory,
+                &mut FileControl { control: &control },
+            );
+            conclude(&claim, job, &directory, result)
+        }
+    };
+    write_atomically(&control.join("result.json"), &serde_json::to_vec(&result)?)?;
+    Ok(json!({"attempt":attempt,"outcome":result.outcome,"exit_code":result.exit_code}))
+}
+
+/// Waits until the coordinator reports the attempt registered: nothing of the job runs before
+/// the store recorded it running. A stop instead yields a not-started result.
+fn registration(claim: &ClaimFile, job: &Job, control: &Path) -> Result<Option<SupervisorResult>> {
+    let started = Instant::now();
+    loop {
+        if let Some(reason) = stop_reason(control)? {
+            return Ok(Some(not_started(claim, job, &reason, None)));
+        }
+        if STOP.load(Ordering::SeqCst) {
+            return Ok(Some(not_started(claim, job, "supervisor-stop", None)));
+        }
+        if control.join("registered").exists() {
+            return Ok(None);
+        }
+        if started.elapsed().as_secs() >= REGISTRATION_SECONDS {
+            let error = format!("not registered within {REGISTRATION_SECONDS} s");
+            return Ok(Some(not_started(
+                claim,
+                job,
+                "registration-timeout",
+                Some(error),
+            )));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn cleanup_external(claim: &ClaimFile, job: &Job, directory: &Path) -> Result<()> {
+    let profile = &claim.profile;
     if job.cleanup.is_empty() {
         return Ok(());
     }
@@ -770,8 +1100,8 @@ fn cleanup_external(
         .env("PATH", std::env::join_paths(paths)?)
         .envs(&profile.definition.environment)
         .envs(&job.environment)
-        .env("PATCHWEFT_STATE", &store.root)
-        .env("PATCHWEFT_ATTEMPT", &attempt.id)
+        .env("PATCHWEFT_STATE", &claim.root)
+        .env("PATCHWEFT_ATTEMPT", &claim.attempt.id)
         .env("PATCHWEFT_WORKSPACE", &work)
         .env("TMPDIR", directory.join("scratch"))
         .env("HOME", directory.join("home"))
@@ -899,6 +1229,8 @@ fn copy_files(
     destination: &Path,
     relative: &Path,
     manifest: &mut BTreeMap<String, Value>,
+    limits: Limits,
+    total: &mut u64,
 ) -> Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     ensure!(
@@ -916,10 +1248,24 @@ fn copy_files(
                 &destination.join(entry.file_name()),
                 &path,
                 manifest,
+                limits,
+                total,
             )?;
         }
     } else {
         ensure!(metadata.is_file(), "artifact is not a regular file");
+        ensure!(
+            metadata.len() <= limits.file,
+            "artifact {} exceeds {} bytes",
+            relative.display(),
+            limits.file
+        );
+        *total += metadata.len();
+        ensure!(
+            *total <= limits.attempt,
+            "attempt outputs exceed {} bytes",
+            limits.attempt
+        );
         fs::create_dir_all(destination.parent().context("artifact parent")?)?;
         fs::copy(source, destination)?;
         let mode = metadata.permissions().mode() & 0o777;
@@ -932,7 +1278,14 @@ fn copy_files(
     Ok(())
 }
 
-fn capture_artifacts(job: &Job, view: &Path, directory: &Path) -> Result<BTreeMap<String, Value>> {
+/// Artifacts count toward the attempt's output together with its log.
+fn capture_artifacts(
+    job: &Job,
+    view: &Path,
+    directory: &Path,
+    limits: Limits,
+) -> Result<BTreeMap<String, Value>> {
+    let mut total = logs_within(directory, limits)?;
     let output = directory.join("artifacts");
     fs::create_dir(&output)?;
     let mut manifest = BTreeMap::new();
@@ -943,7 +1296,14 @@ fn capture_artifacts(job: &Job, view: &Path, directory: &Path) -> Result<BTreeMa
             target.canonicalize()?.starts_with(view.canonicalize()?),
             "artifact escapes job workspace"
         );
-        copy_files(&target, &output.join(&relative), &relative, &mut manifest)?;
+        copy_files(
+            &target,
+            &output.join(&relative),
+            &relative,
+            &mut manifest,
+            limits,
+            &mut total,
+        )?;
     }
     fs::write(
         directory.join("artifacts.json"),
@@ -1038,4 +1398,191 @@ pub fn publish_directory(source: &Path, destination: &Path) -> Result<()> {
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(value: Value) -> Job {
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// An attempt directory whose job wrote `output.log` (4 bytes), `dist/a` (8) and `dist/b` (12).
+    fn finished() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        let view = temp.path().join("work");
+        fs::create_dir_all(view.join("dist")).unwrap();
+        fs::write(temp.path().join("output.log"), "log\n").unwrap();
+        fs::write(view.join("dist/a"), "12345678").unwrap();
+        fs::write(view.join("dist/b"), "123456789012").unwrap();
+        temp
+    }
+
+    #[test]
+    fn capture_enforces_artifact_and_attempt_limits() {
+        let build = job(json!({"name":"build","command":["sh"],"artifacts":["dist"]}));
+        let capture = |file, attempt| {
+            let temp = finished();
+            capture_artifacts(
+                &build,
+                &temp.path().join("work"),
+                temp.path(),
+                Limits { file, attempt },
+            )
+            .map_err(|error| format!("{error:#}"))
+        };
+        let error = capture(11, 100).unwrap_err();
+        assert!(error.contains("dist/b exceeds 11 bytes"), "{error}");
+        let error = capture(3, 100).unwrap_err();
+        assert!(error.contains("output.log exceeds 3 bytes"), "{error}");
+        // Artifacts and the log together: 24 bytes.
+        let error = capture(12, 23).unwrap_err();
+        assert!(error.contains("outputs exceed 23 bytes"), "{error}");
+        let manifest = capture(12, 24).unwrap();
+        assert_eq!(
+            (&manifest["dist/a"]["bytes"], &manifest["dist/b"]["bytes"]),
+            (&json!(8), &json!(12))
+        );
+
+        // The cleanup log is counted once cleanup ran.
+        let temp = finished();
+        let limits = Limits {
+            file: 12,
+            attempt: 24,
+        };
+        let artifacts =
+            capture_artifacts(&build, &temp.path().join("work"), temp.path(), limits).unwrap();
+        let evidence = json!({"artifacts":artifacts});
+        outputs_within(temp.path(), &evidence, limits).unwrap();
+        fs::write(temp.path().join("cleanup.log"), "x").unwrap();
+        let error = format!(
+            "{:#}",
+            outputs_within(temp.path(), &evidence, limits).unwrap_err()
+        );
+        assert!(error.contains("outputs exceed 24 bytes"), "{error}");
+        fs::write(temp.path().join("cleanup.log"), "1234567890123").unwrap();
+        let error = format!(
+            "{:#}",
+            outputs_within(temp.path(), &evidence, limits).unwrap_err()
+        );
+        assert!(error.contains("cleanup.log exceeds 12 bytes"), "{error}");
+
+        // Every host passes the same constants, so a result is deliverable from every host.
+        assert_eq!(
+            LIMITS,
+            Limits {
+                file: api::MAX_ARTIFACT_BYTES,
+                attempt: api::MAX_ATTEMPT_OUTPUT_BYTES
+            }
+        );
+    }
+
+    #[test]
+    fn files_only_job_reads_the_repository_named_in_the_claim() {
+        let temp = tempfile::tempdir().unwrap();
+        // The claim's repository lies outside the root, which has no repos/ at all.
+        let repository = temp.path().join("mirror");
+        fs::create_dir(&repository).unwrap();
+        let git = |args: &[&str]| source::git(&repository, args).unwrap();
+        git(&["init", "--quiet"]);
+        fs::write(repository.join("input.txt"), "from the claim\n").unwrap();
+        fs::write(repository.join("tool.sh"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(
+            repository.join("tool.sh"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(repository.join("unlisted.txt"), "not an input\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@local.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ]);
+        let commit = git(&["rev-parse", "HEAD"]);
+        let root = temp.path().join("root");
+        let definition: Profile = serde_json::from_value(json!({
+            "version":1,"name":"fixture","tools":{},"jobs":[
+                {"name":"lint","command":["sh"],"reuse":"files","inputs":["input.txt","tool.sh"]},
+                {"name":"full","command":["sh"]}]}))
+        .unwrap();
+        let profile = RegisteredProfile {
+            id: "f-1".into(),
+            definition,
+            tools: BTreeMap::new(),
+            engine: file_hash(&std::env::current_exe().unwrap()).unwrap(),
+            platform: engine::platform(),
+        };
+        let claim = ClaimFile {
+            version: CONTROL_VERSION,
+            executor: "mindy".into(),
+            root: root.clone(),
+            attempt: Grant {
+                id: "a1".into(),
+                lease: "lease".into(),
+                lease_expires: 0.0,
+                slots: 1,
+                memory_mb: 512,
+                timeout_seconds: 60,
+            },
+            action: Action {
+                id: "act".into(),
+                key: "key".into(),
+                revision: "rev".into(),
+                profile: "f-1".into(),
+                job: "lint".into(),
+                dependencies: vec![],
+                created: 0.0,
+                identity: None,
+                reservation: None,
+                origin: None,
+            },
+            profile: profile.clone(),
+            revision: RevisionRef {
+                id: "rev".into(),
+                project: "p".into(),
+                commit: commit.clone(),
+            },
+            repository: repository.clone(),
+            dependencies: vec![],
+            transfer: json!({"seconds":1.5,"bytes":42}),
+        };
+        let directory = root.join("attempts").join("a1");
+        fs::create_dir_all(&directory).unwrap();
+        let (view, preparation) =
+            prepare(&claim, engine::job(&profile, "lint").unwrap(), &directory).unwrap();
+        assert_eq!(
+            fs::read_to_string(view.join("input.txt")).unwrap(),
+            "from the claim\n"
+        );
+        let mode = fs::metadata(view.join("tool.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert!(!view.join("unlisted.txt").exists());
+        assert!(!view.join(".git").exists());
+        assert!(!root.join("repos").exists());
+        assert_eq!(
+            (
+                &preparation["transfer_seconds"],
+                &preparation["transfer_bytes"]
+            ),
+            (&json!(1.5), &json!(42))
+        );
+
+        // Every other job checks the claimed commit out of the same repository.
+        let directory = root.join("attempts").join("a2");
+        fs::create_dir_all(&directory).unwrap();
+        let (view, _) =
+            prepare(&claim, engine::job(&profile, "full").unwrap(), &directory).unwrap();
+        assert!(view.join("unlisted.txt").exists());
+        assert_eq!(source::git(&view, &["rev-parse", "HEAD"]).unwrap(), commit);
+    }
 }
