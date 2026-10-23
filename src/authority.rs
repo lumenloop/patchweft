@@ -18,6 +18,8 @@ use std::{
 
 pub const LOCAL: &str = "local";
 pub const DEFAULT_LEASE_SECONDS: u64 = 300;
+/// A `refused` key with which an executor declines every profile, saying why (MUST-FIX 8).
+pub const REFUSE_ALL: &str = "*";
 const MAX_UNVERIFIED: usize = 32;
 /// The executor of an attempt row. Attempts claimed before executors existed are local.
 const EXECUTOR: &str = "COALESCE(json_extract(body,'$.executor'),'local')";
@@ -215,6 +217,7 @@ pub fn select(
     for action in queued {
         if !scope.allows_profile(&action.profile)
             || refused.contains(&action.profile)
+            || refused.contains(REFUSE_ALL)
             || !record.placement.permits(&action.job)
             || !engine::eligible(db, &action)?
         {
@@ -1867,6 +1870,31 @@ mod tests {
             .unwrap();
         let response = claim_for(&mut store, "mindy", &Scope::all(), &ask("k2", &["f-1"])).unwrap();
         assert_eq!(claimed(&response), Some("wide"));
+    }
+
+    #[test]
+    fn refusing_every_profile_claims_nothing() {
+        let (_root, mut store) = lab();
+        queue(
+            &store.db,
+            Queue {
+                id: "work",
+                ..Queue::default()
+            },
+        );
+        let reason = "loopback listener 127.0.0.1:2375 not allowlisted";
+        let mut request = ask("k1", &["f-1"]);
+        request.refused.insert(REFUSE_ALL.into(), reason.into());
+        let response = claim_for(&mut store, LOCAL, &Scope::all(), &request).unwrap();
+        assert_eq!(claimed(&response), None);
+        assert!(response.unverified.is_empty());
+        assert_eq!(state(&store.db, "work"), "queued");
+        let local = load(&store.db, LOCAL).unwrap().unwrap();
+        assert_eq!(local.observed.refused[REFUSE_ALL], reason);
+        assert_eq!(local.observed.verified, BTreeSet::from(["f-1".to_owned()]));
+        // Once the executor stops declining, the same work is claimed.
+        let response = claim_for(&mut store, LOCAL, &Scope::all(), &ask("k2", &["f-1"])).unwrap();
+        assert_eq!(claimed(&response), Some("work"));
     }
 
     #[test]

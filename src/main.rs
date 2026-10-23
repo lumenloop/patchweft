@@ -5,12 +5,15 @@ use patchweft::{
 };
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeSet,
     fs,
     net::SocketAddr,
     path::PathBuf,
     thread,
     time::{Duration, Instant},
 };
+
+const GIB: u64 = 1024 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -146,6 +149,41 @@ enum Operation {
         poll_ms: u64,
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
         heartbeat_seconds: u64,
+        /// Claims wait while less is free under the state directory.
+        #[arg(long, default_value_t = 0)]
+        min_free_gb: u64,
+        /// Refuse work while job containers can reach a host loopback listener on any other
+        /// port. Without ports, every such listener refuses; without the option, no check.
+        #[arg(long, value_delimiter = ',', num_args = 0..=1)]
+        loopback_allow: Option<Vec<u16>>,
+    },
+    /// Run a remote executor's coordinator against an API; --drain exits when all currently
+    /// runnable work is finished. A second coordinator for the same work directory waits as a
+    /// standby.
+    Executor {
+        #[command(flatten)]
+        connection: Connection,
+        /// `PATCHWEFT_STATE` for jobs: attempts, source mirrors, the artifact cache.
+        #[arg(long)]
+        work: PathBuf,
+        #[arg(long)]
+        drain: bool,
+        #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u64).range(1..))]
+        poll_ms: u64,
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
+        heartbeat_seconds: u64,
+        /// Claims wait while less is free under the work directory, after reclaiming space.
+        #[arg(long, default_value_t = 20)]
+        min_free_gb: u64,
+        #[arg(long, default_value_t = 20)]
+        cas_max_gb: u64,
+        /// Fenced or undrained attempt directories are kept this long.
+        #[arg(long, default_value_t = 72)]
+        retain_hours: u64,
+        /// Host loopback ports job containers may reach when the rootless Docker daemon exposes
+        /// host loopback; any other loopback listener refuses all work.
+        #[arg(long, value_delimiter = ',')]
+        loopback_allow: Vec<u16>,
     },
     /// Register or reconfigure an executor. `local` sets the store's own budget; a remote
     /// executor runs only the jobs placed on it with --allow-job.
@@ -378,6 +416,33 @@ fn run(cli: Cli) -> Result<Value> {
             operation,
         } => return remote(connection, operation),
         Operation::Supervise { root, attempt } => return worker::supervise(root, attempt),
+        Operation::Executor {
+            connection,
+            work,
+            drain,
+            poll_ms,
+            heartbeat_seconds,
+            min_free_gb,
+            cas_max_gb,
+            retain_hours,
+            loopback_allow,
+        } => {
+            return executor::remote(
+                || connection.open(),
+                work,
+                executor::Options {
+                    drain: *drain,
+                    poll: Duration::from_millis(*poll_ms),
+                    heartbeat: Duration::from_secs(*heartbeat_seconds),
+                },
+                executor::Bounds {
+                    min_free: min_free_gb * GIB,
+                    cas_max: cas_max_gb * GIB,
+                    retain: Duration::from_secs(retain_hours * 3600),
+                },
+                loopback_allow.iter().copied().collect(),
+            );
+        }
         Operation::Mcp { .. } => unreachable!("stdio is handled before JSON output"),
         _ => {}
     }
@@ -391,6 +456,7 @@ fn run(cli: Cli) -> Result<Value> {
         Operation::Serve { .. }
         | Operation::Remote { .. }
         | Operation::Mcp { .. }
+        | Operation::Executor { .. }
         | Operation::Supervise { .. } => unreachable!(),
         Operation::Grant {
             policy,
@@ -451,12 +517,19 @@ fn run(cli: Cli) -> Result<Value> {
             drain,
             poll_ms,
             heartbeat_seconds,
+            min_free_gb,
+            loopback_allow,
         } => executor::local(
             &store,
             executor::Options {
                 drain,
                 poll: Duration::from_millis(poll_ms),
                 heartbeat: Duration::from_secs(heartbeat_seconds),
+            },
+            executor::Guards {
+                min_free: min_free_gb * GIB,
+                loopback: loopback_allow.map(BTreeSet::from_iter),
+                ..executor::Guards::default()
             },
         )?,
         Operation::ExecutorSet {

@@ -1,9 +1,11 @@
 # Operating Patchweft
 
-Version 0.1 supports one Linux host and a local filesystem. It uses SQLite WAL,
-Git object storage and supervised native processes. `/proc`, Linux child-subreaper
-support, `renameat2`, `/dev/urandom` and `/usr/bin/git` are required.
-Do not put the state directory on a network filesystem.
+Version 0.1 keeps its store on one Linux host and a local filesystem: SQLite WAL,
+Git object storage and supervised native processes. Jobs run on that host and,
+through [executors](#executors), on other Linux hosts. `/proc`, Linux
+child-subreaper support, `renameat2`, `/dev/urandom` and `/usr/bin/git` are
+required on every executing host. Do not put the state directory or an executor's
+work directory on a network filesystem.
 
 ## Ownership and resources
 
@@ -12,8 +14,8 @@ to the state directory have administrative access. API project/profile/role
 permissions constrain remote application operations; they do not isolate executed
 code from the worker account or other files that account can read.
 
-Initialize one shared slot and memory budget. Multiple local worker processes
-coordinate against that store. Admission is fair between owners; `priority OWNER N`
+Initialize the local executor's slot and memory budget. Admission is fair between
+owners across all executors; `priority OWNER N`
 admits a higher-priority owner's work first (for example a landing-ready merge train)
 and `0` clears it. Priority orders admission only: it never preempts running work or
 changes action identity. Jobs hold reservations until their supervised
@@ -22,8 +24,82 @@ its jobs have stopped.
 
 Private working directories prevent accidental workspace sharing, but are not
 a hostile-code sandbox. Native slot and memory declarations do not impose
-process limits. Remote workers, fleet scheduling, replication and per-tenant
+process limits. Placement by locality or cache warmth, replication and per-tenant
 latency guarantees are not implemented.
+
+## Executors
+
+Each executor runs one coordinator, which launches one supervisor per attempt.
+`worker` is the coordinator of the `local` executor on the store's host; `executor`
+runs a remote one, which reaches the store only through the API. Both claim, renew,
+complete and verify the same way. A second coordinator for the same executor
+waits as a standby until the first exits.
+
+Register a remote executor as an API principal and an executor record of the same
+name. Its grant needs `read` and `execute` and names the projects and profiles it
+may run; `local` is reserved:
+
+```bash
+patchweft --state /private/patchweft grant --policy mindy.policy.json \
+  --credential-file /private/mindy.credential
+patchweft --state /private/patchweft executor-set mindy --slots 4 --memory-mb 12288 \
+  --allow-job test --allow-job lint
+patchweft executor --endpoint https://api.example:7412 \
+  --credential-file /private/mindy.credential --work /srv/patchweft-work
+```
+
+Use one credential file per executor host. Jobs on that host run as the
+coordinator's account and can read it.
+
+Each executor has its own budget: `executor-set local` writes the store's budget,
+a remote executor's lives on its record. Remote holds never consume the local
+budget, and the reverse. Memory admitted is the smaller of the configured value
+and the cgroup `memory.high`/`memory.max` limit its coordinator reports. A job
+that needs more than an executor's total budget is left to other executors.
+Fair share and owner priority are global.
+
+Placement is configuration read at claim time; it is never part of job identity,
+action keys or evidence class. `--allow-job` and `--deny-job` replace their lists
+and a denial wins. A remote executor claims nothing until jobs are placed on it
+by name; the local executor admits every job unless given an allowlist. Keep jobs
+that need the API host's network setup, such as browser tests, on `local`.
+
+Profile identity binds runner bytes, declared tool paths and bytes and platform.
+Install the identical binary and tools at the same absolute paths on every host.
+A coordinator verifies each profile before claiming its work and again before
+launching; a profile that does not match is refused and listed under
+`observed.refused` by `patchweft executors`, with `verified`, `last_seen`, the
+reported memory limit and free disk.
+
+Before registering and before every claim, a coordinator checks whether job
+containers can reach host loopback: the rootless Docker daemon behind
+`DOCKER_HOST` (or `$XDG_RUNTIME_DIR/docker.sock`) exposes it unless its
+`rootlesskit` runs with `--disable-host-loopback`, and an unidentified daemon
+counts as exposing it. While it is exposed, every TCP listener on `127.0.0.0/8`
+or `::1` must be in `--loopback-allow PORT[,PORT…]`; otherwise the executor
+refuses all work and its record shows `refused: {"*": "loopback listener … not
+allowlisted"}`. `executor` always checks. `worker` checks only when given
+`--loopback-allow`, with or without ports.
+
+Attempts hold leases: 300 seconds by default (`executor-set --lease-seconds`),
+renewed every second by `worker` and every ten seconds by `executor`. A coordinator
+that cannot renew stops its jobs once the lease minus `max(2 × heartbeat,
+lease / 5)` has passed since its last renewal, before the API could expire it.
+Only `serve` expires leases, and not within one lease of its own start. An
+expired attempt is interrupted and stays undrained: its capacity is held until its
+coordinator reports the drain or an operator confirms it. A coordinator whose
+attempt was fenced stops the job, runs cleanup and may still report the drain
+under its lease; it never records the result.
+
+A remote executor's work directory holds `lock`, `pending-claim`, `ledger/`,
+`attempts/`, `repos/` (bare mirrors), `cas/` (read-only artifacts by SHA-256),
+`retained/` and `tmp/`. An acknowledged, drained attempt directory is deleted;
+fenced or undrained ones move to `retained/` and are deleted after
+`--retain-hours` (72). Artifacts it produced or downloaded stay in `cas/` up to
+`--cas-max-gb` (20), least recently used first; inputs of attempts not yet
+started are kept. Claims wait while less than `--min-free-gb` (20) is free after
+that reclaim. The local executor never deletes attempt directories. Logs of a
+remote attempt are available only after it completes.
 
 ## Failure and recovery
 
@@ -31,10 +107,15 @@ latency guarantees are not implemented.
 requester causes a running action to stop. A new requester cannot join the
 stopping attempt. Accepted work outlives API or MCP disconnection.
 
-`recover` identifies dead supervisors. Uncertain process or external-resource
+`recover` reconciles the local executor while no `worker` runs: it publishes
+finished results and reports dead supervisors. A supervisor that died before its
+command started is drained automatically. Uncertain process or external-resource
 cleanup keeps reservations held. Only after inspecting and draining those resources
-should an authorized operator use `recover --confirm-drained ATTEMPT_ID`.
-That command records the operator's assertion; it cannot establish the assertion.
+on the attempt's host should an authorized operator use
+`recover --confirm-drained ATTEMPT_ID`. That command records the operator's
+assertion about that host's processes and external resources; it cannot establish
+the assertion. It keeps a failed, canceled or passed attempt's state and result
+and refuses attempts still held by a coordinator.
 
 Before confirming drain, inspect the adapter's durable resource records and
 verify that every owned resource is absent, including resources created before
@@ -96,13 +177,14 @@ have not been established by the included tests.
 
 To upgrade:
 
-1. Stop accepting work. Cancel queued actions or let them finish; after the
-   binary changes they fail in preparation with "runner binary changed", each
-   opening a repair.
-2. Drain active attempts and external resources.
+1. Stop accepting work. Queued actions of profiles registered with the old
+   binary stay queued after the change and are listed as refused by
+   `patchweft executors`; cancel or resubmit them under the new profile IDs.
+2. Drain active attempts and external resources. `worker` refuses to start
+   while attempts started by the previous binary are held.
 3. Back up the whole state directory.
-4. Upgrade the server and every remote client binary together. Clients and the
-   server must agree on the command format.
+4. Upgrade the server, every executor host and every remote client binary
+   together. Clients and the server must agree on the command format.
 5. Re-register profiles and grant the new profile IDs.
 6. Resume.
 
@@ -111,7 +193,8 @@ job identity keep working by ID for status, delivery and dependencies, and
 promotion checks them against their original key. They are never shared or
 retained, so the first run of each profile after an upgrade executes every job.
 
-Logs, revisions, events, attempts and artifacts are retained. Automatic retention
+Logs, revisions, events, attempts and artifacts are retained in the store.
+`serve` deletes uploads nobody consumed within 24 hours; other automatic retention
 and garbage collection are not implemented. Monitor disk space. Deleting files
 inside the state store can invalidate evidence or replay; there is no supported
 selective pruning command.
@@ -119,15 +202,18 @@ selective pruning command.
 ## Connections and limits
 
 Use the [connection guide](connections.md) for private credential files, TLS,
-roles, receipts and event cursors. API and worker processes must share the same
-host, state directory and binary. Non-loopback HTTP listeners require TLS.
+roles, receipts and event cursors. The API and `worker` must share the store's
+host, state directory and binary; executors share the binary. Non-loopback HTTP
+listeners require TLS.
 
-Source transfer currently carries full reachable history on download, up to
-1 GiB per bundle. Incremental uploads are possible when the server already has
-the prerequisites; automatic negotiation is absent. Large histories, Git packing,
+Source downloads carry the reachable history a client lacks: an executor sends
+its mirror's newest revisions as `have`, so each new commit is fetched once per
+project and host. Bundles are limited to 1 GiB. Incremental uploads are possible
+when the server already has the prerequisites. Large histories, Git packing,
 disk pressure and network bandwidth can dominate request time.
 
 The API has bounded calls, blocking operations, streams, transfers and pending
-actions. Artifact, log and history growth do not yet have automatic quotas.
+actions. Each artifact or log file is limited to 1 GiB and an attempt's outputs to
+4 GiB on every host. History growth has no automatic quota.
 Metrics are process-local and reset on restart. See the connection guide for
 the exact bounds and timeout behavior.

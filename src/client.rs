@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::blocking::{Client, Response};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
     fs::{self, File},
@@ -13,6 +14,29 @@ use std::{
     path::Path,
     time::Duration,
 };
+
+/// The service answered with an error status. Callers that act on the status downcast to it.
+#[derive(Debug)]
+pub struct Refused {
+    pub status: u16,
+    /// The response's `error` object, or null when it sent none.
+    pub error: Value,
+}
+impl Refused {
+    pub fn code(&self) -> Option<&str> {
+        self.error["code"].as_str()
+    }
+}
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {}", self.status)?;
+        if !self.error.is_null() {
+            write!(f, ": {}", self.error)?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for Refused {}
 
 pub struct Remote {
     client: Client,
@@ -110,15 +134,8 @@ impl Remote {
             "bundle exceeds 1 GiB"
         );
         let sha256 = crate::file_hash(bundle)?;
-        let value = Self::json_response(
-            self.client
-                .put(format!("{}/v1/blobs/{sha256}", self.endpoint))
-                .timeout(Duration::from_secs(TRANSFER_TIMEOUT_SECONDS))
-                .bearer_auth(&self.credential)
-                .body(File::open(bundle)?)
-                .send()?,
-        )?;
-        ensure!(value.get("error").is_none(), "upload refused: {value}");
+        self.upload_blob(bundle, &sha256)
+            .context("upload refused")?;
         self.command_value(
             key,
             &Command::Publish {
@@ -129,7 +146,53 @@ impl Remote {
             },
         )
     }
-    fn download(
+    /// An error status as [`Refused`], with the `error` object the service sent.
+    fn refusal(response: Response) -> anyhow::Error {
+        let status = response.status().as_u16();
+        let error = Self::json_response(response)
+            .ok()
+            .and_then(|value| value.get("error").cloned())
+            .unwrap_or(Value::Null);
+        Refused { status, error }.into()
+    }
+    fn checked(response: Response) -> Result<Value> {
+        if response.status().is_success() {
+            Self::json_response(response)
+        } else {
+            Err(Self::refusal(response))
+        }
+    }
+    /// PUT `/v1/blobs/SHA256` from a file whose digest the caller computed.
+    pub fn upload_blob(&self, path: &Path, sha256: &str) -> Result<Value> {
+        Self::checked(
+            self.client
+                .put(format!("{}/v1/blobs/{sha256}", self.endpoint))
+                .timeout(Duration::from_secs(TRANSFER_TIMEOUT_SECONDS))
+                .bearer_auth(&self.credential)
+                .body(File::open(path)?)
+                .send()?,
+        )
+    }
+    /// POST `/v1/executor/{route}`: one executor call and its result.
+    pub fn executor<T: DeserializeOwned>(
+        &self,
+        route: &str,
+        body: &impl Serialize,
+        timeout: Option<Duration>,
+    ) -> Result<T> {
+        let mut request = self
+            .client
+            .post(format!("{}/v1/executor/{route}", self.endpoint))
+            .bearer_auth(&self.credential)
+            .json(body);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let value = Self::checked(request.send()?)?;
+        serde_json::from_value(value["result"].clone())
+            .with_context(|| format!("unexpected /v1/executor/{route} result"))
+    }
+    pub(crate) fn download(
         &self,
         path: &str,
         destination: &Path,
@@ -145,11 +208,9 @@ impl Remote {
             .timeout(Duration::from_secs(TRANSFER_TIMEOUT_SECONDS))
             .bearer_auth(&self.credential)
             .send()?;
-        ensure!(
-            response.status().is_success(),
-            "download refused with HTTP {}",
-            response.status()
-        );
+        if !response.status().is_success() {
+            return Err(Self::refusal(response).context("download refused"));
+        }
         let digest = response
             .headers()
             .get("x-content-sha256")

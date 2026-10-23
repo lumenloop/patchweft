@@ -3,7 +3,9 @@
 //! launches `_supervise`, relays stops in both directions and publishes results. Its supervisors
 //! reach it only through files in their attempt's `control/` directory.
 use crate::{
-    authority::{self, AuthorityError, LOCAL, MAX_LEASES, Outputs, Scope},
+    api::{self, MAX_HAVES, MAX_RETAINED_UPLOADS, TRANSFER_TIMEOUT_SECONDS},
+    authority::{self, AuthorityError, LOCAL, MAX_LEASES, Outputs, REFUSE_ALL, Scope},
+    client::{Refused, Remote},
     engine, file_hash,
     model::*,
     source,
@@ -11,19 +13,24 @@ use crate::{
     unique,
     worker::{self, write_atomically},
 };
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use fs2::FileExt;
 use serde_json::{Value, json};
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
-    io::ErrorKind,
-    os::unix::process::CommandExt,
-    path::{Path, PathBuf},
+    io::{self, ErrorKind},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    os::unix::{
+        fs::{MetadataExt, PermissionsExt},
+        process::CommandExt,
+    },
+    path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// Refused profiles are judged again after this long: their tools may have been repaired.
@@ -32,6 +39,12 @@ const REVERIFY: Duration = Duration::from_secs(600);
 const MATERIALIZE_TRIES: u32 = 5;
 const PUBLISH_RETRY: Duration = Duration::from_secs(1);
 const PUBLISH_RETRY_MAX: Duration = Duration::from_secs(60);
+/// An upload quota still full after this long makes a report undeliverable (MUST-FIX 3).
+const QUOTA_PATIENCE: Duration = Duration::from_secs(30 * 60);
+/// Retained attempt directories past their retention are looked for this often.
+const MAINTENANCE: Duration = Duration::from_secs(3600);
+const FLOOR_LOG: Duration = Duration::from_secs(60);
+const MIB: u64 = 1024 * 1024;
 
 /// How a coordinator reaches the authority and the inputs of its attempts.
 pub trait Transport: Send + Sync {
@@ -59,6 +72,10 @@ pub trait Transport: Send + Sync {
     ) -> Result<PathBuf, TransportError>;
     /// Disposes of an attempt directory once its report was acknowledged.
     fn retire(&self, attempt: &Path, response: &CompleteResponse) -> Result<()>;
+    /// Bytes the calling thread downloaded through `source` and `dependency` since it last asked.
+    fn transferred(&self) -> u64 {
+        0
+    }
 }
 
 #[derive(Debug)]
@@ -192,6 +209,39 @@ pub struct Options {
     pub heartbeat: Duration,
 }
 
+/// Free bytes on the filesystem holding a path.
+pub type FreeSpace = Arc<dyn Fn(&Path) -> io::Result<u64> + Send + Sync>;
+
+/// What a coordinator checks about its host before each claim. `worker` checks nothing unless
+/// asked to.
+pub struct Guards {
+    /// Claims wait while less than this many bytes are free under the root.
+    pub min_free: u64,
+    /// Loopback ports job containers may reach (MUST-FIX 8); None skips the check.
+    pub loopback: Option<BTreeSet<u16>>,
+    /// A remote work directory's cache and retained attempts, reclaimed below the floor.
+    pub disk: Option<Arc<Disk>>,
+    pub free_space: FreeSpace,
+}
+
+impl Default for Guards {
+    fn default() -> Self {
+        Self {
+            min_free: 0,
+            loopback: None,
+            disk: None,
+            free_space: Arc::new(|path| fs2::available_space(path)),
+        }
+    }
+}
+
+impl Guards {
+    fn loopback_refusal(&self) -> Option<String> {
+        let allow = self.loopback.as_ref()?;
+        loopback_refusal(&|path| fs::read(path), rootless_state().as_deref(), allow)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// Inputs are fetched and the supervisor is not yet spawned.
@@ -267,6 +317,10 @@ struct State {
     last_renewal: Instant,
     partitioned: bool,
     revoked: Option<String>,
+    /// Why claims are declined, as last logged.
+    declined: Option<String>,
+    floor_logged: Option<Instant>,
+    maintained: Instant,
     children: Vec<Child>,
     /// Attempts waiting for the publisher, in order.
     queue: VecDeque<String>,
@@ -282,6 +336,7 @@ pub struct Coordinator<T> {
     /// sha256 of this binary, the runner every profile run here must have been registered with.
     engine: String,
     host: Option<String>,
+    guards: Guards,
     state: Mutex<State>,
     heartbeat: Condvar,
     publisher: Condvar,
@@ -328,6 +383,7 @@ impl<T: Transport> Coordinator<T> {
             options,
             engine,
             host: worker::host(),
+            guards: Guards::default(),
             state: Mutex::new(State {
                 ledger: BTreeMap::new(),
                 verified: BTreeSet::new(),
@@ -336,6 +392,9 @@ impl<T: Transport> Coordinator<T> {
                 last_renewal: Instant::now(),
                 partitioned: false,
                 revoked: None,
+                declined: None,
+                floor_logged: None,
+                maintained: Instant::now(),
                 children: Vec::new(),
                 queue: VecDeque::new(),
                 wake: false,
@@ -347,8 +406,13 @@ impl<T: Transport> Coordinator<T> {
         }
     }
 
+    fn guarded(mut self, guards: Guards) -> Self {
+        self.guards = guards;
+        self
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        locked(&self.state)
     }
 
     fn control(&self, attempt: &str) -> PathBuf {
@@ -526,8 +590,11 @@ impl<T: Transport> Coordinator<T> {
     }
 
     /// One claim exchange. Profiles the authority asks about are verified and the claim is sent
-    /// again, so admission never depends on verification lag.
+    /// again, so admission never depends on verification lag. While this host must take no work,
+    /// the exchange only tells the authority why: `*` refuses every profile.
     fn claim(&self) -> Result<Claimed> {
+        let free = self.room();
+        let declined = self.declining(free);
         let pending = self.transport.control().join("pending-claim");
         // A key whose response was lost is sent again first: the authority replays its claim.
         let key = match fs::read(&pending) {
@@ -535,6 +602,8 @@ impl<T: Transport> Coordinator<T> {
                 .as_str()
                 .context("pending claim lacks a key")?
                 .to_owned(),
+            // Nothing new is claimed under a refusal, so its key need not survive a crash.
+            Err(error) if error.kind() == ErrorKind::NotFound && declined.is_some() => unique(),
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 let key = unique();
                 write_atomically(&pending, json!({"key":key}).to_string().as_bytes())?;
@@ -542,27 +611,15 @@ impl<T: Transport> Coordinator<T> {
             }
             Err(error) => return Err(error.into()),
         };
+        let settled = || match fs::remove_file(&pending) {
+            Err(error) if error.kind() != ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
         loop {
-            let request = {
-                let mut state = self.lock();
-                let now = Instant::now();
-                state
-                    .refused
-                    .retain(|_, (_, at)| now.duration_since(*at) < REVERIFY);
-                ClaimRequest {
-                    claim_key: key.clone(),
-                    verified: state.verified.iter().cloned().collect(),
-                    refused: state
-                        .refused
-                        .iter()
-                        .map(|(profile, (error, _))| (profile.clone(), error.clone()))
-                        .collect(),
-                    memory_limit_mb: None,
-                    disk_free_mb: None,
-                    host: self.host.clone(),
-                    engine: Some(self.engine.clone()),
-                }
-            };
+            let mut request = self.ask(&key, free);
+            if let Some(reason) = &declined {
+                request.refused.insert(REFUSE_ALL.into(), reason.clone());
+            }
             let sent = Instant::now();
             let response = match self.transport.claim(&request) {
                 Ok(response) => response,
@@ -571,23 +628,25 @@ impl<T: Transport> Coordinator<T> {
             if let Some(attempt) = response.fenced {
                 // The key's attempt ended before this coordinator recorded it; nothing of it ran.
                 log(json!({"event":"claim_fenced","executor":self.executor,"attempt":attempt}));
-                fs::remove_file(&pending)?;
+                settled()?;
                 return Ok(Claimed::Retry);
             }
             if let Some(claim) = response.claim {
                 let attempt = claim.attempt.id.clone();
                 write_atomically(&self.ledger(&attempt), &serde_json::to_vec(&claim)?)?;
-                fs::remove_file(&pending)?;
+                settled()?;
                 let mut state = self.lock();
                 // The new lease starts now; held ones keep the time of their last renewal.
                 if state.ledger.is_empty() {
                     state.last_renewal = sent;
                 }
-                let entry = Entry::new(claim, Phase::Materializing);
+                let mut entry = Entry::new(claim, Phase::Materializing);
+                // A claim replayed while declining is reported, never run.
+                entry.stop = declined;
                 state.ledger.insert(attempt.clone(), entry);
                 return Ok(Claimed::Attempt(attempt));
             }
-            if response.unverified.is_empty() {
+            if declined.is_some() || response.unverified.is_empty() {
                 return Ok(Claimed::Idle);
             }
             let hello = match self.transport.hello(&response.unverified) {
@@ -602,6 +661,92 @@ impl<T: Transport> Coordinator<T> {
                     self.refuse(&mut state, profile, error);
                 }
             }
+        }
+    }
+
+    /// A claim request with this coordinator's verdicts and what it observes of its host.
+    fn ask(&self, key: &str, free: Option<u64>) -> ClaimRequest {
+        let memory_limit_mb = memory_limit();
+        let mut state = self.lock();
+        let now = Instant::now();
+        state
+            .refused
+            .retain(|_, (_, at)| now.duration_since(*at) < REVERIFY);
+        ClaimRequest {
+            claim_key: key.into(),
+            verified: state.verified.iter().cloned().collect(),
+            refused: state
+                .refused
+                .iter()
+                .map(|(profile, (error, _))| (profile.clone(), error.clone()))
+                .collect(),
+            memory_limit_mb,
+            disk_free_mb: free.map(|bytes| bytes / MIB),
+            host: self.host.clone(),
+            engine: Some(self.engine.clone()),
+        }
+    }
+
+    /// Free bytes under the root, after reclaiming what the disk bounds allow when below the
+    /// floor (MUST-FIX 4).
+    fn room(&self) -> Option<u64> {
+        let root = self.transport.root();
+        let free = || (self.guards.free_space)(root).ok();
+        let floor = self.guards.min_free;
+        let available = free();
+        if floor == 0 || available.is_some_and(|bytes| bytes >= floor) {
+            return available;
+        }
+        if let Some(disk) = &self.guards.disk
+            && let Err(error) = disk.reclaim(floor, &|| free().unwrap_or(0), SystemTime::now())
+        {
+            log(json!({"event":"reclaim_failed","executor":self.executor,
+                       "error":format!("{error:#}")}));
+        }
+        free()
+    }
+
+    /// Why this host must take no work now, if it must not: a loopback listener job containers
+    /// could reach (MUST-FIX 8), or too little free disk (MUST-FIX 4).
+    fn declining(&self, free: Option<u64>) -> Option<String> {
+        let floor = self.guards.min_free;
+        let low = floor > 0 && free.is_none_or(|bytes| bytes < floor);
+        let reason = self
+            .guards
+            .loopback_refusal()
+            .or_else(|| low.then(|| format!("free space below the {} MiB floor", floor / MIB)));
+        let mut state = self.lock();
+        if low
+            && state
+                .floor_logged
+                .is_none_or(|at| at.elapsed() >= FLOOR_LOG)
+        {
+            state.floor_logged = Some(Instant::now());
+            log(json!({"event":"disk_floor","executor":self.executor,
+                       "free_mb":free.map(|bytes| bytes / MIB)}));
+        }
+        if state.declined != reason {
+            log(json!({"event":"claims_declined","executor":self.executor,"reason":reason}));
+            state.declined = reason.clone();
+        }
+        reason
+    }
+
+    /// Hourly, retained attempt directories past their retention go.
+    fn maintain(&self) {
+        let Some(disk) = &self.guards.disk else {
+            return;
+        };
+        {
+            let mut state = self.lock();
+            if state.maintained.elapsed() < MAINTENANCE {
+                return;
+            }
+            state.maintained = Instant::now();
+        }
+        if let Err(error) = disk.purge_retained(SystemTime::now()) {
+            log(json!({"event":"purge_failed","executor":self.executor,
+                       "error":format!("{error:#}")}));
         }
     }
 
@@ -629,9 +774,21 @@ impl<T: Transport> Coordinator<T> {
             reason: reason.into(),
             error: Some(error),
         };
-        let Some(claim) = self.lock().ledger.get(attempt).map(|e| e.claim.clone()) else {
+        let Some((claim, stop)) = self
+            .lock()
+            .ledger
+            .get(attempt)
+            .map(|e| (e.claim.clone(), e.stop.clone()))
+        else {
             return Ok(());
         };
+        // A stop that came first ends the attempt before anything is fetched.
+        if let Some(reason) = stop {
+            return Err(Report::NotStarted {
+                reason,
+                error: None,
+            });
+        }
         // Tools may have drifted since the profile was verified.
         if let Err(error) = engine::verify_runtime_for(&claim.profile, &self.engine) {
             let error = format!("{error:#}");
@@ -669,7 +826,8 @@ impl<T: Transport> Coordinator<T> {
             revision: claim.revision.clone(),
             repository,
             dependencies,
-            transfer: json!({"seconds":fetching.elapsed().as_secs_f64(),"bytes":0}),
+            transfer: json!({"seconds":fetching.elapsed().as_secs_f64(),
+                             "bytes":self.transport.transferred()}),
         };
         let control = self.control(attempt);
         fs::create_dir_all(&control)
@@ -1178,6 +1336,7 @@ impl<T: Transport + 'static> Coordinator<T> {
     fn coordinate(self: &Arc<Self>) -> Result<Value> {
         loop {
             self.poll(Instant::now());
+            self.maintain();
             let (revoked, idle) = {
                 let state = self.lock();
                 (state.revoked.clone(), state.ledger.is_empty())
@@ -1231,8 +1390,29 @@ fn exclusive(transport: &impl Transport, executor: &str) -> Result<(File, bool)>
 }
 
 /// Runs a coordinator over `transport` until it drains, or forever.
-pub fn run<T: Transport + 'static>(transport: T, options: Options) -> Result<Value> {
+pub fn run<T: Transport + 'static>(
+    transport: T,
+    options: Options,
+    guards: Guards,
+) -> Result<Value> {
     fs::create_dir_all(transport.control().join("ledger"))?;
+    let engine = file_hash(&std::env::current_exe()?)?;
+    // MUST-FIX 8: nothing registers while job containers could reach an unlisted listener.
+    if let Some(reason) = guards.loopback_refusal() {
+        let request = ClaimRequest {
+            claim_key: unique(),
+            refused: BTreeMap::from([(REFUSE_ALL.to_owned(), reason.clone())]),
+            memory_limit_mb: memory_limit(),
+            host: worker::host(),
+            engine: Some(engine),
+            ..ClaimRequest::default()
+        };
+        // Operators see the refusal on the executor record.
+        if let Err(error) = transport.claim(&request) {
+            log(json!({"event":"refusal_unreported","error":format!("{error:#}")}));
+        }
+        bail!("refusing to register: {reason}");
+    }
     let hello = transport.hello(&[])?;
     let (_lock, waited) = exclusive(&transport, &hello.executor)?;
     // A standby may have waited for hours.
@@ -1243,14 +1423,19 @@ pub fn run<T: Transport + 'static>(transport: T, options: Options) -> Result<Val
         options.heartbeat.as_secs_f64(),
         hello.lease_seconds
     );
-    let engine = file_hash(&std::env::current_exe()?)?;
-    let coordinator = Arc::new(Coordinator::new(
-        transport,
-        hello.executor.clone(),
-        hello.lease_seconds,
-        options,
-        engine,
-    ));
+    if let Some(disk) = &guards.disk {
+        disk.start(SystemTime::now())?;
+    }
+    let coordinator = Arc::new(
+        Coordinator::new(
+            transport,
+            hello.executor.clone(),
+            hello.lease_seconds,
+            options,
+            engine,
+        )
+        .guarded(guards),
+    );
     coordinator.verify(&hello.profiles);
     for attempt in coordinator.reconcile(false)? {
         coordinator.materialize_later(attempt);
@@ -1271,7 +1456,7 @@ pub fn run<T: Transport + 'static>(transport: T, options: Options) -> Result<Val
 }
 
 /// `patchweft worker`: the local executor's coordinator.
-pub fn local(store: &Store, options: Options) -> Result<Value> {
+pub fn local(store: &Store, options: Options, guards: Guards) -> Result<Value> {
     authority::prepare(&store.db)?;
     let legacy: Vec<String> = {
         let mut stmt = store.db.prepare(
@@ -1286,7 +1471,7 @@ pub fn local(store: &Store, options: Options) -> Result<Value> {
         "drain attempts started by the previous binary before upgrading: {}",
         legacy.join(", ")
     );
-    run(LocalTransport::new(&store.root), options)
+    run(LocalTransport::new(&store.root), options, guards)
 }
 
 /// `patchweft recover`: when no coordinator runs, reports the local executor's attempts it can
@@ -1335,6 +1520,724 @@ pub fn recover(store: &mut Store, confirmed: Option<&str>) -> Result<Value> {
             .collect::<rusqlite::Result<_>>()?
     };
     Ok(json!({"interrupted_and_drained":drained,"needs_drain_confirmation":uncertain}))
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Where a remote executor's work directory stops growing (MUST-FIX 4).
+pub struct Bounds {
+    /// Claims wait while less is free; the cache and retained attempts are reclaimed first.
+    pub min_free: u64,
+    pub cas_max: u64,
+    /// Fenced or undrained attempt directories are kept this long for inspection.
+    pub retain: Duration,
+}
+
+/// `patchweft executor`: a remote executor's coordinator. `connect` opens one API client; the
+/// heartbeat gets its own.
+pub fn remote(
+    connect: impl Fn() -> Result<Remote>,
+    work: &Path,
+    options: Options,
+    bounds: Bounds,
+    loopback: BTreeSet<u16>,
+) -> Result<Value> {
+    fs::create_dir_all(work)?;
+    // Supervisors check out from the mirrors by absolute path.
+    let work = work.canonicalize()?;
+    for directory in ["attempts", "repos", "cas", "retained", "tmp", "ledger"] {
+        fs::create_dir_all(work.join(directory))?;
+    }
+    let disk = Arc::new(Disk::new(&work, bounds.cas_max, bounds.retain));
+    let transport = HttpTransport {
+        work,
+        remote: connect()?,
+        heartbeat: connect()?,
+        disk: Arc::clone(&disk),
+        projects: Mutex::default(),
+        uploaded: Mutex::default(),
+        throttled: Mutex::default(),
+    };
+    let guards = Guards {
+        min_free: bounds.min_free,
+        loopback: Some(loopback),
+        disk: Some(disk),
+        ..Guards::default()
+    };
+    run(transport, options, guards)
+}
+
+/// A remote executor: the authority over the API, sources from per-project mirrors fetched
+/// incrementally, dependencies from a content-addressed cache. `R` and `C` are both the work
+/// directory.
+pub struct HttpTransport {
+    work: PathBuf,
+    remote: Remote,
+    /// Renewals use their own connections, so a long transfer never delays a lease.
+    heartbeat: Remote,
+    disk: Arc<Disk>,
+    /// One fetch per project at a time; one coordinator per work directory makes this enough.
+    projects: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    /// Digests each unacknowledged attempt already uploaded.
+    uploaded: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    /// When each attempt's uploads were first refused for quota.
+    throttled: Mutex<BTreeMap<String, Instant>>,
+}
+
+thread_local! {
+    /// What this materializer thread downloaded, for its attempt's `preparation.transfer_bytes`.
+    static TRANSFERRED: Cell<u64> = const { Cell::new(0) };
+}
+
+fn fetched(bytes: u64) {
+    TRANSFERRED.with(|transferred| transferred.set(transferred.get() + bytes));
+}
+
+/// Only an answer from the service is final; an unreachable or failing exchange is retried.
+fn classify(error: anyhow::Error) -> TransportError {
+    let Some(refused) = error.downcast_ref::<Refused>() else {
+        return TransportError::Transient(error);
+    };
+    match (refused.status, refused.code()) {
+        (401 | 403, _) => TransportError::Unauthorized(error),
+        (409, Some("attempt_fenced" | "completion_conflict")) => TransportError::Fenced,
+        (429 | 500.., _) => TransportError::Transient(error),
+        _ => TransportError::Permanent(error),
+    }
+}
+
+/// Digests a `422 missing_blob` asks for again.
+fn missing_blobs(error: &anyhow::Error) -> Option<BTreeSet<String>> {
+    let refused = error.downcast_ref::<Refused>()?;
+    (refused.code() == Some("missing_blob")).then(|| {
+        refused.error["detail"]["missing"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|digest| digest.as_str().map(str::to_owned))
+            .collect()
+    })
+}
+
+/// Each distinct blob a completion names, with its file in the attempt directory.
+fn blobs(request: &CompleteRequest, attempt: &Path) -> Result<BTreeMap<String, (PathBuf, u64)>> {
+    let mut blobs = BTreeMap::new();
+    for (name, blob) in [
+        ("output.log", &request.log),
+        ("cleanup.log", &request.cleanup_log),
+    ] {
+        if let Some(blob) = blob {
+            blobs.insert(blob.sha256.clone(), (attempt.join(name), blob.bytes));
+        }
+    }
+    for (name, entry) in &request.artifacts {
+        let path = attempt.join("artifacts").join(source::relative_path(name)?);
+        blobs
+            .entry(entry.sha256.clone())
+            .or_insert((path, entry.bytes));
+    }
+    Ok(blobs)
+}
+
+impl HttpTransport {
+    /// The project's mirror, holding the revision's commit. A fetch sends the mirror's newest
+    /// revisions, so the bundle carries only the history the mirror lacks (MUST-FIX 5).
+    fn mirror(&self, revision: &RevisionRef) -> Result<PathBuf> {
+        ensure!(api::digest(&revision.project, 64), "invalid project ID");
+        let lock = Arc::clone(
+            locked(&self.projects)
+                .entry(revision.project.clone())
+                .or_default(),
+        );
+        let _fetching = locked(&lock);
+        let repo = self.work.join("repos").join(&revision.project);
+        let holds = || {
+            source::git_command(&repo)
+                .args(["cat-file", "-e", &format!("{}^{{commit}}", revision.commit)])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        if repo.join("HEAD").exists() && holds() {
+            return Ok(repo);
+        }
+        if !repo.join("HEAD").exists() {
+            fs::create_dir_all(&repo)?;
+            source::git(&repo, &["init", "--bare", "--quiet"])?;
+        }
+        let tips = source::git(
+            &repo,
+            &[
+                "for-each-ref",
+                "--sort=-committerdate",
+                &format!("--count={MAX_HAVES}"),
+                "--format=%(objectname)",
+                "refs/patchweft/revisions/",
+            ],
+        )?;
+        let haves: Vec<String> = tips.lines().map(str::to_owned).collect();
+        let bundle = self.work.join("tmp").join(format!("{}.bundle", unique()));
+        let fetch = || -> Result<u64> {
+            self.remote.bundle_since(&revision.id, &haves, &bundle)?;
+            let reference = format!("refs/patchweft/revisions/{}", revision.id);
+            source::git(
+                &repo,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "-c",
+                    "fetch.fsckObjects=true",
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    bundle.to_str().context("non-UTF-8 work directory")?,
+                    &format!("{reference}:{reference}"),
+                ],
+            )?;
+            Ok(fs::metadata(&bundle)?.len())
+        };
+        let result = fetch();
+        let _ = fs::remove_file(&bundle);
+        let bytes = result?;
+        ensure!(
+            holds(),
+            "the revision's bundle lacks commit {}",
+            revision.commit
+        );
+        fetched(bytes);
+        log(json!({"event":"source.fetched","project":revision.project,
+                   "revision":revision.id,"bytes":bytes,"haves":haves.len()}));
+        Ok(repo)
+    }
+
+    /// The artifact's file in the cache, downloaded at most once per digest.
+    fn cached(&self, dependency: &DependencyEvidence, entry: &ArtifactEntry) -> Result<PathBuf> {
+        let sha256 = &entry.sha256;
+        ensure!(api::digest(sha256, 64), "invalid artifact digest");
+        let path = self.disk.cas().join(sha256);
+        {
+            let lock = self.disk.lock(sha256);
+            let _held = locked(&lock);
+            if fs::metadata(&path).is_ok_and(|metadata| metadata.len() == entry.bytes) {
+                self.disk.touch(sha256);
+                return Ok(path);
+            }
+            let temp = self.work.join("tmp").join(unique());
+            let download = || -> Result<()> {
+                let route = format!("/v1/artifacts/{}/{sha256}", dependency.action);
+                self.remote
+                    .download(&route, &temp, Some(sha256), entry.bytes)?;
+                fs::set_permissions(&temp, fs::Permissions::from_mode(0o444))?;
+                Ok(fs::rename(&temp, &path)?)
+            };
+            if let Err(error) = download() {
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
+        }
+        fetched(entry.bytes);
+        log(json!({"event":"dependency.fetched","sha256":sha256,"bytes":entry.bytes}));
+        self.disk.bound();
+        Ok(path)
+    }
+
+    /// Uploads the blobs this attempt has not uploaded yet, or exactly `again`. A quota still
+    /// full after half an hour makes the report undeliverable.
+    fn upload(
+        &self,
+        attempt: &str,
+        blobs: &BTreeMap<String, (PathBuf, u64)>,
+        again: Option<&BTreeSet<String>>,
+    ) -> Result<(), TransportError> {
+        for (sha256, (path, _)) in blobs {
+            let done = match again {
+                Some(again) => !again.contains(sha256),
+                None => locked(&self.uploaded)
+                    .get(attempt)
+                    .is_some_and(|done| done.contains(sha256)),
+            };
+            if done {
+                continue;
+            }
+            if let Err(error) = self.remote.upload_blob(path, sha256) {
+                if error
+                    .downcast_ref::<Refused>()
+                    .is_some_and(|refused| refused.status == 429)
+                {
+                    let first = *locked(&self.throttled)
+                        .entry(attempt.into())
+                        .or_insert_with(Instant::now);
+                    if first.elapsed() >= QUOTA_PATIENCE {
+                        return Err(TransportError::Permanent(error));
+                    }
+                }
+                return Err(classify(error));
+            }
+            locked(&self.uploaded)
+                .entry(attempt.into())
+                .or_default()
+                .insert(sha256.clone());
+        }
+        locked(&self.throttled).remove(attempt);
+        Ok(())
+    }
+}
+
+impl Transport for HttpTransport {
+    fn root(&self) -> &Path {
+        &self.work
+    }
+    fn control(&self) -> &Path {
+        &self.work
+    }
+    fn hello(&self, ids: &[String]) -> Result<Hello, TransportError> {
+        let request = HelloRequest { ids: ids.to_vec() };
+        self.remote
+            .executor("profiles", &request, None)
+            .map_err(classify)
+    }
+    fn claim(&self, request: &ClaimRequest) -> Result<ClaimResponse, TransportError> {
+        self.remote
+            .executor("claim", request, None)
+            .map_err(classify)
+    }
+    fn renew(&self, request: &RenewRequest) -> Result<RenewResponse, TransportError> {
+        self.heartbeat
+            .executor("renew", request, None)
+            .map_err(classify)
+    }
+    /// A produced artifact enters the cache before the report, so a consumer claimed here never
+    /// downloads it (MUST-FIX 4).
+    fn complete(
+        &self,
+        request: &CompleteRequest,
+        attempt: &Path,
+    ) -> Result<CompleteResponse, TransportError> {
+        let blobs = blobs(request, attempt).map_err(TransportError::Permanent)?;
+        let total: u64 = blobs.values().map(|(_, bytes)| bytes).sum();
+        if total > MAX_RETAINED_UPLOADS {
+            return Err(TransportError::Permanent(anyhow!(
+                "{total} bytes of logs and artifacts exceed the {MAX_RETAINED_UPLOADS}-byte upload quota"
+            )));
+        }
+        for (name, entry) in &request.artifacts {
+            let adopted = source::relative_path(name).and_then(|relative| {
+                self.disk
+                    .adopt(&attempt.join("artifacts").join(relative), &entry.sha256)
+            });
+            if let Err(error) = adopted {
+                log(json!({"event":"cache_failed","attempt":request.attempt,
+                           "sha256":entry.sha256,"error":format!("{error:#}")}));
+            }
+        }
+        if !request.artifacts.is_empty() {
+            self.disk.bound();
+        }
+        self.upload(&request.attempt, &blobs, None)?;
+        let timeout = Some(Duration::from_secs(TRANSFER_TIMEOUT_SECONDS));
+        let mut uploaded_again = false;
+        loop {
+            match self.remote.executor("complete", request, timeout) {
+                Ok(response) => {
+                    locked(&self.uploaded).remove(&request.attempt);
+                    return Ok(response);
+                }
+                Err(error) => match missing_blobs(&error) {
+                    // Purged since it was uploaded: once more, then the publisher's backoff.
+                    Some(missing) if !uploaded_again => {
+                        self.upload(&request.attempt, &blobs, Some(&missing))?;
+                        uploaded_again = true;
+                    }
+                    _ => return Err(classify(error)),
+                },
+            }
+        }
+    }
+    fn source(&self, revision: &RevisionRef) -> Result<PathBuf, TransportError> {
+        self.mirror(revision).map_err(classify)
+    }
+    fn dependency(
+        &self,
+        dependency: &DependencyEvidence,
+        _: &str,
+        entry: &ArtifactEntry,
+    ) -> Result<PathBuf, TransportError> {
+        self.cached(dependency, entry).map_err(classify)
+    }
+    /// Recorded and drained, nothing of the attempt is needed here (MUST-FIX 4); otherwise its
+    /// directory is kept for inspection until the retention passes.
+    fn retire(&self, attempt: &Path, response: &CompleteResponse) -> Result<()> {
+        if response.status == "recorded" && response.drained {
+            return remove_tree(attempt);
+        }
+        let target = self
+            .work
+            .join("retained")
+            .join(attempt.file_name().context("attempt directory")?);
+        match fs::rename(attempt, &target) {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            result => result?,
+        }
+        // Retention counts from now, not from the job's last write.
+        let _ = File::open(&target).and_then(|directory| directory.set_modified(SystemTime::now()));
+        log(
+            json!({"event":"attempt_retained","attempt":response.attempt,
+                   "status":response.status,"drained":response.drained}),
+        );
+        Ok(())
+    }
+    fn transferred(&self) -> u64 {
+        TRANSFERRED.with(|transferred| transferred.replace(0))
+    }
+}
+
+/// A remote work directory's cache (`cas/<sha256>`, read-only files) and retained attempts
+/// (`retained/<attempt>`), kept within bounds (MUST-FIX 4).
+pub struct Disk {
+    work: PathBuf,
+    cas_max: u64,
+    retain: Duration,
+    /// Per digest: held while it is fetched, adopted or evicted.
+    locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    /// Last use of entries whose file time could not be set.
+    used: Mutex<BTreeMap<String, SystemTime>>,
+}
+
+impl Disk {
+    pub fn new(work: &Path, cas_max: u64, retain: Duration) -> Self {
+        Self {
+            work: work.into(),
+            cas_max,
+            retain,
+            locks: Mutex::default(),
+            used: Mutex::default(),
+        }
+    }
+
+    fn cas(&self) -> PathBuf {
+        self.work.join("cas")
+    }
+
+    fn lock(&self, sha256: &str) -> Arc<Mutex<()>> {
+        Arc::clone(locked(&self.locks).entry(sha256.into()).or_default())
+    }
+
+    /// Marks a cached digest used now. Call with its lock held.
+    fn touch(&self, sha256: &str) {
+        let now = SystemTime::now();
+        let path = self.cas().join(sha256);
+        if File::open(path)
+            .and_then(|file| file.set_modified(now))
+            .is_err()
+        {
+            locked(&self.used).insert(sha256.into(), now);
+        }
+    }
+
+    fn last_use(&self, sha256: &str) -> io::Result<SystemTime> {
+        let modified = fs::symlink_metadata(self.cas().join(sha256))?.modified()?;
+        let used = locked(&self.used).get(sha256).copied();
+        Ok(modified.max(used.unwrap_or(UNIX_EPOCH)))
+    }
+
+    /// Adds an artifact this executor produced to the cache, unless the digest is there.
+    fn adopt(&self, path: &Path, sha256: &str) -> Result<()> {
+        ensure!(api::digest(sha256, 64), "invalid artifact digest");
+        ensure!(
+            fs::symlink_metadata(path)?.is_file(),
+            "artifact is not a regular file"
+        );
+        let lock = self.lock(sha256);
+        let _held = locked(&lock);
+        let target = self.cas().join(sha256);
+        if !target.exists() {
+            fs::hard_link(path, &target)?;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o444))?;
+        }
+        self.touch(sha256);
+        Ok(())
+    }
+
+    /// Inputs of attempts whose command has not started: they may still be copied.
+    fn pinned(&self) -> Result<BTreeSet<String>> {
+        let mut pinned = BTreeSet::new();
+        for entry in fs::read_dir(self.work.join("ledger"))? {
+            let path = entry?.path();
+            // Partly written entries are temporary files without the extension.
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let claim: Claim = serde_json::from_slice(&fs::read(&path)?)
+                .with_context(|| format!("unreadable ledger entry {}", path.display()))?;
+            let control = self
+                .work
+                .join("attempts")
+                .join(&claim.attempt.id)
+                .join("control");
+            if control.join("command-started").exists() {
+                continue;
+            }
+            for dependency in &claim.dependencies {
+                pinned.extend(dependency.artifacts.values().map(|e| e.sha256.clone()));
+            }
+        }
+        Ok(pinned)
+    }
+
+    /// Deletes the least recently used entries nothing pins, while the cache exceeds its cap or,
+    /// given a floor, while less than the floor is free.
+    pub fn evict(&self, floor: Option<(u64, &dyn Fn() -> u64)>) -> Result<()> {
+        let pinned = self.pinned()?;
+        let mut entries = Vec::new();
+        let mut total = 0;
+        for entry in fs::read_dir(self.cas())? {
+            let entry = entry?;
+            let Ok(sha256) = entry.file_name().into_string() else {
+                continue;
+            };
+            if !api::digest(&sha256, 64) {
+                continue;
+            }
+            let bytes = entry.metadata()?.len();
+            total += bytes;
+            entries.push((self.last_use(&sha256)?, sha256, bytes));
+        }
+        entries.sort();
+        for (used, sha256, bytes) in entries {
+            let short = floor.is_some_and(|(floor, free)| free() < floor);
+            if total <= self.cas_max && !short {
+                break;
+            }
+            if pinned.contains(&sha256) {
+                continue;
+            }
+            let lock = self.lock(&sha256);
+            // Being fetched or adopted, or used since it was listed: keep it.
+            let Ok(_held) = lock.try_lock() else {
+                continue;
+            };
+            if self.last_use(&sha256).ok() != Some(used) {
+                continue;
+            }
+            fs::remove_file(self.cas().join(&sha256))?;
+            total -= bytes;
+            log(json!({"event":"cache_evicted","sha256":sha256,"bytes":bytes}));
+        }
+        Ok(())
+    }
+
+    /// Keeps the cache under its cap after an insertion.
+    fn bound(&self) {
+        if let Err(error) = self.evict(None) {
+            log(json!({"event":"evict_failed","error":format!("{error:#}")}));
+        }
+    }
+
+    /// Deletes retained attempt directories older than the retention; returns their names.
+    pub fn purge_retained(&self, now: SystemTime) -> Result<Vec<String>> {
+        let entries = match fs::read_dir(self.work.join("retained")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut purged = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let modified = entry.metadata()?.modified()?;
+            if now.duration_since(modified).unwrap_or_default() <= self.retain {
+                continue;
+            }
+            remove_tree(&entry.path())?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            log(json!({"event":"retained_purged","attempt":name}));
+            purged.push(name);
+        }
+        purged.sort();
+        Ok(purged)
+    }
+
+    /// At startup, under the executor lock: half-finished downloads of a previous coordinator go,
+    /// and so do retained attempts past their retention.
+    fn start(&self, now: SystemTime) -> Result<()> {
+        for entry in fs::read_dir(self.work.join("tmp"))? {
+            let path = entry?.path();
+            if fs::symlink_metadata(&path)?.is_dir() {
+                remove_tree(&path)?;
+            } else {
+                fs::remove_file(&path)?;
+            }
+        }
+        self.purge_retained(now)?;
+        Ok(())
+    }
+
+    /// Reclaims space for the floor: expired retained attempts, then cache entries.
+    fn reclaim(&self, floor: u64, free: &dyn Fn() -> u64, now: SystemTime) -> Result<()> {
+        self.purge_retained(now)?;
+        self.evict(Some((floor, free)))
+    }
+}
+
+/// Removes a directory tree, including directories a job left read-only.
+fn remove_tree(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(_) => {}
+    }
+    fn writable(path: &Path) -> io::Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.is_dir() {
+            let mode = metadata.permissions().mode() | 0o700;
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+            for entry in fs::read_dir(path)? {
+                writable(&entry?.path())?;
+            }
+        }
+        Ok(())
+    }
+    writable(path)?;
+    Ok(fs::remove_dir_all(path)?)
+}
+
+/// The smallest `memory.high` or `memory.max` on this process's cgroup v2 path, in MiB. The
+/// authority admits work against the smaller of this and the configured memory.
+pub fn cgroup_memory_limit_mb(proc_self_cgroup: &str, sys_root: &Path) -> Option<u32> {
+    let path = proc_self_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?;
+    let mut directory = sys_root.to_path_buf();
+    let mut directories = vec![directory.clone()];
+    for component in Path::new(path).components() {
+        if let Component::Normal(name) = component {
+            directory.push(name);
+            directories.push(directory.clone());
+        }
+    }
+    directories
+        .iter()
+        .flat_map(|directory| ["memory.high", "memory.max"].map(|file| directory.join(file)))
+        .filter_map(|file| fs::read_to_string(file).ok()?.trim().parse::<u64>().ok())
+        .min()
+        .map(|bytes| u32::try_from(bytes / MIB).unwrap_or(u32::MAX))
+}
+
+/// This process's cgroup memory limit, reported with every claim.
+fn memory_limit() -> Option<u32> {
+    let cgroup = fs::read_to_string("/proc/self/cgroup").ok()?;
+    cgroup_memory_limit_mb(&cgroup, Path::new("/sys/fs/cgroup"))
+}
+
+/// Where the rootless Docker daemon jobs reach keeps its state: beside the socket `DOCKER_HOST`
+/// names, or in the user's runtime directory. None when `DOCKER_HOST` names no Unix socket.
+fn rootless_state() -> Option<PathBuf> {
+    let socket = match std::env::var_os("DOCKER_HOST") {
+        Some(host) => PathBuf::from(host.to_str()?.strip_prefix("unix://")?),
+        None => {
+            let runtime = match std::env::var_os("XDG_RUNTIME_DIR") {
+                Some(runtime) => PathBuf::from(runtime),
+                None => format!("/run/user/{}", fs::metadata("/proc/self").ok()?.uid()).into(),
+            };
+            runtime.join("docker.sock")
+        }
+    };
+    Some(socket.parent()?.join("dockerd-rootless"))
+}
+
+/// MUST-FIX 8: a rootless Docker daemon with host loopback lets job containers reach this host's
+/// loopback listeners, so each one must be allowlisted. A daemon that cannot be identified counts
+/// as exposing host loopback. `read` reads a file; `rootless` is the daemon's state directory.
+/// Returns why no work may be claimed, if none may.
+pub fn loopback_refusal(
+    read: &dyn Fn(&Path) -> io::Result<Vec<u8>>,
+    rootless: Option<&Path>,
+    allow: &BTreeSet<u16>,
+) -> Option<String> {
+    if rootless.is_some_and(|state| host_loopback(read, state) == Some(false)) {
+        return None;
+    }
+    match loopback_listeners(read) {
+        Ok(listeners) => listeners
+            .into_iter()
+            .find(|listener| !allow.contains(&listener.port()))
+            .map(|listener| format!("loopback listener {listener} not allowlisted")),
+        Err(error) => Some(format!("cannot list loopback listeners: {error:#}")),
+    }
+}
+
+/// Whether the rootless daemon keeping its state in `state` exposes host loopback: its
+/// `child_pid`'s parent is `rootlesskit`, run without `--disable-host-loopback`. None when the
+/// daemon cannot be identified.
+fn host_loopback(read: &dyn Fn(&Path) -> io::Result<Vec<u8>>, state: &Path) -> Option<bool> {
+    let text = |path: &Path| String::from_utf8(read(path).ok()?).ok();
+    let child: u32 = text(&state.join("child_pid"))?.trim().parse().ok()?;
+    let stat = text(Path::new(&format!("/proc/{child}/stat")))?;
+    // The command name may hold spaces and parentheses; the fields after it cannot.
+    let (_, fields) = stat.rsplit_once(')')?;
+    let parent: u32 = fields.split_whitespace().nth(1)?.parse().ok()?;
+    let cmdline = read(Path::new(&format!("/proc/{parent}/cmdline"))).ok()?;
+    let mut arguments = cmdline
+        .split(|byte| *byte == 0)
+        .map(|argument| String::from_utf8_lossy(argument).into_owned());
+    let program = arguments.next()?;
+    if Path::new(&program).file_name()? != "rootlesskit" {
+        return None;
+    }
+    Some(!arguments.any(|argument| {
+        argument == "--disable-host-loopback" || argument == "--disable-host-loopback=true"
+    }))
+}
+
+/// TCP sockets listening on 127.0.0.0/8 or ::1, IPv4-mapped included.
+fn loopback_listeners(read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) -> Result<Vec<SocketAddr>> {
+    let mut listeners = Vec::new();
+    for (table, required) in [("/proc/net/tcp", true), ("/proc/net/tcp6", false)] {
+        let bytes = match read(Path::new(table)) {
+            Ok(bytes) => bytes,
+            Err(error) if !required && error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(anyhow::Error::new(error).context(table)),
+        };
+        for line in String::from_utf8_lossy(&bytes).lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // State 0A is LISTEN.
+            if fields.get(3) != Some(&"0A") {
+                continue;
+            }
+            let address = fields
+                .get(1)
+                .and_then(|field| socket_address(field))
+                .with_context(|| format!("{table}: unreadable line {line:?}"))?;
+            let loopback = match address.ip() {
+                IpAddr::V4(ip) => ip.is_loopback(),
+                IpAddr::V6(ip) => {
+                    ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+                }
+            };
+            if loopback {
+                listeners.push(address);
+            }
+        }
+    }
+    Ok(listeners)
+}
+
+/// A `/proc/net/tcp*` address: the IP as 32-bit words in host byte order, then the port.
+fn socket_address(text: &str) -> Option<SocketAddr> {
+    let (ip, port) = text.split_once(':')?;
+    if !ip.is_ascii() || ![8, 32].contains(&ip.len()) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(16);
+    for word in 0..ip.len() / 8 {
+        let word = u32::from_str_radix(&ip[word * 8..word * 8 + 8], 16).ok()?;
+        bytes.extend(word.to_ne_bytes());
+    }
+    let ip = match <[u8; 4]>::try_from(bytes.as_slice()) {
+        Ok(v4) => IpAddr::from(v4),
+        Err(_) => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(bytes).ok()?)),
+    };
+    Some(SocketAddr::new(ip, u16::from_str_radix(port, 16).ok()?))
 }
 
 #[cfg(test)]
@@ -1866,5 +2769,371 @@ mod tests {
         );
         assert!(second.refused["p-bad"].contains("runner binary changed"));
         assert_eq!(second.engine.as_deref(), Some("e"));
+    }
+
+    /// Ten-byte cache entries named for digests, used one minute apart in the order given.
+    fn cached(work: &Path, names: &[&str]) -> Vec<String> {
+        let cas = work.join("cas");
+        fs::create_dir_all(&cas).unwrap();
+        let start = SystemTime::now() - Duration::from_secs(3600);
+        names
+            .iter()
+            .zip(0..)
+            .map(|(name, minute)| {
+                let sha256 = crate::hash(name.as_bytes());
+                let path = cas.join(&sha256);
+                fs::write(&path, b"0123456789").unwrap();
+                File::open(&path)
+                    .unwrap()
+                    .set_modified(start + Duration::from_secs(60 * minute))
+                    .unwrap();
+                sha256
+            })
+            .collect()
+    }
+
+    /// A ledger entry under `work` for an attempt consuming `digests`.
+    fn consuming(work: &Path, attempt: &str, digests: &[&String]) {
+        let mut claim = claim(attempt);
+        claim.dependencies = vec![DependencyEvidence {
+            action: "producer".into(),
+            attempt: "produced".into(),
+            artifacts: digests
+                .iter()
+                .zip(0..)
+                .map(|(sha256, n)| {
+                    let entry = ArtifactEntry {
+                        sha256: (*sha256).clone(),
+                        mode: 0o444,
+                        bytes: 10,
+                    };
+                    (format!("dist/{n}"), entry)
+                })
+                .collect(),
+        }];
+        fs::create_dir_all(work.join("ledger")).unwrap();
+        fs::write(
+            work.join("ledger").join(format!("{attempt}.json")),
+            serde_json::to_vec(&claim).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn cache(work: &Path) -> BTreeSet<String> {
+        fs::read_dir(work.join("cas"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn cas_lru_evicts_oldest_unpinned_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path();
+        let names = ["locked", "used", "started", "waiting", "newer", "newest"];
+        let [locked, used, started, waiting, newer, newest] =
+            <[String; 6]>::try_from(cached(work, &names)).unwrap();
+        // `waiting` feeds an attempt whose command has not started; `started` one whose has.
+        consuming(work, "a1", &[&waiting]);
+        consuming(work, "a2", &[&started]);
+        fs::create_dir_all(work.join("attempts/a2/control")).unwrap();
+        fs::write(work.join("attempts/a2/control/command-started"), "").unwrap();
+        let disk = Disk::new(work, 35, Duration::from_secs(3600));
+        disk.touch(&used);
+        // A digest being fetched or adopted is never evicted meanwhile.
+        let lock = disk.lock(&locked);
+        let held = lock.lock().unwrap();
+        disk.evict(None).unwrap();
+        assert_eq!(
+            cache(work),
+            BTreeSet::from([locked.clone(), used.clone(), waiting.clone()])
+        );
+        assert!(!cache(work).contains(&newer) && !cache(work).contains(&newest));
+        drop(held);
+        let disk = Disk::new(work, 20, Duration::from_secs(3600));
+        disk.evict(None).unwrap();
+        // Recency now comes from the file times alone: `used` was marked on disk.
+        assert_eq!(cache(work), BTreeSet::from([used, waiting]));
+    }
+
+    #[test]
+    fn free_disk_floor_blocks_claims_after_eviction() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = fake(temp.path());
+        let work = fake.root.clone();
+        let coordinator = coordinator(fake);
+        let [old, pinned, new] =
+            <[String; 3]>::try_from(cached(&work, &["old", "pinned", "new"])).unwrap();
+        consuming(&work, "a0", &[&pinned]);
+        // A 1000-byte disk: other files use `other` bytes, the cache the rest of what is used.
+        let other = Arc::new(std::sync::atomic::AtomicU64::new(970));
+        let free_space: FreeSpace = {
+            let (other, cas) = (other.clone(), work.join("cas"));
+            Arc::new(move |_: &Path| {
+                let cached: u64 = fs::read_dir(&cas)?
+                    .map(|entry| Ok(entry?.metadata()?.len()))
+                    .sum::<std::io::Result<u64>>()?;
+                Ok(1000 - other.load(std::sync::atomic::Ordering::SeqCst) - cached)
+            })
+        };
+        let disk = Arc::new(Disk::new(&work, u64::MAX, Duration::from_secs(3600)));
+        let coordinator = coordinator.guarded(Guards {
+            min_free: 25,
+            loopback: None,
+            disk: Some(disk),
+            free_space,
+        });
+        // Eviction frees 20 bytes of the 25 needed: claims wait.
+        assert_eq!(coordinator.claim().unwrap(), Claimed::Idle);
+        assert_eq!(cache(&work), BTreeSet::from([pinned.clone()]));
+        assert!(!cache(&work).contains(&old) && !cache(&work).contains(&new));
+        let declined = claims_sent(&coordinator);
+        assert_eq!(declined.len(), 1);
+        let reason = &declined[0].refused[authority::REFUSE_ALL];
+        assert!(reason.contains("floor"), "{reason}");
+        // The report claims nothing: a fresh key, never the pending one.
+        assert!(
+            !coordinator
+                .transport
+                .control()
+                .join("pending-claim")
+                .exists()
+        );
+        coordinator
+            .transport
+            .claims
+            .lock()
+            .unwrap()
+            .push_back(ClaimResponse {
+                claim: Some(claim("a1")),
+                fenced: None,
+                unverified: vec![],
+            });
+        other.store(900, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(coordinator.claim().unwrap(), Claimed::Attempt("a1".into()));
+        let requests = claims_sent(&coordinator);
+        assert_ne!(requests[1].claim_key, requests[0].claim_key);
+        assert!(requests[1].refused.is_empty());
+        assert_eq!(cache(&work), BTreeSet::from([pinned]));
+    }
+
+    #[test]
+    fn a_claim_replayed_while_declining_is_reported_unrun() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = fake(temp.path());
+        fs::create_dir_all(&fake.control).unwrap();
+        // Written before a crash lost the response to it.
+        fs::write(fake.control.join("pending-claim"), r#"{"key":"lost"}"#).unwrap();
+        fake.claims.lock().unwrap().push_back(ClaimResponse {
+            claim: Some(claim("a1")),
+            fenced: None,
+            unverified: vec![],
+        });
+        let coordinator = coordinator(fake).guarded(Guards {
+            min_free: 1,
+            free_space: Arc::new(|_: &Path| Ok(0)),
+            ..Guards::default()
+        });
+        assert_eq!(coordinator.claim().unwrap(), Claimed::Attempt("a1".into()));
+        let requests = claims_sent(&coordinator);
+        assert_eq!(requests[0].claim_key, "lost");
+        assert!(requests[0].refused[authority::REFUSE_ALL].contains("floor"));
+        assert!(
+            !coordinator
+                .transport
+                .control()
+                .join("pending-claim")
+                .exists()
+        );
+        // Nothing is fetched or launched; the attempt is reported drained and unrun.
+        coordinator.materialize("a1");
+        assert!(!coordinator.control("a1").join("claim.json").exists());
+        coordinator.publish_queued().unwrap();
+        let reports = completions(&coordinator);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].outcome, Outcome::NotStarted);
+        assert!(reports[0].reason.as_deref().unwrap().contains("floor"));
+        assert!(reports[0].drained);
+        assert!(coordinator.lock().ledger.is_empty());
+    }
+
+    fn claims_sent(coordinator: &Coordinator<Fake>) -> Vec<ClaimRequest> {
+        calls(coordinator)
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Claim(request) => Some(request),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn retained_dirs_are_purged_after_retention() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path();
+        let now = SystemTime::now();
+        for (name, hours) in [("old", 73), ("recent", 71)] {
+            let directory = work.join("retained").join(name);
+            fs::create_dir_all(directory.join("work/locked")).unwrap();
+            fs::write(directory.join("work/locked/file"), "x").unwrap();
+            // Jobs may leave read-only directories behind.
+            fs::set_permissions(
+                directory.join("work/locked"),
+                fs::Permissions::from_mode(0o555),
+            )
+            .unwrap();
+            File::open(&directory)
+                .unwrap()
+                .set_modified(now - Duration::from_secs(hours * 3600))
+                .unwrap();
+        }
+        let disk = Disk::new(work, u64::MAX, Duration::from_secs(72 * 3600));
+        assert_eq!(disk.purge_retained(now).unwrap(), ["old"]);
+        assert!(!work.join("retained/old").exists());
+        assert!(work.join("retained/recent/work/locked/file").exists());
+        fs::set_permissions(
+            work.join("retained/recent/work/locked"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cgroup_limit_is_min_of_high_and_max_along_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let sys = temp.path();
+        let cgroup = "0::/user.slice/user-1000.slice/app.slice/patchweft.service\n";
+        let limit = |path: &str, file: &str, value: &str| {
+            let directory = sys.join(path);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join(file), value).unwrap();
+        };
+        limit("user.slice", "memory.max", "max\n");
+        limit("user.slice/user-1000.slice", "memory.max", "12884901888\n");
+        limit(
+            "user.slice/user-1000.slice/app.slice",
+            "memory.high",
+            "max\n",
+        );
+        let leaf = "user.slice/user-1000.slice/app.slice/patchweft.service";
+        limit(leaf, "memory.max", "8589934592\n");
+        limit(leaf, "memory.high", "max\n");
+        assert_eq!(cgroup_memory_limit_mb(cgroup, sys), Some(8192));
+        // memory.high counts like memory.max, and an ancestor's limit binds its descendants.
+        limit(leaf, "memory.high", "7516192768\n");
+        assert_eq!(cgroup_memory_limit_mb(cgroup, sys), Some(7168));
+        limit("user.slice/user-1000.slice", "memory.high", "4294967296\n");
+        assert_eq!(cgroup_memory_limit_mb(cgroup, sys), Some(4096));
+        // Unlimited, cgroup v1 only, or no cgroup at all: nothing to report.
+        assert_eq!(cgroup_memory_limit_mb("0::/user.slice\n", sys), None);
+        assert_eq!(cgroup_memory_limit_mb("0::/\n", sys), None);
+        assert_eq!(cgroup_memory_limit_mb("4:memory:/user.slice\n", sys), None);
+        assert_eq!(cgroup_memory_limit_mb("", sys), None);
+    }
+
+    const ROOTLESS: &str = "/run/user/1000/dockerd-rootless";
+    const TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:0947 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 31001 1 0000000000000000 100 0 0 10 0
+   1: 3500007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   101        0 31002 1 0000000000000000 100 0 0 10 0
+   2: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 31003 1 0000000000000000 100 0 0 10 0
+   3: 0100007F:B5F2 0100007F:0947 01 00000000:00000000 00:00000000 00000000  1000        0 31004 1 0000000000000000 20 4 30 10 -1
+";
+    const TCP6: &str = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000001000000:0277 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 31005 1 0000000000000000 100 0 0 10 0
+   1: 00000000000000000000000000000000:0050 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 31006 1 0000000000000000 100 0 0 10 0
+";
+
+    /// A host holding exactly `files`: listeners on 127.0.0.1:2375, 127.0.0.53:53 and [::1]:631,
+    /// plus a rootless daemon whose `rootlesskit` parent runs with `flags`.
+    fn host(flags: Option<&str>) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut files: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::from([
+            ("/proc/net/tcp".into(), TCP.into()),
+            ("/proc/net/tcp6".into(), TCP6.into()),
+        ]);
+        if let Some(flags) = flags {
+            files.insert(Path::new(ROOTLESS).join("child_pid"), b"4242\n".to_vec());
+            // A command name may hold spaces and parentheses.
+            files.insert(
+                "/proc/4242/stat".into(),
+                b"4242 (exe (child)) S 4200 4242 4200 0 -1 4194560".to_vec(),
+            );
+            let cmdline = format!("/usr/bin/rootlesskit\0--net=slirp4netns\0{flags}\0dockerd\0");
+            files.insert("/proc/4200/cmdline".into(), cmdline.into_bytes());
+        }
+        files
+    }
+
+    fn refusal(files: &BTreeMap<PathBuf, Vec<u8>>, ports: &[u16]) -> Option<String> {
+        let read = |path: &Path| {
+            files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| std::io::Error::from(ErrorKind::NotFound))
+        };
+        loopback_refusal(
+            &read,
+            Some(Path::new(ROOTLESS)),
+            &ports.iter().copied().collect(),
+        )
+    }
+
+    #[test]
+    fn loopback_check_refuses_unlisted_listener_when_host_loopback_enabled() {
+        let files = host(Some("--port-driver=builtin"));
+        assert_eq!(
+            refusal(&files, &[53]).as_deref(),
+            Some("loopback listener 127.0.0.1:2375 not allowlisted")
+        );
+        assert_eq!(
+            refusal(&files, &[53, 2375]).as_deref(),
+            Some("loopback listener [::1]:631 not allowlisted")
+        );
+        // Wildcard listeners and established connections are not loopback listeners.
+        assert_eq!(refusal(&files, &[53, 631, 2375]), None);
+    }
+
+    #[test]
+    fn loopback_check_passes_when_host_loopback_disabled() {
+        assert_eq!(refusal(&host(Some("--disable-host-loopback")), &[]), None);
+        assert_eq!(
+            refusal(&host(Some("--disable-host-loopback=true")), &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn loopback_check_fails_closed_when_daemon_unknown() {
+        let expected = Some("loopback listener 127.0.0.1:2375 not allowlisted");
+        // No daemon state at all.
+        assert_eq!(refusal(&host(None), &[53]).as_deref(), expected);
+        // The child's parent is not rootlesskit.
+        let mut files = host(Some("--disable-host-loopback"));
+        files.insert(
+            "/proc/4200/cmdline".into(),
+            b"dockerd\0--disable-host-loopback\0".to_vec(),
+        );
+        assert_eq!(refusal(&files, &[53]).as_deref(), expected);
+        // The parent is gone.
+        files.remove(Path::new("/proc/4200/cmdline"));
+        assert_eq!(refusal(&files, &[53]).as_deref(), expected);
+        // DOCKER_HOST names no socket whose daemon could be inspected.
+        let files = host(Some("--disable-host-loopback"));
+        let read = |path: &Path| {
+            files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| std::io::Error::from(ErrorKind::NotFound))
+        };
+        let allow = BTreeSet::from([53]);
+        assert_eq!(loopback_refusal(&read, None, &allow).as_deref(), expected);
+        // Listeners that cannot be listed refuse too; an unlisted daemon alone does not.
+        let mut files = host(None);
+        files.remove(Path::new("/proc/net/tcp"));
+        assert!(
+            refusal(&files, &[53, 631, 2375])
+                .unwrap()
+                .contains("/proc/net/tcp")
+        );
+        assert_eq!(refusal(&host(None), &[53, 631, 2375]), None);
     }
 }
