@@ -368,7 +368,7 @@ fn policy_update_changes_scope_without_rotating_the_credential() {
         max_pending: 1024,
     };
     assert_eq!(
-        api::update_policy(&store, widened).unwrap()["rotated"],
+        api::update_policy(&store, serde_json::to_value(&widened).unwrap()).unwrap()["rotated"],
         false
     );
     // The same credential now carries the new scope: review is allowed, write is gone.
@@ -387,8 +387,115 @@ fn policy_update_changes_scope_without_rotating_the_credential() {
         roles: BTreeSet::from(["read".into()]),
         max_pending: 1,
     };
-    assert!(api::update_policy(&store, unknown).is_err());
+    assert!(api::update_policy(&store, serde_json::to_value(&unknown).unwrap()).is_err());
     assert_eq!(lab.rows("api_credentials"), 2);
+    // Every policy change is audited with the scope before and after it (gate P2-1).
+    let audits: Vec<Value> = store
+        .events(0)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e["kind"] == "principal.policy")
+        .collect();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0]["subject"], "alice");
+    assert_eq!(
+        audits[0]["detail"]["after"]["roles"],
+        json!(["read", "review"])
+    );
+    assert!(audits[0]["detail"]["before"]["roles"].is_array());
+    assert_ne!(audits[0]["detail"]["before"], audits[0]["detail"]["after"]);
+}
+
+#[test]
+fn policy_update_refuses_an_invalid_policy_and_changes_nothing() {
+    // Gate P2-2: the validate_policy call is what stands between a typo and a scope.
+    let lab = Lab::new();
+    let store = Store::open(&lab.root).unwrap();
+    let body = |store: &Store| -> String {
+        store
+            .db
+            .query_row(
+                "SELECT body FROM api_principals WHERE id='alice'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let before = body(&store);
+    for invalid in [
+        json!({"id":"alice","projects":[lab.pa],"profiles":["no-such-profile"],"roles":["read"]}),
+        json!({"id":"alice","projects":[lab.pa],"profiles":[],"roles":["admin-everything"]}),
+        json!({"id":"alice","projects":[lab.pa],"profiles":[],"roles":["read"],"max_pending":0}),
+    ] {
+        assert!(
+            api::update_policy(&store, invalid.clone()).is_err(),
+            "{invalid}"
+        );
+        assert_eq!(body(&store), before, "{invalid}");
+    }
+    assert!(
+        !store
+            .events(0)
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "principal.policy")
+    );
+}
+
+#[test]
+fn policy_update_keeps_max_pending_when_omitted_and_grant_and_revoke_are_audited() {
+    let lab = Lab::new();
+    let store = Store::open(&lab.root).unwrap();
+    let limit = |store: &Store| -> Value {
+        let body: String = store
+            .db
+            .query_row(
+                "SELECT body FROM api_principals WHERE id='alice'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        serde_json::from_str::<Value>(&body).unwrap()["max_pending"].clone()
+    };
+    let current = limit(&store);
+    api::update_policy(
+        &store,
+        json!({"id":"alice","projects":[lab.pa],"profiles":[lab.profile],"roles":["read"]}),
+    )
+    .unwrap();
+    // A policy without max_pending keeps the limit instead of resetting it (gate P3).
+    assert_eq!(limit(&store), current);
+    let dave = Principal {
+        id: "dave".into(),
+        projects: BTreeSet::from([lab.pa.clone()]),
+        profiles: BTreeSet::new(),
+        roles: BTreeSet::from(["read".into()]),
+        max_pending: 8,
+    };
+    api::grant(&store, dave, &lab.root.join("dave.credential")).unwrap();
+    let granted: Vec<Value> = store
+        .events(0)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e["kind"] == "principal.granted")
+        .collect();
+    assert_eq!(granted.len(), 1);
+    assert_eq!(
+        (
+            &granted[0]["subject"],
+            &granted[0]["detail"]["after"]["max_pending"]
+        ),
+        (&json!("dave"), &json!(8))
+    );
+    api::revoke(&store, "alice").unwrap();
+    let revoked: Vec<Value> = store
+        .events(0)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e["kind"] == "principal.revoked")
+        .collect();
+    assert_eq!(revoked.len(), 1);
+    assert_eq!(revoked[0]["detail"]["credentials_revoked"], 1);
 }
 
 #[test]

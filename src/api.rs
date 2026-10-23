@@ -1,6 +1,10 @@
 //! Versioned, authenticated application boundary shared by HTTP and MCP.
 //! Local administrative CLI commands retain their existing Unix-account authority.
-use crate::{engine, hash, identity, now, source, store::Store, unique};
+use crate::{
+    engine, hash, identity, now, source,
+    store::{Store, event},
+    unique,
+};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -309,6 +313,12 @@ pub fn grant(store: &Store, principal: Principal, token_file: &Path) -> Result<V
             "INSERT INTO api_credentials VALUES (?,?)",
             params![hash(token.as_bytes()), principal.id],
         )?;
+        event(
+            &store.db,
+            "principal.granted",
+            &principal.id,
+            &json!({"after":principal,"rotated":true}),
+        )?;
         store.db.execute_batch("COMMIT")?;
         Ok(())
     })();
@@ -320,27 +330,69 @@ pub fn grant(store: &Store, principal: Principal, token_file: &Path) -> Result<V
     Ok(json!({"principal":principal.id,"credential_file":token_file,"rotated":true}))
 }
 
-/// Replace an existing principal's scope; its issued credentials keep working.
-pub fn update_policy(store: &Store, principal: Principal) -> Result<Value> {
+/// Replace an existing principal's scope; its issued credentials keep working. A policy without
+/// `max_pending` keeps the current limit. Read, validation, write and the `{before, after}` audit
+/// event are one immediate transaction, so concurrent edits cannot lose an update.
+pub fn update_policy(store: &Store, policy: Value) -> Result<Value> {
     prepare(store)?;
-    validate_policy(store, &principal)?;
-    let changed = store.db.execute(
-        "UPDATE api_principals SET body=? WHERE id=?",
-        params![serde_json::to_string(&principal)?, principal.id],
-    )?;
-    ensure!(
-        changed == 1,
-        "unknown principal; grant issues its first credential"
-    );
-    Ok(json!({"principal":principal.id,"rotated":false}))
+    store.db.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<Value> {
+        let id = policy["id"].as_str().context("policy lacks an id")?;
+        let before: Option<String> = store
+            .db
+            .query_row("SELECT body FROM api_principals WHERE id=?", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let before: Value = serde_json::from_str(
+            &before.context("unknown principal; grant issues its first credential")?,
+        )?;
+        let mut policy = policy.clone();
+        if policy.get("max_pending").is_none() {
+            policy["max_pending"] = before["max_pending"].clone();
+        }
+        let principal: Principal = serde_json::from_value(policy)?;
+        validate_policy(store, &principal)?;
+        let after = serde_json::to_value(&principal)?;
+        store.db.execute(
+            "UPDATE api_principals SET body=? WHERE id=?",
+            params![after.to_string(), principal.id],
+        )?;
+        event(
+            &store.db,
+            "principal.policy",
+            &principal.id,
+            &json!({"before":before,"after":after}),
+        )?;
+        store.db.execute_batch("COMMIT")?;
+        Ok(json!({"principal":principal.id,"rotated":false}))
+    })();
+    if result.is_err() {
+        let _ = store.db.execute_batch("ROLLBACK");
+    }
+    result
 }
 
 pub fn revoke(store: &Store, principal: &str) -> Result<Value> {
     prepare(store)?;
-    let count = store
-        .db
-        .execute("DELETE FROM api_credentials WHERE principal=?", [principal])?;
-    Ok(json!({"principal":principal,"credentials_revoked":count}))
+    store.db.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<usize> {
+        let count = store
+            .db
+            .execute("DELETE FROM api_credentials WHERE principal=?", [principal])?;
+        event(
+            &store.db,
+            "principal.revoked",
+            principal,
+            &json!({"credentials_revoked":count}),
+        )?;
+        store.db.execute_batch("COMMIT")?;
+        Ok(count)
+    })();
+    if result.is_err() {
+        let _ = store.db.execute_batch("ROLLBACK");
+    }
+    Ok(json!({"principal":principal,"credentials_revoked":result?}))
 }
 
 fn auth(store: &Store, token: &str) -> ApiResult<Principal> {
