@@ -432,6 +432,44 @@ fn setup_failures_are_classified_by_cause() {
 }
 
 #[test]
+fn declared_jobs_receive_their_inputs_and_keyed_base_from_the_claim() {
+    // pw#11: PATCHWEFT_INPUTS and PATCHWEFT_BASE come from the claimed action, so a local and a remote
+    // supervisor export the same values; a job with neither recorded sees neither.
+    let lab = Lab::new();
+    let (inputs, base) = ("a".repeat(64), "b".repeat(40));
+    let mut claim = lab.claim(
+        &format!("test \"$PATCHWEFT_INPUTS\" = {inputs} && test \"$PATCHWEFT_BASE\" = {base}"),
+        None,
+        60,
+    );
+    claim.action.declared_inputs = Some(inputs);
+    claim.action.declared_base = Some(base);
+    lab.write(&claim);
+    lab.register(&claim);
+    let result = lab.result(&claim, lab.spawn(&claim));
+    assert_eq!(
+        (result.outcome, result.exit_code),
+        (Outcome::Completed, 0),
+        "{}",
+        result.evidence
+    );
+    let plain = lab.claim(
+        "test -z \"${PATCHWEFT_INPUTS+x}${PATCHWEFT_BASE+x}\"",
+        None,
+        60,
+    );
+    lab.write(&plain);
+    lab.register(&plain);
+    let result = lab.result(&plain, lab.spawn(&plain));
+    assert_eq!(
+        (result.outcome, result.exit_code),
+        (Outcome::Completed, 0),
+        "{}",
+        result.evidence
+    );
+}
+
+#[test]
 fn command_started_marker_precedes_spawn() {
     let lab = Lab::new();
     let claim = lab.claim(
