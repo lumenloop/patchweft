@@ -76,9 +76,11 @@ they run natively, so they reach every TCP listener on `127.0.0.0/8` or `::1`, a
 on a wildcard address (`0.0.0.0`, `::`, `::ffff:0.0.0.0`) at 127.0.0.1 with a loopback source,
 whatever a Docker daemon exposes to containers. UDP is not checked. A job also reaches a listener
 bound to one of the host's own addresses (a tailnet or LAN address) over `lo`; keep such services
-off executor hosts. Under WSL with mirrored networking the Windows host's listeners answer at
-127.0.0.1 without appearing in Linux's tables, so the coordinator refuses all work there. A host firewall does not filter `lo`, so a service that binds a wildcard
-and trusts loopback is reachable from every job. Each such listener must be in
+off executor hosts, except ones that authenticate every caller, such as tailscaled's peerapi on the
+tailnet address. Under WSL (mirrored networking) the Windows host's listeners can answer at
+127.0.0.1 without appearing in Linux's tables, and the mode can't be ruled out from inside, so the
+coordinator refuses all work on any WSL kernel: run executors in a Linux VM. A host firewall does
+not filter `lo`, so a service that binds a wildcard and trusts loopback is reachable from every job. Each such listener must be in
 `--loopback-allow PORT[,PORT…]`, unless the rootless Docker daemon's own `rootlesskit` (or a
 process under it) holds it, those being the ports it publishes for job containers, or one of
 the executor's own attempts does: a listener held by a process descending from a live supervisor
