@@ -2309,7 +2309,8 @@ const DECLARED_AUDIT: &str = "patchweft-inputs.json names every file the job rea
 /// `check` reads provider.mjs (and the common consumer.mjs); `gate` also reads README, which
 /// it does not declare, so an outside change can flip it.
 const DECLARATIONS: &str = r#"{"schema":"patchweft.inputs/1","common":["consumer.mjs"],
- "jobs":{"check":{"paths":["provider.mjs"],"why":"check reads provider.mjs and consumer.mjs"},
+ "jobs":{"prep":{"paths":["*.mjs"],"why":"prep builds dist from the modules"},
+         "check":{"paths":["provider.mjs"],"why":"check reads provider.mjs and consumer.mjs"},
          "gate":{"paths":["*.mjs"],"why":"gate's declared reads are the modules"},
          "census":{"whole_tree":"lists the whole tree"}}}"#;
 const RECORD: &str = "mkdir -p out; env > out/env";
@@ -2325,7 +2326,7 @@ fn declared_profile(lab: &Lab) -> String {
         "declared",
         json!({"version":1,"name":"declared","certifying":true,"tools":{"sh":"/usr/bin/sh"},
         "inputs_file":INPUTS_FILE,"jobs":[
-            job("prep", BUILD, json!({"artifacts":["dist"]})),
+            declared("prep", BUILD, json!({"artifacts":["dist"]})),
             declared("check", &format!("test -s dist/out && {RECORD}"),
                      json!({"dependencies":["prep"],"artifacts":["out"]})),
             declared("gate", "! grep -q fail README", json!({})),
@@ -2363,7 +2364,8 @@ fn a_declared_pass_is_reused_until_a_declared_input_changes() {
     let (second, _) = lab.edit(&first, "author", "README", "pass\n");
     let b = lab.submit(&second, &profile, "agent");
     assert_eq!(b["required"]["check"], a["required"]["check"]);
-    assert_eq!(names(&b["reused"]), ["check"]);
+    // prep is declared too, so check's passed key (which folds in prep's) holds.
+    assert_eq!(names(&b["reused"]), ["check", "prep"]);
     assert_eq!(b["reused"]["check"]["from_candidate"], a["id"]);
     assert_eq!(b["reused"]["check"]["from_revision"], json!(first));
     let checks: i64 = lab
@@ -2376,21 +2378,26 @@ fn a_declared_pass_is_reused_until_a_declared_input_changes() {
         .unwrap();
     assert_eq!(checks, 1, "no new action for a reused job");
     let reused = lab.events_of("action.reused");
+    assert_eq!(reused.len(), 2);
+    let reused: Vec<_> = reused
+        .iter()
+        .filter(|e| e["subject"] == a["required"]["check"])
+        .collect();
     assert_eq!(reused.len(), 1);
-    assert_eq!(reused[0]["subject"], a["required"]["check"]);
     assert_eq!(reused[0]["detail"]["candidate"], b["id"]);
     // A failed declared action is never reused, even with the same declared inputs.
     assert_ne!(b["required"]["gate"], a["required"]["gate"]);
-    for job in ["prep", "census", "plain"] {
+    for job in ["census", "plain"] {
         assert_ne!(b["required"][job], a["required"][job], "{job}");
     }
     let status = lab.call(&["status", b["id"].as_str().unwrap()]);
-    assert_eq!(status["reused"], json!(["check"]));
+    assert_eq!(status["reused"], json!(["check", "prep"]));
     assert_eq!(status["jobs"]["check"]["state"], "passed");
     assert_eq!(status["jobs"]["check"]["reused"], b["reused"]["check"]);
     lab.drain();
     assert_eq!(lab.state(&b), "passed");
-    assert_eq!(lab.count("attempt.started"), 5 + 4);
+    // b reuses prep and check, so it starts gate, census and plain only.
+    assert_eq!(lab.count("attempt.started"), 5 + 3);
 
     // The reused pass consumed A's `prep`; promote accepts it by its passed key.
     lab.call(&["review", &second, "--reviewer", "reviewer"]);

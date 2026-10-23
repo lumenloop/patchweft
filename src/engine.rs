@@ -332,19 +332,60 @@ pub fn action_key(
     )
 }
 
-/// The key under which a declared job's pass is reused: its declared inputs, without dependency
-/// actions. The recipe already hashes the dependencies' recipes.
+/// The key under which a declared job's pass is reused: its declared inputs and recipe, plus its
+/// dependencies' passed keys (not their actions: a dependency rerun on equal inputs keeps them).
 pub fn passed_key(
     project: &str,
     recipe: &str,
     class: &str,
     timeout_seconds: u64,
     inputs: &Value,
+    dependencies: &[String],
 ) -> Result<String> {
     identity(
         &json!({"key":"patchweft.declared/1","project":project,"recipe":recipe,"class":class,
-                     "timeout_seconds":timeout_seconds,"inputs":inputs}),
+                     "timeout_seconds":timeout_seconds,"inputs":inputs,"dependencies":dependencies}),
     )
+}
+
+/// Each job's passed key, dependencies first. A job has one only if it is declared off the fail-safe
+/// path and every dependency has one: a dependency's output is an input of its dependents, so a
+/// commit-keyed or fail-safe dependency leaves them nothing to reuse under (pw#11 adversary F1).
+pub fn passed_keys(
+    profile: &RegisteredProfile,
+    recipes: &BTreeMap<String, String>,
+    declared: &Declared,
+    project: &str,
+    class: &str,
+) -> Result<BTreeMap<String, Option<String>>> {
+    let jobs = &profile.definition.jobs;
+    let mut keys: BTreeMap<String, Option<String>> = BTreeMap::new();
+    while keys.len() < jobs.len() {
+        let before = keys.len();
+        for job in jobs {
+            if keys.contains_key(&job.name)
+                || !job.dependencies.iter().all(|d| keys.contains_key(d))
+            {
+                continue;
+            }
+            let dependencies: Option<Vec<String>> =
+                job.dependencies.iter().map(|d| keys[d].clone()).collect();
+            let key = match (declared.identity(&job.name), dependencies) {
+                (Some(inputs), Some(dependencies)) => Some(passed_key(
+                    project,
+                    recipes.get(&job.name).context("job recipe missing")?,
+                    class,
+                    job.timeout_seconds,
+                    inputs,
+                    &dependencies,
+                )?),
+                _ => None,
+            };
+            keys.insert(job.name.clone(), key);
+        }
+        ensure!(keys.len() != before, "profile contains a dependency cycle");
+    }
+    Ok(keys)
 }
 
 /// What a job's action must answer to, and what it recorded: a pass reused under its passed key
@@ -357,26 +398,14 @@ struct Answer<'a> {
     class: &'a str,
     timeout_seconds: u64,
     inputs: &'a Value,
-    declared: Option<&'a Value>,
+    passed: Option<&'a str>,
     dependencies: &'a [String],
 }
 
 impl Answer<'_> {
     fn matches(&self, db: &Connection, action: &Action, reused: bool) -> Result<bool> {
         let (key, recorded) = if reused {
-            let key = self
-                .declared
-                .map(|declared| {
-                    passed_key(
-                        self.project,
-                        self.recipe,
-                        self.class,
-                        self.timeout_seconds,
-                        declared,
-                    )
-                })
-                .transpose()?;
-            (key, passed_key_of(db, &action.id)?)
+            (self.passed.map(Into::into), passed_key_of(db, &action.id)?)
         } else {
             let key = action_key(
                 self.project,
@@ -470,6 +499,7 @@ struct Requester<'a> {
     requested: BTreeMap<String, String>,
     retention: Option<Retention>,
     declared: Declared,
+    passed: BTreeMap<String, Option<String>>,
     reused: BTreeMap<String, Reused>,
 }
 
@@ -578,7 +608,10 @@ fn retainable(
         class: &identity.class,
         timeout_seconds: identity.timeout_seconds,
         inputs,
-        declared: request.declared.identity(&definition.name),
+        passed: request
+            .passed
+            .get(&definition.name)
+            .and_then(|key| key.as_deref()),
         dependencies,
     };
     if !answer.matches(&store.db, &action, reused)? {
@@ -617,20 +650,9 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
         &inputs,
         &dependencies,
     )?;
-    // Only a declared job off the fail-safe path has a passed key.
+    // Only a declared job off the fail-safe path, with every dependency keyed too, has a passed key.
     let declared = request.declared.identity(name).cloned();
-    let passed = declared
-        .as_ref()
-        .map(|declared| {
-            passed_key(
-                &request.revision.project,
-                &recipe,
-                class,
-                definition.timeout_seconds,
-                declared,
-            )
-        })
-        .transpose()?;
+    let passed = request.passed.get(name).cloned().flatten();
     let (owner, context, profile) = (request.owner, request.context, request.profile);
     // Before the generic lookup, so an unrelated queued row cannot capture the job and break the chain.
     let outcome = match request.retention {
@@ -831,15 +853,24 @@ pub fn request(
     verify_runtime(&profile)?;
     let declared = declarations(store, &revision, &profile.definition);
     report_declarations(&store.db, "", &declared)?;
+    let recipes = recipes(&profile)?;
+    let passed = passed_keys(
+        &profile,
+        &recipes,
+        &declared,
+        &revision.project,
+        class(&profile),
+    )?;
     let mut request = Requester {
         revision: &revision,
-        recipes: recipes(&profile)?,
+        recipes,
         profile: &profile,
         owner,
         context: "",
         requested: BTreeMap::new(),
         retention: None,
         declared,
+        passed,
         reused: BTreeMap::new(),
     };
     let id = request_job(store, &mut request, name)?;
@@ -931,9 +962,17 @@ fn submit_inner(
     transaction.commit()?;
     let declared = declarations(store, &revision_row, &profile_row.definition);
     report_declarations(&store.db, &id, &declared)?;
+    let recipes = recipes(&profile_row)?;
+    let passed = passed_keys(
+        &profile_row,
+        &recipes,
+        &declared,
+        &revision_row.project,
+        class(&profile_row),
+    )?;
     let mut request = Requester {
         revision: &revision_row,
-        recipes: recipes(&profile_row)?,
+        recipes,
         profile: &profile_row,
         owner,
         context: &id,
@@ -944,6 +983,7 @@ fn submit_inner(
             not_retained: BTreeMap::new(),
         }),
         declared,
+        passed,
         reused: BTreeMap::new(),
     };
     for job in &profile_row.definition.jobs {
@@ -1253,6 +1293,13 @@ pub fn promote(store: &mut Store, candidate_id: &str, expected: Option<&str>) ->
     );
     let recipes = recipes(&profile)?;
     let declared = declarations(store, &revision, &profile.definition);
+    let passed = passed_keys(
+        &profile,
+        &recipes,
+        &declared,
+        &revision.project,
+        "certifying",
+    )?;
     // Once actions cross profiles, construction no longer guarantees identity; recompute it.
     let mut obligations = BTreeMap::new();
     for name in candidate.required.keys() {
@@ -1349,7 +1396,7 @@ pub fn promote(store: &mut Store, candidate_id: &str, expected: Option<&str>) ->
                 class: "certifying",
                 timeout_seconds: identity.timeout_seconds,
                 inputs,
-                declared: declared.identity(name),
+                passed: passed.get(name).and_then(|key| key.as_deref()),
                 dependencies,
             };
             ensure!(
@@ -1858,7 +1905,8 @@ mod declared_tests {
     const FILE: &str = "ci/inputs.json";
     const AUDIT: &str = "the declarations file names every read";
     const DECLARATIONS: &str = r#"{"schema":"patchweft.inputs/1","common":["package.json"],
-        "jobs":{"check":{"paths":["src/**"],"why":"check reads src and package.json"},
+        "jobs":{"prep":{"paths":["package.json"],"why":"prep installs from package.json"},
+                "check":{"paths":["src/**"],"why":"check reads src and package.json"},
                 "solo":{"paths":["src/**"],"exclude":["src/*.md"],"why":"solo reads src and package.json"},
                 "census":{"whole_tree":"lists the whole tree"},
                 "ghost":{"paths":["src/**"],"why":"a job this profile does not have"}}}"#;
@@ -1950,7 +1998,7 @@ mod declared_tests {
             self.register(
                 "declared",
                 json!([
-                    job("prep", "inflight", &[]),
+                    job("prep", "declared", &[]),
                     job("check", "declared", &["prep"]),
                     job("solo", "declared", &[]),
                     job("census", "declared", &[])
@@ -2069,7 +2117,9 @@ mod declared_tests {
         lab.pass_all(&a);
         let outside = lab.commit(&[("README", Some("changed"))]);
         let b = lab.submit(&outside, &profile);
-        for job in ["prep", "census"] {
+        // prep is declared, so it is reused too, and check's passed key folds in prep's.
+        assert_eq!(b.reused["prep"].action, a.required["prep"]);
+        for job in ["census"] {
             assert_ne!(
                 b.required[job], a.required[job],
                 "{job} keeps the commit key"
@@ -2087,9 +2137,9 @@ mod declared_tests {
                 }
             );
         }
-        assert_eq!(b.reused.len(), 2);
+        assert_eq!(b.reused.len(), 3);
         let events = lab.events("action.reused");
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         let check = events
             .iter()
             .find(|e| e["subject"] == a.required["check"])
@@ -2103,10 +2153,10 @@ mod declared_tests {
             json!({"candidate":b.id,"owner":"agent","from":a.id,"recipe":recipe,"key":key})
         );
         let status = candidate_status(&lab.store, &b.id).unwrap();
-        assert_eq!(status["reused"], json!(["check", "solo"]));
+        assert_eq!(status["reused"], json!(["check", "prep", "solo"]));
         assert_eq!(status["jobs"]["check"]["state"], "passed");
         assert_eq!(status["jobs"]["check"]["reused"], json!(b.reused["check"]));
-        assert!(status["jobs"]["prep"].get("reused").is_none());
+        assert_eq!(status["jobs"]["prep"]["reused"], json!(b.reused["prep"]));
         assert!(
             candidate_status(&lab.store, &a.id)
                 .unwrap()
@@ -2117,12 +2167,16 @@ mod declared_tests {
         // Inputs are per job: `solo` excludes the notes `check` reads.
         let notes = lab.commit(&[("src/notes.md", None)]);
         let n = lab.submit(&notes, &profile);
-        assert_eq!(n.reused.keys().collect::<Vec<_>>(), ["solo"]);
+        assert_eq!(n.reused.keys().collect::<Vec<_>>(), ["prep", "solo"]);
         assert_eq!(n.required["solo"], a.required["solo"]);
         assert_ne!(n.required["check"], a.required["check"]);
         let inside = lab.commit(&[("src/a.ts", Some("a2"))]);
         let c = lab.submit(&inside, &profile);
-        assert!(c.reused.is_empty());
+        assert_eq!(
+            c.reused.keys().collect::<Vec<_>>(),
+            ["prep"],
+            "prep reads no source"
+        );
         for job in ["check", "solo"] {
             assert_ne!(c.required[job], a.required[job], "{job}");
             assert_ne!(c.required[job], n.required[job], "{job}");
@@ -2222,7 +2276,16 @@ mod declared_tests {
         );
         assert!(lab.events("inputs.invalid").is_empty());
         let declared = declarations(&lab.store, &revision, &profile.definition);
-        for job in ["check", "solo"] {
+        let recipes = recipes(&profile).unwrap();
+        let passed = passed_keys(
+            &profile,
+            &recipes,
+            &declared,
+            &revision.project,
+            "certifying",
+        )
+        .unwrap();
+        for job in ["prep", "check", "solo"] {
             let action = lab.store.action(&candidate.required[job]).unwrap();
             let inputs = declared.identity(job).unwrap();
             assert_eq!(inputs["declared"]["schema"], SCHEMA);
@@ -2233,19 +2296,28 @@ mod declared_tests {
             );
             assert_eq!(
                 passed_key_of(&lab.store.db, &action.id).unwrap(),
-                Some(
-                    passed_key(
-                        &revision.project,
-                        &recipes(&profile).unwrap()[job],
-                        "certifying",
-                        1800,
-                        inputs
-                    )
-                    .unwrap()
-                )
+                passed[job],
+                "{job}"
             );
         }
-        for job in ["prep", "census"] {
+        // check's passed key folds in prep's (pw#11 adversary F1).
+        let check = declared.identity("check").unwrap();
+        let prep = passed["prep"].clone().unwrap();
+        assert_eq!(
+            passed["check"],
+            Some(
+                passed_key(
+                    &revision.project,
+                    &recipes["check"],
+                    "certifying",
+                    1800,
+                    check,
+                    &[prep]
+                )
+                .unwrap()
+            )
+        );
+        for job in ["census"] {
             let action = lab.store.action(&candidate.required[job]).unwrap();
             assert_eq!(action.declared_inputs, None, "{job}");
             assert_eq!(passed_key_of(&lab.store.db, &action.id).unwrap(), None);
@@ -2262,9 +2334,9 @@ mod declared_tests {
         let outside = lab.commit(&[("README", Some("changed"))]);
         let b = lab.submit(&outside, &profile);
         let check = lab.store.action(&b.required["check"]).unwrap();
-        // The reused pass consumed the earlier candidate's `prep`.
+        // The reused pass consumed the earlier candidate's `prep`, itself reused under its passed key.
         assert_eq!(check.dependencies, [a.required["prep"].clone()]);
-        assert_ne!(b.required["prep"], a.required["prep"]);
+        assert_eq!(b.reused["prep"].action, a.required["prep"]);
         lab.pass_all(&b);
         review(&mut lab.store, &outside.id, "reviewer").unwrap();
         let refused = |lab: &mut Lab| {
@@ -2305,7 +2377,7 @@ mod declared_tests {
         assert_eq!(receipt["reused"], json!(b.reused["check"]));
         assert_eq!(receipt["audit"], AUDIT);
         assert_eq!(certificate["receipts"]["solo"]["route"], "reused");
-        assert_eq!(certificate["receipts"]["prep"]["route"], "own");
+        assert_eq!(certificate["receipts"]["prep"]["route"], "reused");
     }
 
     #[test]
@@ -2482,5 +2554,58 @@ mod declared_tests {
         )
         .unwrap();
         assert!(register(&mut lab.store, &path).is_err());
+    }
+
+    #[test]
+    fn a_dependencys_input_change_reruns_its_declared_dependents() {
+        // pw#11 adversary F1: a dependency's output is an input of its dependents, so a dependency's
+        // passed key folds into theirs, and a commit-keyed dependency gives them none.
+        let mut lab = Lab::new();
+        let declarations = r#"{"schema":"patchweft.inputs/1","common":["package.json"],
+            "jobs":{"prep":{"paths":["gen.txt"],"why":"prep copies gen.txt into its artifact"},
+                    "check":{"paths":["src/**"],"why":"check reads src and prep's artifact"}}}"#;
+        let profile = lab.register(
+            "deps",
+            json!([
+                job("prep", "declared", &[]),
+                job("check", "declared", &["prep"])
+            ]),
+        );
+        let first = lab.commit(&[
+            (FILE, Some(declarations)),
+            ("package.json", Some("{}")),
+            ("gen.txt", Some("ok")),
+            ("src/a.ts", Some("a\n")),
+        ]);
+        let a = lab.submit(&first, &profile);
+        lab.pass_all(&a);
+        let outside = lab.commit(&[("README", Some("x"))]);
+        let b = lab.submit(&outside, &profile);
+        assert_eq!(
+            b.reused["check"].action, a.required["check"],
+            "nothing check depends on changed"
+        );
+        let generated = lab.commit(&[("gen.txt", Some("fail"))]);
+        let c = lab.submit(&generated, &profile);
+        assert!(!c.reused.contains_key("prep"));
+        assert!(
+            !c.reused.contains_key("check"),
+            "prep's inputs changed, so check's passed key changed"
+        );
+        let inflight = lab.register(
+            "inflight-prep",
+            json!([
+                job("prep", "inflight", &[]),
+                job("check", "declared", &["prep"])
+            ]),
+        );
+        let d = lab.submit(&first, &inflight);
+        lab.pass_all(&d);
+        let later = lab.commit(&[("README", Some("y"))]);
+        let e = lab.submit(&later, &inflight);
+        assert!(
+            !e.reused.contains_key("check"),
+            "a commit-keyed dependency gives its dependents no passed key"
+        );
     }
 }
