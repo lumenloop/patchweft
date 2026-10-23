@@ -3583,6 +3583,44 @@ mod tests {
     }
 
     #[test]
+    fn the_claim_loop_exempts_the_listeners_of_its_live_supervisors() {
+        // pw#9's PASS P3-1: declining() must hand the check this executor's live supervisors. Given
+        // none, mauve would refuse every claim while a Vitest shard's server listens. Real /proc,
+        // allowing every listener on this host except the probe's own.
+        let temp = tempfile::tempdir().unwrap();
+        let fake = fake(temp.path());
+        let (root, control) = (fake.root.clone(), fake.control.clone());
+        let coordinator = coordinator(fake);
+        let (supervisor, socket) = listening_child(r#"python3 -c "$1" & wait"#);
+        let others = || -> BTreeSet<u16> {
+            reachable_listeners(&|path| fs::read(path))
+                .unwrap()
+                .into_iter()
+                .filter(|(_, inode)| *inode != socket)
+                .map(|(listener, _)| listener.port())
+                .collect()
+        };
+        let coordinator = coordinator.guarded(Guards {
+            loopback: Some(others()),
+            ..Guards::default()
+        });
+        let refused = coordinator.declining(None);
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|reason| reason.ends_with(" not allowlisted")),
+            "an unrecorded process's listener is a host service: {refused:?}"
+        );
+        supervising(&root, &control, "a1", supervisor.id());
+        let coordinator = coordinator.guarded(Guards {
+            loopback: Some(others()),
+            ..Guards::default()
+        });
+        assert_eq!(coordinator.declining(None), None);
+        stop(supervisor);
+    }
+
+    #[test]
     fn owned_listeners_are_walked_again_when_the_supervisors_change() {
         // Gate P2-1 on pw#9: a socket is not its attempt's once its supervisor is gone (an orphan
         // keeps it open), so the cache is keyed on the live supervisors, and a new listener is
