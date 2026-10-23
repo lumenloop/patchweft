@@ -76,9 +76,9 @@ pub trait Transport: Send + Sync {
     /// Disposes of an attempt directory once its report was acknowledged.
     fn retire(&self, attempt: &Path, response: &CompleteResponse) -> Result<()>;
     /// Hourly: deletes what retire could not. Returns how many attempts still could not be
-    /// cleaned (foreign-owned files need an operator).
-    fn sweep(&self) -> Result<usize> {
-        Ok(0)
+    /// cleaned (foreign-owned files need an operator), or None when another sweep is running.
+    fn sweep(&self) -> Result<Option<usize>> {
+        Ok(None)
     }
     /// Bytes the calling thread downloaded through `source` and `dependency` since it last asked.
     fn transferred(&self) -> u64 {
@@ -223,12 +223,14 @@ impl Transport for LocalTransport {
         }
         Ok(())
     }
-    fn sweep(&self) -> Result<usize> {
-        let swept = sweep_job_trees(&self.store().map_err(|error| anyhow!(error))?)?;
+    fn sweep(&self) -> Result<Option<usize>> {
+        let Some(swept) = sweep_job_trees(&self.store().map_err(|error| anyhow!(error))?)? else {
+            return Ok(None);
+        };
         if swept["attempts"] != 0 || swept["failed"] != json!([]) {
             log(json!({"event":"job_trees_swept","executor":LOCAL,"result":swept}));
         }
-        Ok(swept["failed"].as_array().map_or(0, Vec::len))
+        Ok(Some(swept["failed"].as_array().map_or(0, Vec::len)))
     }
 }
 
@@ -245,6 +247,14 @@ static SWEEPING: Mutex<()> = Mutex::new(());
 /// returns it when there was anything to set aside.
 fn set_aside_job_trees(attempt: &Path) -> Result<Option<PathBuf>> {
     let discard = attempt.join(DISCARD);
+    // A job could plant `.discard` as a link: its trees must never be renamed out of the store.
+    if let Ok(metadata) = fs::symlink_metadata(&discard) {
+        ensure!(
+            metadata.is_dir(),
+            "{} is not a directory",
+            discard.display()
+        );
+    }
     let mut moved = false;
     for tree in JOB_TREES {
         let source = attempt.join(tree);
@@ -269,10 +279,14 @@ fn discard_job_trees(attempt: &Path) -> Result<()> {
 
 /// Deletes the job trees of every drained local attempt that still has them: attempts that finished
 /// before attempts were retired, or whose retire failed. `worker` runs it once at start.
-pub fn sweep_job_trees(store: &Store) -> Result<Value> {
-    let _sweeping = SWEEPING
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+/// None when another sweep holds the lock: the hourly round then skips instead of stalling the
+/// claim loop behind a long start sweep (gate P3-1 on pw#7).
+pub fn sweep_job_trees(store: &Store) -> Result<Option<Value>> {
+    let _sweeping = match SWEEPING.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+    };
     let ids: Vec<String> = {
         let mut stmt = store.db.prepare(
             "SELECT id FROM attempts WHERE drained=1 AND state NOT IN ('claimed','running')",
@@ -295,7 +309,7 @@ pub fn sweep_job_trees(store: &Store) -> Result<Value> {
             Err(error) => failed.push(json!({"attempt":id,"error":format!("{error:#}")})),
         }
     }
-    Ok(json!({"attempts":swept,"failed":failed}))
+    Ok(Some(json!({"attempts":swept,"failed":failed})))
 }
 
 pub struct Options {
@@ -866,7 +880,8 @@ impl<T: Transport> Coordinator<T> {
         }
         // Retire failures, and attempts settled later by recover or a drain report (gate P3-1).
         match self.transport.sweep() {
-            Ok(stuck) => self.lock().trees_stuck = stuck,
+            Ok(Some(stuck)) => self.lock().trees_stuck = stuck,
+            Ok(None) => {}
             Err(error) => log(json!({"event":"sweep_failed","executor":self.executor,
                                      "error":format!("{error:#}")})),
         }
@@ -2598,6 +2613,10 @@ mod tests {
             self.record(Call::Retire(name));
             Ok(())
         }
+        /// Two attempts whose job trees an operator must delete.
+        fn sweep(&self) -> Result<Option<usize>> {
+            Ok(Some(2))
+        }
     }
 
     fn profile(id: &str, engine: &str) -> RegisteredProfile {
@@ -3409,6 +3428,33 @@ mod tests {
     }
 
     #[test]
+    fn the_hourly_maintenance_sweeps_and_reports_what_it_could_not_delete() {
+        // Gate P3-2 on pw#7: maintain() runs the transport's sweep, and attempts it could not
+        // clean show in the disk-floor refusal, as the remote path's retained directories do.
+        let temp = tempfile::tempdir().unwrap();
+        let coordinator = coordinator(fake(temp.path())).guarded(Guards {
+            min_free: 1,
+            free_space: Arc::new(|_: &Path| Ok(0)),
+            ..Guards::default()
+        });
+        coordinator.maintain();
+        assert!(
+            !coordinator
+                .declining(Some(0))
+                .unwrap()
+                .contains("job trees"),
+            "within the hour"
+        );
+        coordinator.lock().maintained = Instant::now() - MAINTENANCE - Duration::from_secs(1);
+        coordinator.maintain();
+        let reason = coordinator.declining(Some(0)).unwrap();
+        assert!(
+            reason.contains("2 attempts' job trees could not be deleted"),
+            "{reason}"
+        );
+    }
+
+    #[test]
     fn the_worker_sweeps_job_trees_of_every_drained_attempt() {
         // Attempts finished before this version, or whose retire failed, are swept at start.
         let temp = tempfile::tempdir().unwrap();
@@ -3447,7 +3493,11 @@ mod tests {
         let aside = finished_attempt(temp.path(), "aside");
         set_aside_job_trees(&aside).unwrap();
         let swept = sweep_job_trees(&store).unwrap();
-        assert_eq!(swept, json!({"attempts":3,"failed":[]}));
+        assert_eq!(swept, Some(json!({"attempts":3,"failed":[]})));
+        // A sweep already running makes another skip rather than wait (gate P3-1 on pw#7).
+        let held = SWEEPING.lock().unwrap();
+        assert_eq!(sweep_job_trees(&store).unwrap(), None);
+        drop(held);
         for id in ["old", "red", "aside"] {
             assert!(
                 evidence_only(&temp.path().join("attempts").join(id)),
