@@ -1106,9 +1106,11 @@ fn executor_refuses_to_register_with_an_unlisted_loopback_listener() {
         .unwrap()
         .to_owned();
     assert!(
-        reason.starts_with("loopback listener ") && reason.ends_with(" not allowlisted"),
+        (reason.starts_with("loopback listener ") || reason.starts_with("wildcard listener "))
+            && reason.ends_with(" not allowlisted"),
         "{reason}"
     );
+    assert_eq!(lab.mindy()["observed"]["loopback"], "allow []");
     assert_eq!(lab.count("attempt.claimed"), 0);
     // Only the explicit opt-out lets the same executor work.
     assert_eq!(lab.drain_remote(), json!({"executor":"mindy","launched":1}));

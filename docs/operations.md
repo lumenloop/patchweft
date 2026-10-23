@@ -71,15 +71,18 @@ launching; a profile that does not match is refused and listed under
 `observed.refused` by `patchweft executors`, with `verified`, `last_seen`, the
 reported memory limit and free disk.
 
-Before registering and before every claim, a coordinator checks the host's loopback: jobs run
-natively, so they reach every loopback listener directly, whatever a Docker daemon exposes to
-containers. Every TCP listener on `127.0.0.0/8` or `::1` must be in
-`--loopback-allow PORT[,PORT…]`; otherwise the executor refuses all work and its record shows
-`refused: {"*": "loopback listener … not allowlisted"}`. Both `executor` and `worker` check by
-default; `worker --no-loopback-check` skips it, only for a host whose every loopback service may be
-reached by jobs. The check covers TCP listeners bound to loopback. A listener on a wildcard address
-(`0.0.0.0`, `::`) is reachable on the host's own addresses whatever this check says, so it is
-outside its model: keep such services off executor hosts or firewall them.
+Before registering and before every claim, a coordinator checks what jobs can reach: they run
+natively, so they reach every TCP listener on `127.0.0.0/8` or `::1`, and every listener on a
+wildcard address (`0.0.0.0`, `::`) at 127.0.0.1 with a loopback source, whatever a Docker daemon
+exposes to containers. A host firewall does not filter `lo`, so a service that binds a wildcard
+and trusts loopback is reachable from every job. Each such listener must be in
+`--loopback-allow PORT[,PORT…]`, unless the rootless Docker daemon's own `rootlesskit` (or a
+process under it) holds it: those are the ports it publishes for job containers. Otherwise the
+executor refuses all work and its record shows `refused: {"*": "… listener … not allowlisted"}`.
+Both `executor` and `worker` check by default; `--no-loopback-check` skips it, only for a host
+whose every reachable service may be reached by jobs. Each executor's record shows how it checks
+(`observed.loopback`: `off` or the allowlist). Run `ss -ltnH` for the host census, wildcard rows
+included.
 
 Attempts hold leases: 300 seconds by default for a remote executor and 3600 seconds
 for `local`, whose supervisors keep running while its worker is stopped
