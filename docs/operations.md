@@ -77,7 +77,10 @@ wildcard address (`0.0.0.0`, `::`) at 127.0.0.1 with a loopback source, whatever
 exposes to containers. A host firewall does not filter `lo`, so a service that binds a wildcard
 and trusts loopback is reachable from every job. Each such listener must be in
 `--loopback-allow PORT[,PORT…]`, unless the rootless Docker daemon's own `rootlesskit` (or a
-process under it) holds it: those are the ports it publishes for job containers. Otherwise the
+process under it) holds it, those being the ports it publishes for job containers, or one of
+the executor's own attempts does: a listener held by a process descending from a live supervisor
+in its ledger is the job's own, not a host service. Ownership is looked up again whenever the
+live supervisors change, so a listener left behind by a dead supervisor's orphan refuses. Otherwise the
 executor refuses all work and its record shows `refused: {"*": "… listener … not allowlisted"}`.
 Both `executor` and `worker` check by default; `--no-loopback-check` skips it, only for a host
 whose every reachable service may be reached by jobs. Each executor's record shows how it checks
