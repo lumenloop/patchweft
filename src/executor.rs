@@ -2297,6 +2297,12 @@ pub fn loopback_refusal(
     allow: &BTreeSet<u16>,
     exempt: &dyn Fn(&BTreeSet<u64>) -> BTreeSet<u64>,
 ) -> Option<String> {
+    if wsl_mirrored(read) {
+        return Some(
+            "WSL mirrored networking: Windows listeners are reachable at 127.0.0.1 and cannot be listed"
+                .into(),
+        );
+    }
     let unlisted: Vec<(SocketAddr, u64)> = match reachable_listeners(read) {
         Ok(listeners) => listeners
             .into_iter()
@@ -2312,13 +2318,35 @@ pub fn loopback_refusal(
         .into_iter()
         .find(|(_, inode)| !exempt.contains(inode))
         .map(|(listener, _)| {
-            let kind = if listener.ip().is_unspecified() {
+            let kind = if wildcard(listener.ip()) {
                 "wildcard"
             } else {
                 "loopback"
             };
             format!("{kind} listener {listener} not allowlisted")
         })
+}
+
+/// Whether this is WSL with mirrored networking (re-gate P2 on pw#8): the Windows host's listeners
+/// then answer at 127.0.0.1 without appearing in /proc/net/tcp, so no listing is complete.
+/// Mirrored mode shows as the `loopback0` interface.
+fn wsl_mirrored(read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) -> bool {
+    let wsl = read(Path::new("/proc/sys/kernel/osrelease")).is_ok_and(|release| {
+        String::from_utf8_lossy(&release)
+            .to_lowercase()
+            .contains("microsoft")
+    });
+    wsl && read(Path::new("/sys/class/net/loopback0/type")).is_ok()
+}
+
+/// An address listening on every interface: 0.0.0.0, ::, or ::ffff:0.0.0.0.
+fn wildcard(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_unspecified(),
+        IpAddr::V6(ip) => {
+            ip.is_unspecified() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_unspecified())
+        }
+    }
 }
 
 /// Where the rootless Docker daemon jobs use keeps its state: beside the socket `DOCKER_HOST`
@@ -3599,6 +3627,98 @@ mod tests {
             BTreeSet::from([7])
         );
         assert_eq!(walks.get(), 3);
+    }
+
+    #[test]
+    fn wsl_mirrored_networking_refuses_because_windows_listeners_cannot_be_listed() {
+        // Re-gate P2 on pw#8 (robin): Windows' SMB, RDP and others answer at 127.0.0.1 but are
+        // not in /proc/net/tcp, so the table is incomplete by construction.
+        let mut files = host(None);
+        let wsl = b"6.18.54.1-microsoft-standard-WSL2\n".to_vec();
+        files.insert("/proc/sys/kernel/osrelease".into(), wsl.clone());
+        assert_eq!(
+            refusal(&files, &[22, 53, 80, 631, 2375]),
+            None,
+            "WSL with NAT networking"
+        );
+        files.insert("/sys/class/net/loopback0/type".into(), b"772\n".to_vec());
+        assert_eq!(
+            refusal(&files, &[22, 53, 80, 631, 2375]).as_deref(),
+            Some(
+                "WSL mirrored networking: Windows listeners are reachable at 127.0.0.1 and cannot be listed"
+            )
+        );
+        // loopback0 alone, outside WSL, is not mirrored networking.
+        files.insert(
+            "/proc/sys/kernel/osrelease".into(),
+            b"6.8.0-136-generic\n".to_vec(),
+        );
+        assert_eq!(refusal(&files, &[22, 53, 80, 631, 2375]), None);
+    }
+
+    #[test]
+    fn a_v4_mapped_wildcard_counts_as_a_wildcard() {
+        // Re-gate P3-2 on pw#8: [::ffff:0.0.0.0]:8080 listens on every IPv4 address.
+        let mut files = host(None);
+        files.insert(
+            "/proc/net/tcp6".into(),
+            format!("{}   0: 0000000000000000FFFF000000000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 31007 1 0000000000000000 100 0 0 10 0\n",
+                    TCP6.lines().next().unwrap().to_owned() + "\n")
+            .into_bytes(),
+        );
+        assert_eq!(
+            refusal(&files, &[22, 53, 2375]).as_deref(),
+            Some("wildcard listener [::ffff:0.0.0.0]:8080 not allowlisted")
+        );
+    }
+
+    #[test]
+    fn only_a_rootlesskit_parent_of_child_pid_exempts_its_tree() {
+        // Re-gate P3-1 on pw#8: a reused pid or a garbage record must never exempt an unrelated
+        // tree (systemd --user, say).
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("dockerd-rootless");
+        fs::create_dir_all(&state).unwrap();
+        // The impostor's tree holds a real listener, so a wrong exemption would show.
+        let listener = "import socket,time\ns=socket.socket()\ns.bind(('0.0.0.0',0))\ns.listen()\nprint('ready', flush=True)\ntime.sleep(60)";
+        let mut impostor = Command::new("/bin/bash")
+            .arg("-c")
+            .arg(r#"exec -a notrootlesskit /bin/bash -c 'sleep 60 & echo $! > "$0/child_pid"; python3 -c "$1" & wait' "$1" "$2""#)
+            .arg("bash")
+            .arg(&state)
+            .arg(listener)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(impostor.stdout.as_mut().unwrap()),
+            &mut ready,
+        )
+        .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        assert!(
+            !sockets_held_by(&[impostor.id()]).is_empty(),
+            "the impostor holds a listener"
+        );
+        assert!(
+            rootless_sockets(Some(&state)).is_empty(),
+            "a parent not named rootlesskit"
+        );
+        for garbage in ["abc", "", "4294967295", "1"] {
+            fs::write(state.join("child_pid"), garbage).unwrap();
+            assert!(
+                rootless_sockets(Some(&state)).is_empty(),
+                "child_pid {garbage:?}"
+            );
+        }
+        for pid in worker::descendants_of(&[impostor.id()]) {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+        impostor.kill().unwrap();
+        let _ = impostor.wait();
     }
 
     #[test]
