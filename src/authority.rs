@@ -351,7 +351,7 @@ pub fn claim_for(
     request: &ClaimRequest,
 ) -> Result<ClaimResponse, AuthorityError> {
     let key = &request.claim_key;
-    if key.is_empty() || key.len() > 128 || !key.bytes().all(|c| c.is_ascii_graphic()) {
+    if !api::visible_key(key) {
         return Err(AuthorityError::Invalid(
             "A 1–128 byte visible-ASCII claim key is required.".into(),
         ));
@@ -1229,6 +1229,154 @@ pub fn confirm_drained(store: &mut Store, id: &str) -> Result<()> {
     }
     transaction.commit()?;
     Ok(())
+}
+
+/// `executor-set`: unset fields keep their value; a placement list replaces the current one.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigureRequest {
+    pub slots: Option<u32>,
+    pub memory_mb: Option<u32>,
+    pub lease_seconds: Option<u64>,
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+    /// Back to the default placement before `allow` and `deny` apply.
+    pub clear_placement: bool,
+}
+
+/// MUST-FIX 8: a remote executor runs only the jobs an operator placed on it by name. The local
+/// executor admits every job unless it is given an allowlist.
+fn default_placement(id: &str) -> Placement {
+    Placement {
+        allow: (id != LOCAL).then(BTreeSet::new),
+        deny: BTreeSet::new(),
+    }
+}
+
+/// Creates or updates an executor. The local executor's slots and memory are the store's
+/// settings, the budget `init`, `status` and profile registration already read.
+pub fn configure(store: &mut Store, id: &str, request: &ConfigureRequest) -> Result<Value> {
+    ensure!(!id.is_empty() && id.len() <= 128, "invalid executor name");
+    if let Some(slots) = request.slots {
+        ensure!((1..=64).contains(&slots), "slots must be 1–64");
+    }
+    if let Some(memory_mb) = request.memory_mb {
+        ensure!(memory_mb >= 128, "memory must be at least 128 MiB");
+    }
+    if let Some(lease_seconds) = request.lease_seconds {
+        ensure!(
+            (3..=3600).contains(&lease_seconds),
+            "lease must be 3–3600 seconds"
+        );
+    }
+    ensure!(
+        request
+            .allow
+            .iter()
+            .chain(&request.deny)
+            .all(|job| !job.is_empty()),
+        "job names must be nonempty"
+    );
+    prepare(&store.db)?;
+    let transaction = store.transaction()?;
+    let existing = load(&transaction, id)?;
+    let created = existing.is_none();
+    let mut record = match existing {
+        Some(record) => record,
+        None => {
+            ensure!(
+                request.slots.is_some() && request.memory_mb.is_some(),
+                "a new executor needs --slots and --memory-mb"
+            );
+            ExecutorRecord {
+                placement: default_placement(id),
+                ..default_record(id)
+            }
+        }
+    };
+    if id == LOCAL {
+        for (key, value) in [("slots", request.slots), ("memory_mb", request.memory_mb)] {
+            if let Some(value) = value {
+                transaction.execute(
+                    "UPDATE settings SET value=? WHERE key=?",
+                    params![value.to_string(), key],
+                )?;
+            }
+        }
+    } else {
+        record.slots = request.slots.or(record.slots);
+        record.memory_mb = request.memory_mb.or(record.memory_mb);
+    }
+    record.lease_seconds = request.lease_seconds.unwrap_or(record.lease_seconds);
+    if request.clear_placement {
+        record.placement = default_placement(id);
+    }
+    if !request.allow.is_empty() {
+        record.placement.allow = Some(request.allow.iter().cloned().collect());
+    }
+    if !request.deny.is_empty() {
+        record.placement.deny = request.deny.iter().cloned().collect();
+    }
+    save(&transaction, &record)?;
+    let view = view(&transaction, &record)?;
+    let configured = &view["configured"];
+    event(
+        &transaction,
+        "executor.configured",
+        id,
+        &json!({"created":created,"slots":configured["slots"],
+                "memory_mb":configured["memory_mb"],"lease_seconds":record.lease_seconds,
+                "placement":record.placement}),
+    )?;
+    transaction.commit()?;
+    Ok(view)
+}
+
+/// Every executor with its budget, what it holds and what its coordinator last reported.
+pub fn list(store: &Store) -> Result<Value> {
+    prepare(&store.db)?;
+    let records: Vec<ExecutorRecord> = {
+        let mut stmt = store.db.prepare("SELECT body FROM executors ORDER BY id")?;
+        stmt.query_map([], |r| r.get::<_, String>(0))?
+            .map(|body| Ok(serde_json::from_str(&body?)?))
+            .collect::<Result<_>>()?
+    };
+    Ok(Value::Array(
+        records
+            .iter()
+            .map(|record| view(&store.db, record))
+            .collect::<Result<_>>()?,
+    ))
+}
+
+fn view(db: &Connection, record: &ExecutorRecord) -> Result<Value> {
+    let (slots, memory_mb) = if record.id == LOCAL {
+        let (slots, memory_mb) = store::capacity(db)?;
+        (Some(slots), Some(memory_mb))
+    } else {
+        (record.slots, record.memory_mb)
+    };
+    // A record written without capacity is still listed; it can claim nothing.
+    let effective = capacity(db, record).ok();
+    let held = held(db, &record.id)?;
+    let attempts: Vec<Value> = {
+        let mut stmt = db.prepare(&format!(
+            "SELECT id,state,action FROM attempts WHERE drained=0 AND {EXECUTOR}=? ORDER BY rowid"
+        ))?;
+        stmt.query_map([&record.id], |r| {
+            Ok(
+                json!({"id":r.get::<_, String>(0)?,"state":r.get::<_, String>(1)?,
+                      "action":r.get::<_, String>(2)?}),
+            )
+        })?
+        .collect::<rusqlite::Result<_>>()?
+    };
+    Ok(
+        json!({"id":record.id,"configured":{"slots":slots,"memory_mb":memory_mb},
+        "effective":effective,
+        "held":{"slots":held.slots,"memory_mb":held.memory_mb,"attempts":attempts},
+        "lease_seconds":record.lease_seconds,"placement":record.placement,
+        "observed":record.observed}),
+    )
 }
 
 #[cfg(test)]
@@ -3365,5 +3513,113 @@ mod tests {
         // The report itself is accepted as the executor gave it.
         assert_eq!(evidence["exit_code"], 0);
         assert_eq!(evidence["log_sha256"], json!(log.sha256));
+    }
+
+    #[test]
+    fn executor_without_placement_allowlist_claims_nothing() {
+        let (_root, mut store) = lab();
+        queue(
+            &store.db,
+            Queue {
+                id: "work",
+                ..Queue::default()
+            },
+        );
+        let fresh = ConfigureRequest {
+            slots: Some(2),
+            memory_mb: Some(2048),
+            ..ConfigureRequest::default()
+        };
+        let configured = configure(&mut store, "mindy", &fresh).unwrap();
+        assert_eq!(configured["placement"], json!({"allow":[],"deny":[]}));
+        let response = claim_for(&mut store, "mindy", &Scope::all(), &ask("k1", &["f-1"])).unwrap();
+        assert_eq!(claimed(&response), None);
+        assert!(response.unverified.is_empty());
+        assert_eq!(state(&store.db, "work"), "queued");
+        // The operator places jobs on a remote executor by name.
+        let allow = ConfigureRequest {
+            allow: vec!["test".into()],
+            ..ConfigureRequest::default()
+        };
+        configure(&mut store, "mindy", &allow).unwrap();
+        let response = claim_for(&mut store, "mindy", &Scope::all(), &ask("k2", &["f-1"])).unwrap();
+        assert_eq!(claimed(&response), Some("work"));
+        // Clearing placement closes a remote executor again; the local one admits every job.
+        let clear = ConfigureRequest {
+            clear_placement: true,
+            ..ConfigureRequest::default()
+        };
+        configure(&mut store, "mindy", &clear).unwrap();
+        let mindy = load(&store.db, "mindy").unwrap().unwrap();
+        assert_eq!(mindy.placement.allow, Some(BTreeSet::new()));
+        assert!(!mindy.placement.permits("test"));
+        configure(&mut store, LOCAL, &allow).unwrap();
+        configure(&mut store, LOCAL, &clear).unwrap();
+        let local = load(&store.db, LOCAL).unwrap().unwrap();
+        assert_eq!(local.placement, Placement::default());
+        queue(
+            &store.db,
+            Queue {
+                id: "local-work",
+                job: "build",
+                created: 2.0,
+                ..Queue::default()
+            },
+        );
+        let response = claim_for(&mut store, LOCAL, &Scope::all(), &ask("k3", &["f-1"])).unwrap();
+        assert_eq!(claimed(&response), Some("local-work"));
+        // Configuration never loses the executor's capacity or its observations.
+        assert_eq!(
+            (mindy.slots, mindy.memory_mb, mindy.lease_seconds),
+            (Some(2), Some(2048), DEFAULT_LEASE_SECONDS)
+        );
+        assert!(mindy.observed.last_seen.is_some());
+    }
+
+    #[test]
+    fn configure_validates_and_local_capacity_is_the_settings() {
+        let (_root, mut store) = empty();
+        let request = |slots, memory_mb, lease_seconds| ConfigureRequest {
+            slots,
+            memory_mb,
+            lease_seconds,
+            ..ConfigureRequest::default()
+        };
+        for (id, invalid) in [
+            ("mindy", request(Some(1), None, None)),
+            ("mindy", request(None, Some(1024), None)),
+            ("mindy", request(Some(0), Some(1024), None)),
+            ("mindy", request(Some(65), Some(1024), None)),
+            ("mindy", request(Some(1), Some(127), None)),
+            ("mindy", request(Some(1), Some(1024), Some(2))),
+            ("mindy", request(Some(1), Some(1024), Some(3601))),
+            ("", request(Some(1), Some(1024), None)),
+        ] {
+            assert!(
+                configure(&mut store, id, &invalid).is_err(),
+                "{id} {invalid:?}"
+            );
+        }
+        let mut blank = request(Some(1), Some(1024), None);
+        blank.deny = vec![String::new()];
+        assert!(configure(&mut store, "mindy", &blank).is_err());
+        assert!(load(&store.db, "mindy").unwrap().is_none());
+        configure(&mut store, "mindy", &request(Some(64), Some(128), Some(3))).unwrap();
+        configure(&mut store, LOCAL, &request(Some(2), Some(1536), Some(3600))).unwrap();
+        assert_eq!(store.capacity().unwrap(), (2, 1536));
+        let local = load(&store.db, LOCAL).unwrap().unwrap();
+        assert_eq!((local.slots, local.memory_mb), (None, None));
+        assert_eq!(local.lease_seconds, 3600);
+        let listed = list(&store).unwrap();
+        assert_eq!(listed[0]["id"], LOCAL);
+        assert_eq!(listed[0]["configured"], json!({"slots":2,"memory_mb":1536}));
+        assert_eq!(listed[1]["id"], "mindy");
+        assert_eq!(listed[1]["configured"], json!({"slots":64,"memory_mb":128}));
+        assert_eq!(listed[1]["lease_seconds"], 3);
+        let events = events(&store.db, "executor.configured");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "mindy");
+        assert_eq!(events[0].1["created"], true);
+        assert_eq!(events[1].1["slots"], 2);
     }
 }

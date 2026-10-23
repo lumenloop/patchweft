@@ -1,5 +1,5 @@
 use crate::{
-    api::{Command, MAX_BUNDLE, Query, TRANSFER_TIMEOUT_SECONDS},
+    api::{Command, MAX_BUNDLE, MAX_HAVES, Query, TRANSFER_TIMEOUT_SECONDS},
     mcp::Backend,
     source,
 };
@@ -170,13 +170,29 @@ impl Remote {
         Ok(actual)
     }
     pub fn bundle(&self, revision: &str, destination: &Path) -> Result<Value> {
+        self.bundle_since(revision, &[], destination)
+    }
+    /// A bundle of the revision without the history of `haves`, commits the caller holds. It
+    /// verifies only in a repository holding them, unless the service had to send everything.
+    pub fn bundle_since(
+        &self,
+        revision: &str,
+        haves: &[String],
+        destination: &Path,
+    ) -> Result<Value> {
         ensure!(crate::api::digest(revision, 64), "invalid revision ID");
-        let sha256 = self.download(
-            &format!("/v1/revisions/{revision}/bundle"),
-            destination,
-            None,
-            MAX_BUNDLE as u64,
-        )?;
+        ensure!(
+            haves.len() <= MAX_HAVES
+                && haves
+                    .iter()
+                    .all(|h| crate::api::digest(h, 40) || crate::api::digest(h, 64)),
+            "at most {MAX_HAVES} haves, each a full commit ID"
+        );
+        let mut path = format!("/v1/revisions/{revision}/bundle");
+        if !haves.is_empty() {
+            path = format!("{path}?have={}", haves.join(","));
+        }
+        let sha256 = self.download(&path, destination, None, MAX_BUNDLE as u64)?;
         Ok(json!({"revision":revision,"destination":destination,"sha256":sha256}))
     }
     pub fn deliver(&self, action: &str, destination: &Path) -> Result<Value> {

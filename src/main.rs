@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
-use patchweft::{api, client, engine, executor, http, mcp, source, store::Store, worker};
+use patchweft::{
+    api, authority, client, engine, executor, http, mcp, source, store::Store, worker,
+};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -145,6 +147,28 @@ enum Operation {
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
         heartbeat_seconds: u64,
     },
+    /// Register or reconfigure an executor. `local` sets the store's own budget; a remote
+    /// executor runs only the jobs placed on it with --allow-job.
+    ExecutorSet {
+        id: String,
+        #[arg(long)]
+        slots: Option<u32>,
+        #[arg(long)]
+        memory_mb: Option<u32>,
+        #[arg(long)]
+        lease_seconds: Option<u64>,
+        /// Replaces the jobs this executor may run.
+        #[arg(long)]
+        allow_job: Vec<String>,
+        /// Replaces the jobs this executor never runs; a denial wins over an allowance.
+        #[arg(long)]
+        deny_job: Vec<String>,
+        /// Reset placement before applying --allow-job and --deny-job.
+        #[arg(long)]
+        clear_placement: bool,
+    },
+    /// Show executors: budgets, held attempts, placement and their coordinators' reports.
+    Executors,
     /// Inspect exact source identities, action states and unmet prerequisites.
     Status { candidate: Option<String> },
     /// Wait for one candidate; a timeout or failed/blocked candidate returns a failing exit code.
@@ -435,6 +459,27 @@ fn run(cli: Cli) -> Result<Value> {
                 heartbeat: Duration::from_secs(heartbeat_seconds),
             },
         )?,
+        Operation::ExecutorSet {
+            id,
+            slots,
+            memory_mb,
+            lease_seconds,
+            allow_job,
+            deny_job,
+            clear_placement,
+        } => authority::configure(
+            &mut store,
+            &id,
+            &authority::ConfigureRequest {
+                slots,
+                memory_mb,
+                lease_seconds,
+                allow: allow_job,
+                deny: deny_job,
+                clear_placement,
+            },
+        )?,
+        Operation::Executors => authority::list(&store)?,
         Operation::Status { candidate } => match candidate {
             Some(candidate) => engine::candidate_status(&store, &candidate)?,
             None => engine::status(&store)?,

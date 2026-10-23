@@ -1345,3 +1345,878 @@ async fn submit_retain_from_is_project_scoped() {
     assert_eq!(body["result"]["retained_from"], source.id);
     assert_ne!(body["result"]["id"], source.id);
 }
+
+// Executors reach the authority through these routes (multi-host step 6).
+const MINDY: &str = "fixture-mindy-executor-credential-not-for-deployment";
+
+/// Grants `id` the lab profile on project `a` with `roles`, under `token`.
+fn executor_principal(lab: &Lab, id: &str, token: &str, roles: &[&str]) {
+    let store = Store::open(&lab.root).unwrap();
+    let principal = Principal {
+        id: id.into(),
+        projects: BTreeSet::from([lab.pa.clone()]),
+        profiles: BTreeSet::from([lab.profile.clone()]),
+        roles: roles.iter().map(|role| role.to_string()).collect(),
+        max_pending: 1024,
+    };
+    store
+        .db
+        .execute(
+            "INSERT INTO api_principals VALUES (?,?)",
+            rusqlite::params![id, serde_json::to_string(&principal).unwrap()],
+        )
+        .unwrap();
+    store
+        .db
+        .execute(
+            "INSERT INTO api_credentials VALUES (?,?)",
+            rusqlite::params![hash(token.as_bytes()), id],
+        )
+        .unwrap();
+}
+
+fn configure(lab: &Lab, id: &str, request: patchweft::authority::ConfigureRequest) -> Value {
+    patchweft::authority::configure(&mut Store::open(&lab.root).unwrap(), id, &request).unwrap()
+}
+
+/// mindy: an executor of project `a` with two slots, placed to run `dep`.
+fn register_mindy(lab: &Lab) {
+    executor_principal(lab, "mindy", MINDY, &["read", "execute"]);
+    configure(
+        lab,
+        "mindy",
+        patchweft::authority::ConfigureRequest {
+            slots: Some(2),
+            memory_mb: Some(2048),
+            allow: vec!["dep".into()],
+            ..Default::default()
+        },
+    );
+}
+
+fn queue_job(lab: &Lab, revision: &str, job: &str) -> String {
+    engine::request(
+        &mut Store::open(&lab.root).unwrap(),
+        revision,
+        &lab.profile,
+        job,
+        "lane",
+    )
+    .unwrap()
+    .id
+}
+
+async fn executor_post(lab: &Lab, route: &str, token: &str, body: Value) -> (StatusCode, Value) {
+    send(
+        lab.router(),
+        &format!("/v1/executor/{route}"),
+        body,
+        Some(token),
+        &[],
+    )
+    .await
+}
+
+/// Claims as mindy: (attempt, lease, action).
+async fn claim_as_mindy(lab: &Lab, key: &str) -> (String, String, String) {
+    let (status, body) = executor_post(
+        lab,
+        "claim",
+        MINDY,
+        json!({"claim_key":key,"verified":[lab.profile]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let claim = &body["result"]["claim"];
+    let text = |value: &Value| {
+        value
+            .as_str()
+            .unwrap_or_else(|| panic!("{body}"))
+            .to_owned()
+    };
+    (
+        text(&claim["attempt"]["id"]),
+        text(&claim["attempt"]["lease"]),
+        text(&claim["action"]["id"]),
+    )
+}
+
+fn upload_names(lab: &Lab, principal: &str) -> BTreeSet<String> {
+    fs::read_dir(lab.root.join("uploads").join(hash(principal.as_bytes())))
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn staging_dirs(lab: &Lab) -> usize {
+    fs::read_dir(&lab.root)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".incoming-")
+        })
+        .count()
+}
+
+fn attempt_row(lab: &Lab, attempt: &str) -> (String, bool, Value) {
+    let store = Store::open(&lab.root).unwrap();
+    let (state, drained, body): (String, bool, String) = store
+        .db
+        .query_row(
+            "SELECT state,drained,body FROM attempts WHERE id=?",
+            [attempt],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    (state, drained, serde_json::from_str(&body).unwrap())
+}
+
+#[tokio::test]
+async fn executor_routes_require_execute_role() {
+    let lab = Lab::new();
+    register_mindy(&lab);
+    let complete = json!({"attempt":"absent","lease":"l","outcome":"lost","exit_code":125,
+        "evidence":{},"drained":false});
+    let routes = [
+        ("profiles", json!({})),
+        ("claim", json!({"claim_key":"k"})),
+        ("renew", json!({"leases":[]})),
+        ("complete", complete),
+    ];
+    for (route, body) in &routes {
+        let (status, error) = executor_post(&lab, route, ALICE, body.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{route}: {error}");
+        assert_eq!(error["error"]["code"], "forbidden", "{route}");
+    }
+    // `local` is the store's own executor; a principal of that name never acts as one.
+    let local = "fixture-local-named-credential-not-for-deployment";
+    executor_principal(&lab, "local", local, &["read", "execute"]);
+    for (route, body) in &routes {
+        let (status, error) = executor_post(&lab, route, local, body.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{route}: {error}");
+    }
+    let (status, body) = executor_post(&lab, "profiles", MINDY, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["api_version"], "1");
+    assert_eq!(body["result"]["executor"], "mindy");
+    assert_eq!(body["result"]["lease_seconds"], 300);
+    // Executors upload their results; a reader may not upload at all.
+    lab.api.upload(MINDY, &hash(b"log\n"), b"log\n").unwrap();
+    let reader = "fixture-reader-credential-not-for-deployment";
+    executor_principal(&lab, "reader", reader, &["read"]);
+    assert_eq!(
+        lab.api
+            .upload(reader, &hash(b"log\n"), b"log\n")
+            .unwrap_err()
+            .status,
+        403
+    );
+}
+
+#[tokio::test]
+async fn unregistered_executor_is_refused() {
+    let lab = Lab::new();
+    let ghost = "fixture-ghost-executor-credential-not-for-deployment";
+    executor_principal(&lab, "ghost", ghost, &["read", "execute"]);
+    queue_job(&lab, &lab.a, "dep");
+    let complete = json!({"attempt":"absent","lease":"l","outcome":"lost","exit_code":125,
+        "evidence":{},"drained":false});
+    for (route, body) in [
+        ("profiles", json!({})),
+        ("claim", json!({"claim_key":"k","verified":[lab.profile]})),
+        ("renew", json!({"leases":[]})),
+        ("complete", complete),
+    ] {
+        let (status, error) = executor_post(&lab, route, ghost, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{route}: {error}");
+        assert_eq!(error["error"]["code"], "executor_unregistered", "{route}");
+    }
+    assert_eq!(lab.rows("attempts"), 0);
+    configure(
+        &lab,
+        "ghost",
+        patchweft::authority::ConfigureRequest {
+            slots: Some(1),
+            memory_mb: Some(1024),
+            ..Default::default()
+        },
+    );
+    let (status, body) = executor_post(&lab, "profiles", ghost, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["profiles"][0]["id"], lab.profile);
+}
+
+#[tokio::test]
+async fn verified_outside_profile_allowlist_is_forbidden() {
+    let lab = Lab::new();
+    register_mindy(&lab);
+    let action = queue_job(&lab, &lab.a, "dep");
+    let other = register(&lab, "other", "true");
+    let (status, error) = executor_post(
+        &lab,
+        "claim",
+        MINDY,
+        json!({"claim_key":"k1","verified":[lab.profile, other]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{error}");
+    assert_eq!(error["error"]["code"], "forbidden");
+    assert_eq!(lab.rows("attempts"), 0);
+    // Profiles are described only within the executor's allowlist.
+    let (status, body) =
+        executor_post(&lab, "profiles", MINDY, json!({"ids":[lab.profile, other]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let described: Vec<&str> = body["result"]["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(described, [lab.profile.as_str()]);
+    let (_, _, claimed) = claim_as_mindy(&lab, "k2").await;
+    assert_eq!(claimed, action);
+}
+
+#[tokio::test]
+async fn claims_never_cross_project_scope() {
+    let lab = Lab::new();
+    register_mindy(&lab);
+    let elsewhere = queue_job(&lab, &lab.b, "dep");
+    let here = queue_job(&lab, &lab.a, "dep");
+    let (attempt, lease, claimed) = claim_as_mindy(&lab, "k1").await;
+    assert_eq!(claimed, here);
+    // A free slot remains, but the earlier action belongs to a project mindy may not read.
+    let (status, body) = executor_post(
+        &lab,
+        "claim",
+        MINDY,
+        json!({"claim_key":"k2","verified":[lab.profile]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["claim"], Value::Null);
+    let store = Store::open(&lab.root).unwrap();
+    assert_eq!(
+        engine::action_state(&store.db, &elsewhere).unwrap(),
+        "queued"
+    );
+    // Scope is rechecked on every call: narrowing the grant fences work already held.
+    store
+        .db
+        .execute(
+            "UPDATE api_principals SET body=json_set(body,'$.projects',json(?)) WHERE id='mindy'",
+            [json!([lab.pb]).to_string()],
+        )
+        .unwrap();
+    let (status, body) = executor_post(
+        &lab,
+        "renew",
+        MINDY,
+        json!({"leases":[{"attempt":attempt,"lease":lease}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["leases"][0]["status"], "fenced");
+}
+
+#[test]
+fn grant_execute_requires_read_and_reserves_local() {
+    let lab = Lab::new();
+    let store = Store::open(&lab.root).unwrap();
+    let policy = |id: &str, roles: &[&str]| Principal {
+        id: id.into(),
+        projects: BTreeSet::from([lab.pa.clone()]),
+        profiles: BTreeSet::from([lab.profile.clone()]),
+        roles: roles.iter().map(|role| role.to_string()).collect(),
+        max_pending: 1,
+    };
+    let file = |name: &str| lab._temp.path().join(name);
+    let error = api::grant(&store, policy("mindy", &["execute"]), &file("execute-only"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("read"), "{error}");
+    assert!(!file("execute-only").exists());
+    let error = api::grant(
+        &store,
+        policy("local", &["read", "execute"]),
+        &file("local-executor"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("local"), "{error}");
+    assert!(!file("local-executor").exists());
+    let granted = api::grant(
+        &store,
+        policy("mindy", &["read", "execute"]),
+        &file("mindy"),
+    )
+    .unwrap();
+    assert_eq!(granted["principal"], "mindy");
+    // Only executors are kept away from the name.
+    api::grant(&store, policy("local", &["read"]), &file("local-reader")).unwrap();
+    assert!(api::grant(&store, policy("x", &["exec"]), &file("typo")).is_err());
+}
+
+/// An attempt claimed by mindy and registered as running: (attempt, lease, action).
+async fn running_on_mindy(lab: &Lab, key: &str) -> (String, String, String) {
+    queue_job(lab, &lab.a, "dep");
+    let (attempt, lease, action) = claim_as_mindy(lab, key).await;
+    let (status, body) = executor_post(
+        lab,
+        "renew",
+        MINDY,
+        json!({"leases":[{"attempt":attempt,"lease":lease,"started":{"pid":4242,"start":"1"}}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["leases"][0]["registered"], true, "{body}");
+    (attempt, lease, action)
+}
+
+/// A passing report naming a log and `dist/report.txt`.
+fn passing(attempt: &str, lease: &str, log: &[u8], artifact: &[u8]) -> Value {
+    let entry = json!({"sha256":hash(artifact),"mode":0o644,"bytes":artifact.len()});
+    json!({"attempt":attempt,"lease":lease,"outcome":"completed","exit_code":0,
+        "evidence":{"exit_code":0,"log_sha256":hash(log),"artifacts":{"dist/report.txt":entry},
+                    "host":"mindy","executor":"spoofed"},
+        "drained":true,"log":{"sha256":hash(log),"bytes":log.len()},
+        "artifacts":{"dist/report.txt":entry}})
+}
+
+#[tokio::test]
+async fn remote_complete_moves_uploads_and_checks_hashes() {
+    use std::os::unix::fs::PermissionsExt;
+    let lab = Lab::new();
+    register_mindy(&lab);
+    let (attempt, lease, action) = running_on_mindy(&lab, "k1").await;
+    let (log, artifact) = (b"remote log\n".as_slice(), b"artifact\n".as_slice());
+    let report = passing(&attempt, &lease, log, artifact);
+    lab.api.upload(MINDY, &hash(log), log).unwrap();
+    // An upload whose bytes no longer hash to its name is discarded and asked for again.
+    let area = lab.root.join("uploads").join(hash(b"mindy"));
+    fs::write(area.join(hash(artifact)), b"corrupt\n").unwrap();
+    let (status, error) = executor_post(&lab, "complete", MINDY, report.clone()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+    assert_eq!(error["error"]["code"], "missing_blob");
+    assert_eq!(error["error"]["detail"]["missing"], json!([hash(artifact)]));
+    assert_eq!(upload_names(&lab, "mindy"), BTreeSet::from([hash(log)]));
+    lab.api.upload(MINDY, &hash(artifact), artifact).unwrap();
+    // A declared length that differs from the upload is refused before anything moves.
+    let mut wrong = report.clone();
+    wrong["log"]["bytes"] = json!(log.len() + 1);
+    let (status, error) = executor_post(&lab, "complete", MINDY, wrong).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+    assert_eq!(error["error"]["code"], "invalid_evidence");
+    assert_eq!(upload_names(&lab, "mindy").len(), 2);
+    assert_eq!(attempt_row(&lab, &attempt).0, "running");
+
+    let (status, body) = executor_post(&lab, "complete", MINDY, report.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"],
+        json!({"attempt":attempt,"status":"recorded","state":"passed","drained":true,
+               "replayed":false,"drain_recorded":false})
+    );
+    // The uploads moved into the attempt directory: the executor's quota is free again.
+    assert!(upload_names(&lab, "mindy").is_empty());
+    assert_eq!(staging_dirs(&lab), 0);
+    let directory = lab.root.join("attempts").join(&attempt);
+    assert_eq!(fs::read(directory.join("output.log")).unwrap(), log);
+    let copy = directory.join("artifacts/dist/report.txt");
+    assert_eq!(fs::read(&copy).unwrap(), artifact);
+    assert_eq!(
+        fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
+        0o444
+    );
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(directory.join("artifacts.json")).unwrap()).unwrap();
+    assert_eq!(manifest, report["artifacts"]);
+    let (state, drained, body) = attempt_row(&lab, &attempt);
+    assert_eq!((state.as_str(), drained), ("passed", true));
+    assert_eq!(body["result"]["executor"], "mindy");
+    assert_eq!(body["result"]["host"], "mindy");
+    // The remote pass is delivered like a local one.
+    use std::io::Read;
+    let mut contents = Vec::new();
+    lab.api
+        .artifact(MINDY, &action, &hash(artifact))
+        .unwrap()
+        .read_to_end(&mut contents)
+        .unwrap();
+    assert_eq!(contents, artifact);
+    let log_page = lab
+        .api
+        .query(
+            MINDY,
+            &Query::Logs {
+                attempt: attempt.clone(),
+                offset: 0,
+                limit: 1024,
+            },
+        )
+        .unwrap();
+    assert_eq!(log_page["observed_bytes"], log.len());
+    // A lost response is answered again without its uploads; a different report is refused.
+    let (status, body) = executor_post(&lab, "complete", MINDY, report.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["replayed"], true);
+    let mut different = report;
+    different["drained"] = json!(false);
+    let (status, error) = executor_post(&lab, "complete", MINDY, different).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(error["error"]["code"], "completion_conflict");
+}
+
+#[tokio::test]
+async fn missing_blob_is_422_with_detail() {
+    let lab = Lab::new();
+    register_mindy(&lab);
+    let (attempt, lease, _) = running_on_mindy(&lab, "k1").await;
+    let log = b"uploaded log\n".as_slice();
+    lab.api.upload(MINDY, &hash(log), log).unwrap();
+    let mut report = passing(&attempt, &lease, log, b"never uploaded\n");
+    let other = json!({"sha256":hash(b"also absent\n"),"mode":0o644,"bytes":12});
+    report["artifacts"]["other.txt"] = other.clone();
+    report["evidence"]["artifacts"]["other.txt"] = other;
+    let (status, error) = executor_post(&lab, "complete", MINDY, report.clone()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+    assert_eq!(error["error"]["code"], "missing_blob");
+    let mut missing = vec![hash(b"never uploaded\n"), hash(b"also absent\n")];
+    missing.sort();
+    assert_eq!(error["error"]["detail"], json!({"missing":missing}));
+    // Nothing moved and nothing was recorded.
+    assert_eq!(upload_names(&lab, "mindy"), BTreeSet::from([hash(log)]));
+    assert_eq!(staging_dirs(&lab), 0);
+    assert_eq!(attempt_row(&lab, &attempt).0, "running");
+    assert!(!lab.root.join("attempts").join(&attempt).exists());
+    // Digests become file names, so a malformed one is refused outright.
+    report["log"]["sha256"] = json!("../../state.sqlite");
+    let (status, error) = executor_post(&lab, "complete", MINDY, report).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["error"]["code"], "invalid");
+}
+
+#[tokio::test]
+async fn fenced_complete_discards_staged_uploads() {
+    let lab = Lab::new();
+    register_mindy(&lab);
+    let (attempt, lease, action) = running_on_mindy(&lab, "k1").await;
+    let log = b"partial log\n".as_slice();
+    let lost = |lease: &str, drained: bool| {
+        json!({"attempt":attempt,"lease":lease,"outcome":"lost","exit_code":125,
+            "evidence":{"error":"supervisor exited without a result"},"drained":drained,
+            "log":{"sha256":hash(log),"bytes":log.len()}})
+    };
+    lab.api.upload(MINDY, &hash(log), log).unwrap();
+    // Another lease's report is refused without touching anything.
+    let (status, error) = executor_post(&lab, "complete", MINDY, lost("stale", true)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(error["error"]["code"], "attempt_fenced");
+    assert_eq!(upload_names(&lab, "mindy"), BTreeSet::from([hash(log)]));
+    // The lease lapses: the attempt is interrupted and stays undrained.
+    let mut store = Store::open(&lab.root).unwrap();
+    let expired = patchweft::authority::expire(&mut store, patchweft::now() + 1e6, 0.0).unwrap();
+    assert_eq!(expired, std::slice::from_ref(&attempt));
+    // A late result is never recorded, and its uploads are consumed rather than kept.
+    let (status, error) = executor_post(&lab, "complete", MINDY, lost(&lease, false)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(error["error"]["code"], "attempt_fenced");
+    assert!(upload_names(&lab, "mindy").is_empty());
+    assert_eq!(staging_dirs(&lab), 0);
+    assert!(!lab.root.join("attempts").join(&attempt).exists());
+    assert!(!attempt_row(&lab, &attempt).1);
+    // A drain report is still accepted (A2), and its uploads are discarded too.
+    lab.api.upload(MINDY, &hash(log), log).unwrap();
+    let (status, body) = executor_post(&lab, "complete", MINDY, lost(&lease, true)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["status"], "fenced");
+    assert_eq!(body["result"]["drain_recorded"], true);
+    assert!(upload_names(&lab, "mindy").is_empty());
+    assert_eq!(staging_dirs(&lab), 0);
+    assert!(!lab.root.join("attempts").join(&attempt).exists());
+    let (state, drained, body) = attempt_row(&lab, &attempt);
+    assert_eq!((state.as_str(), drained), ("interrupted", true));
+    assert_eq!(body["result"], Value::Null);
+    assert_eq!(
+        engine::action_state(&store.db, &action).unwrap(),
+        "interrupted"
+    );
+}
+
+#[test]
+fn stale_uploads_and_staging_are_purged() {
+    use std::time::{Duration, SystemTime};
+    let lab = Lab::new();
+    let now = SystemTime::now();
+    let aged = |path: &Path, age: Duration| {
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(now - age)
+            .unwrap();
+    };
+    let hour = Duration::from_secs(3600);
+    let mut kept = vec![];
+    let mut purged = vec![];
+    for principal in ["mindy", "alice"] {
+        let area = lab.root.join("uploads").join(hash(principal.as_bytes()));
+        fs::create_dir_all(&area).unwrap();
+        for (name, age) in [("old", 25 * hour), ("fresh", 23 * hour)] {
+            let path = area.join(hash(format!("{principal}{name}").as_bytes()));
+            fs::write(&path, name).unwrap();
+            aged(&path, age);
+            if name == "old" {
+                purged.push(path)
+            } else {
+                kept.push(path)
+            }
+        }
+    }
+    for (name, age) in [
+        (".incoming-old", 2 * hour),
+        (".incoming-stale-old", 2 * hour),
+        (".incoming-fresh", hour / 2),
+    ] {
+        let path = lab.root.join(name);
+        fs::create_dir_all(path.join("artifacts")).unwrap();
+        fs::write(path.join("output.log"), "log").unwrap();
+        aged(&path, age);
+        if name.ends_with("old") {
+            purged.push(path)
+        } else {
+            kept.push(path)
+        }
+    }
+    assert_eq!(api::purge(&lab.root, now).unwrap(), purged.len());
+    for path in &purged {
+        assert!(!path.exists(), "{}", path.display());
+    }
+    for path in &kept {
+        assert!(path.exists(), "{}", path.display());
+    }
+    // Nothing else in the store is touched.
+    assert!(lab.root.join("state.sqlite").exists());
+    assert_eq!(api::purge(&lab.root, now).unwrap(), 0);
+}
+
+fn cli(lab: &Lab, args: &[&str]) -> std::process::Output {
+    Process::new(env!("CARGO_BIN_EXE_patchweft"))
+        .arg("--state")
+        .arg(&lab.root)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn cli_value(lab: &Lab, args: &[&str]) -> Value {
+    let output = cli(lab, args);
+    assert!(
+        output.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn executor_set_and_list_report_held_and_observed() {
+    let lab = Lab::new();
+    executor_principal(&lab, "mindy", MINDY, &["read", "execute"]);
+    let configured = cli_value(
+        &lab,
+        &[
+            "executor-set",
+            "mindy",
+            "--slots",
+            "2",
+            "--memory-mb",
+            "2048",
+            "--lease-seconds",
+            "30",
+            "--allow-job",
+            "dep",
+            "--deny-job",
+            "root",
+        ],
+    );
+    assert_eq!(configured["id"], "mindy");
+    assert_eq!(
+        configured["configured"],
+        json!({"slots":2,"memory_mb":2048})
+    );
+    assert_eq!(configured["lease_seconds"], 30);
+    assert_eq!(
+        configured["placement"],
+        json!({"allow":["dep"],"deny":["root"]})
+    );
+    assert_eq!(
+        configured["held"],
+        json!({"slots":0,"memory_mb":0,"attempts":[]})
+    );
+    for (args, message) in [
+        (&["executor-set", "fresh"][..], "slots"),
+        (&["executor-set", "mindy", "--slots", "0"][..], "slots"),
+        (&["executor-set", "mindy", "--slots", "65"][..], "slots"),
+        (
+            &["executor-set", "mindy", "--memory-mb", "64"][..],
+            "memory",
+        ),
+        (
+            &["executor-set", "mindy", "--lease-seconds", "2"][..],
+            "lease",
+        ),
+        (
+            &["executor-set", "mindy", "--lease-seconds", "3601"][..],
+            "lease",
+        ),
+    ] {
+        let output = cli(&lab, args);
+        assert!(!output.status.success(), "{args:?}");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(message), "{args:?}: {error}");
+    }
+    // The local executor's budget is the store's own settings.
+    let local = cli_value(
+        &lab,
+        &[
+            "executor-set",
+            "local",
+            "--slots",
+            "3",
+            "--memory-mb",
+            "3072",
+        ],
+    );
+    assert_eq!(local["configured"], json!({"slots":3,"memory_mb":3072}));
+    assert_eq!(
+        Store::open(&lab.root).unwrap().capacity().unwrap(),
+        (3, 3072)
+    );
+    queue_job(&lab, &lab.a, "dep");
+    let (status, body) = executor_post(
+        &lab,
+        "claim",
+        MINDY,
+        json!({"claim_key":"k1","verified":[lab.profile],"memory_limit_mb":1536,
+               "disk_free_mb":70000,"host":"mindy-host","engine":"e".repeat(64)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let attempt = body["result"]["claim"]["attempt"]["id"].clone();
+    let listed = cli_value(&lab, &["executors"]);
+    let ids: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["local", "mindy"]);
+    let mindy = &listed[1];
+    assert_eq!(mindy["configured"], json!({"slots":2,"memory_mb":2048}));
+    // The reported cgroup limit caps what the executor is given.
+    assert_eq!(mindy["effective"], json!({"slots":2,"memory_mb":1536}));
+    assert_eq!(mindy["held"]["slots"], 1);
+    assert_eq!(mindy["held"]["memory_mb"], 1024);
+    assert_eq!(mindy["held"]["attempts"][0]["id"], attempt);
+    assert_eq!(mindy["held"]["attempts"][0]["state"], "claimed");
+    let observed = &mindy["observed"];
+    assert!(observed["last_seen"].as_f64().is_some(), "{observed}");
+    assert_eq!(observed["verified"], json!([lab.profile]));
+    assert_eq!(observed["memory_limit_mb"], 1536);
+    assert_eq!(observed["disk_free_mb"], 70000);
+    assert_eq!(observed["host"], "mindy-host");
+    // Remote work never counts against the local budget.
+    assert_eq!(listed[0]["held"]["slots"], 0);
+    assert_eq!(listed[0]["effective"], json!({"slots":3,"memory_mb":3072}));
+    let events = Store::open(&lab.root).unwrap().events(0).unwrap();
+    let configured: Vec<&str> = events
+        .iter()
+        .filter(|e| e["kind"] == "executor.configured")
+        .map(|e| e["subject"].as_str().unwrap())
+        .collect();
+    assert_eq!(configured, ["mindy", "local"]);
+}
+
+// Incremental source bundles (multi-host step 7).
+
+/// Commits `contents` as `name` and imports it into project `a`: (revision, commit).
+fn commit_revision(lab: &Lab, name: &str, contents: &[u8]) -> (String, String) {
+    fs::write(lab.repo.join(name), contents).unwrap();
+    git(&lab.repo, &["add", name]);
+    git(&lab.repo, &["commit", "--quiet", "-m", name]);
+    let mut store = Store::open(&lab.root).unwrap();
+    let revision = source::import(&mut store, "a", &lab.repo, "HEAD", "fixture").unwrap();
+    (revision.id, revision.commit)
+}
+
+/// Hex text that compresses poorly, so bundle sizes track history.
+fn noise(bytes: usize) -> Vec<u8> {
+    (0..bytes / 64)
+        .flat_map(|i| hash(i.to_string().as_bytes()).into_bytes())
+        .collect()
+}
+
+fn verifies(repo: &Path, bundle: &Path) -> bool {
+    Process::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["bundle", "verify"])
+        .arg(bundle)
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+fn bare(lab: &Lab, name: &str) -> PathBuf {
+    let path = lab._temp.path().join(name);
+    git(
+        lab._temp.path(),
+        &["init", "--bare", "--quiet", path.to_str().unwrap()],
+    );
+    path
+}
+
+async fn get(lab: &Lab, uri: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let response = lab
+        .router()
+        .oneshot(
+            Request::get(uri)
+                .header("authorization", format!("Bearer {ALICE}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, headers) = (response.status(), response.headers().clone());
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, bytes.to_vec())
+}
+
+#[tokio::test]
+async fn incremental_bundle_needs_only_missing_history() {
+    let lab = Lab::new();
+    let (_, parent) = commit_revision(&lab, "large", &noise(256 * 1024));
+    // A mirror holding the parent, as an executor's would.
+    let holder = lab._temp.path().join("holder");
+    git(
+        lab._temp.path(),
+        &[
+            "clone",
+            "--bare",
+            "--quiet",
+            lab.repo.to_str().unwrap(),
+            holder.to_str().unwrap(),
+        ],
+    );
+    let (revision, commit) = commit_revision(&lab, "small", b"small change\n");
+    let path = format!("/v1/revisions/{revision}/bundle");
+    let (status, _, full) = get(&lab, &path).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, headers, incremental) = get(&lab, &format!("{path}?have={parent}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-content-sha256"], hash(&incremental).as_str());
+    assert!(
+        incremental.len() * 8 < full.len(),
+        "{} vs {}",
+        incremental.len(),
+        full.len()
+    );
+    let (full_path, incremental_path) = (
+        lab._temp.path().join("full.bundle"),
+        lab._temp.path().join("incremental.bundle"),
+    );
+    fs::write(&full_path, &full).unwrap();
+    fs::write(&incremental_path, &incremental).unwrap();
+    let empty = bare(&lab, "empty");
+    assert!(verifies(&empty, &full_path));
+    assert!(!verifies(&empty, &incremental_path));
+    assert!(verifies(&holder, &incremental_path));
+    git(
+        &holder,
+        &[
+            "fetch",
+            "--quiet",
+            incremental_path.to_str().unwrap(),
+            &format!("refs/patchweft/revisions/{revision}:refs/patchweft/revisions/{revision}"),
+        ],
+    );
+    git(
+        &holder,
+        &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+    );
+}
+
+#[test]
+fn unknown_haves_are_ignored() {
+    let lab = Lab::new();
+    let (_, parent) = commit_revision(&lab, "large", &noise(64 * 1024));
+    let (revision, _) = commit_revision(&lab, "small", b"small change\n");
+    let tree = git(&lab.repo, &["rev-parse", "HEAD^{tree}"]);
+    let empty = bare(&lab, "empty");
+    let (_full_dir, full) = lab.api.source_bundle(ALICE, &revision, &[]).unwrap();
+    let full_bytes = fs::metadata(&full).unwrap().len();
+    // Absent objects, a tree and a SHA-256-length name: none is a commit, so the bundle is whole.
+    let unknown = vec![
+        hash(b"never committed")[..40].to_owned(),
+        tree,
+        "f".repeat(64),
+    ];
+    let (_dir, ignored) = lab.api.source_bundle(ALICE, &revision, &unknown).unwrap();
+    assert!(verifies(&empty, &ignored));
+    // Known haves still count beside unknown ones.
+    let mixed = vec![unknown[0].clone(), parent];
+    let (_dir, partial) = lab.api.source_bundle(ALICE, &revision, &mixed).unwrap();
+    assert!(!verifies(&empty, &partial));
+    assert!(fs::metadata(&partial).unwrap().len() < full_bytes);
+}
+
+#[test]
+fn have_already_containing_revision_falls_back_to_full_bundle() {
+    let lab = Lab::new();
+    let (revision, commit) = commit_revision(&lab, "first", b"first\n");
+    let (_, later) = commit_revision(&lab, "second", b"second\n");
+    let empty = bare(&lab, "empty");
+    for have in [commit.clone(), later] {
+        let (_dir, bundle) = lab.api.source_bundle(ALICE, &revision, &[have]).unwrap();
+        assert!(verifies(&empty, &bundle));
+        let heads = git(&empty, &["bundle", "list-heads", bundle.to_str().unwrap()]);
+        assert!(heads.starts_with(&commit), "{heads}");
+    }
+}
+
+#[tokio::test]
+async fn invalid_have_is_400() {
+    let lab = Lab::new();
+    let path = format!("/v1/revisions/{}/bundle", lab.a);
+    let commit = git(&lab.repo, &["rev-parse", "HEAD"]);
+    let many = vec![commit.clone(); 33].join(",");
+    for query in [
+        "have=xyz".to_owned(),
+        format!("have={}", commit.to_uppercase()),
+        format!("have={}", &commit[..39]),
+        format!("have={commit},"),
+        "have=".to_owned(),
+        format!("have={many}"),
+    ] {
+        let (status, _, body) = get(&lab, &format!("{path}?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "invalid", "{query}");
+    }
+    let (status, _, _) = get(&lab, &format!("{path}?have={}", vec![commit; 32].join(","))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        lab.api
+            .source_bundle(ALICE, &lab.a, &["../HEAD".into()])
+            .unwrap_err()
+            .status,
+        400
+    );
+}
