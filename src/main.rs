@@ -55,6 +55,11 @@ enum Operation {
         #[arg(allow_negative_numbers = true)]
         priority: i64,
     },
+    /// Replace an existing principal's scope without rotating its credentials.
+    Policy {
+        #[arg(long)]
+        policy: PathBuf,
+    },
     /// Revoke all credentials for a principal.
     Revoke { principal: String },
     /// Use the remote API without exposing credential bytes in argv.
@@ -470,6 +475,9 @@ fn run(cli: Cli) -> Result<Value> {
             &credential_file,
         )?,
         Operation::Priority { owner, priority } => worker::set_priority(&store, &owner, priority)?,
+        Operation::Policy { policy } => {
+            api::update_policy(&store, serde_json::from_slice(&fs::read(policy)?)?)?
+        }
         Operation::Revoke { principal } => api::revoke(&store, &principal)?,
         Operation::Import {
             name,
