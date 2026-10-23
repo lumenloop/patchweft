@@ -173,6 +173,8 @@ pub struct ApiError {
     pub status: u16,
     pub code: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Value>,
 }
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -186,6 +188,7 @@ impl ApiError {
             status,
             code: code.into(),
             message: message.into(),
+            detail: None,
         }
     }
     pub(crate) fn internal(error: impl std::fmt::Display) -> Self {
@@ -235,6 +238,7 @@ pub struct Api {
 
 pub fn prepare(store: &Store) -> Result<()> {
     store.db.execute_batch(SCHEMA)?;
+    crate::authority::prepare(&store.db)?;
     store.db.execute(
         "INSERT OR IGNORE INTO api_settings VALUES ('version','1')",
         [],

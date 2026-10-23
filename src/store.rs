@@ -162,15 +162,7 @@ impl Store {
     }
 
     pub fn capacity(&self) -> Result<(u32, u32)> {
-        let get = |key| -> Result<u32> {
-            let value: String =
-                self.db
-                    .query_row("SELECT value FROM settings WHERE key=?", [key], |r| {
-                        r.get(0)
-                    })?;
-            Ok(value.parse()?)
-        };
-        Ok((get("slots")?, get("memory_mb")?))
+        capacity(&self.db)
     }
 
     pub fn revision(&self, id: &str) -> Result<Revision> {
@@ -212,6 +204,17 @@ impl Store {
         })
         .collect()
     }
+}
+
+/// The local executor's budget; also readable inside an open transaction.
+pub fn capacity(db: &Connection) -> Result<(u32, u32)> {
+    let get = |key| -> Result<u32> {
+        let value: String = db.query_row("SELECT value FROM settings WHERE key=?", [key], |r| {
+            r.get(0)
+        })?;
+        Ok(value.parse()?)
+    };
+    Ok((get("slots")?, get("memory_mb")?))
 }
 
 // The table identifiers below are internal constants, never accepted from a caller.

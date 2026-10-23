@@ -1,15 +1,16 @@
 use crate::{
+    authority::{self, Choice, Scope},
     engine, file_hash,
     model::*,
     now, source,
-    store::{Store, event, record},
+    store::{Store, event},
     unique,
 };
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::params;
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
@@ -96,67 +97,39 @@ fn reap_adopted(main: u32) {
 }
 
 pub fn claim(store: &mut Store) -> Result<Option<Attempt>> {
-    let capacity = store.capacity()?;
     let transaction = store.transaction()?;
-    let held: Vec<Attempt> = {
-        let mut stmt = transaction.prepare("SELECT body FROM attempts WHERE drained=0")?;
-        stmt.query_map([], |r| r.get::<_, String>(0))?
-            .map(|v| Ok(serde_json::from_str(&v?)?))
-            .collect::<Result<_>>()?
+    let local = authority::load(&transaction, authority::LOCAL)?
+        .context("local executor record missing")?;
+    let capacity = authority::capacity(&transaction, &local)?;
+    // `prepare` verifies the runtime of each claimed profile, so every registered one qualifies.
+    let verified: BTreeSet<String> = {
+        let mut stmt = transaction.prepare("SELECT id FROM profiles")?;
+        stmt.query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
     };
-    let used_slots: u32 = held.iter().map(|a| a.slots).sum();
-    let used_memory: u32 = held.iter().map(|a| a.memory_mb).sum();
-    let queued: Vec<Action> = {
-        let mut stmt = transaction
-            .prepare("SELECT body FROM actions WHERE state='queued' ORDER BY created,id")?;
-        stmt.query_map([], |r| r.get::<_, String>(0))?
-            .map(|v| Ok(serde_json::from_str(&v?)?))
-            .collect::<Result<_>>()?
-    };
-    let priorities = owner_priorities(&transaction)?;
-    let mut choices = Vec::new();
-    for action in queued {
-        if !engine::eligible(&transaction, &action)? {
-            continue;
-        }
-        let mut stmt = transaction
-            .prepare("SELECT DISTINCT owner FROM interests WHERE action=? AND active=1")?;
-        let owners: Vec<String> = stmt
-            .query_map([&action.id], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        for owner in owners {
-            let served = transaction
-                .query_row("SELECT last FROM dispatches WHERE owner=?", [&owner], |r| {
-                    r.get::<_, f64>(0)
-                })
-                .optional()?
-                .unwrap_or(0.0);
-            let priority = priorities.get(&owner).copied().unwrap_or(0);
-            choices.push((priority, served, action.created, owner, action.clone()));
-        }
-    }
-    // Higher operator priority first (a landing-ready train), then fair share between owners.
-    choices.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then(a.1.total_cmp(&b.1))
-            .then(a.2.total_cmp(&b.2))
-            .then(a.3.cmp(&b.3))
-    });
-    let Some((_, _, _, owner, action)) = choices.first() else {
+    let selection = authority::select(
+        &transaction,
+        &local,
+        &Scope::all(),
+        &verified,
+        &BTreeSet::new(),
+        capacity,
+    )?;
+    let Some(Choice {
+        owner,
+        action,
+        reservation,
+        timeout_seconds,
+    }) = selection.choice
+    else {
         return Ok(None);
     };
-    let profile: RegisteredProfile = record(&transaction, "profiles", &action.profile)?;
-    let job = engine::job(&profile, &action.job)?;
-    // Legacy actions carry neither field; their creating profile's job values apply.
-    let reservation = action.reservation.unwrap_or_else(|| Reservation::from(job));
-    let timeout_seconds = action
-        .identity
-        .as_ref()
-        .map_or(job.timeout_seconds, |i| i.timeout_seconds);
     // Drain for the next owner's action. Later tiny tasks cannot starve this reservation.
-    if used_slots + reservation.slots > capacity.0
-        || used_memory + reservation.memory_mb > capacity.1
-    {
+    if !authority::fits(
+        authority::held(&transaction, authority::LOCAL)?,
+        reservation,
+        capacity,
+    ) {
         return Ok(None);
     }
     let attempt = Attempt {
@@ -175,6 +148,12 @@ pub fn claim(store: &mut Store) -> Result<Option<Attempt>> {
         exit_code: None,
         result: None,
         timeout_seconds: Some(timeout_seconds),
+        executor: None,
+        lease: None,
+        lease_expires: None,
+        claim_key: None,
+        completion: None,
+        stop: None,
     };
     transaction.execute(
         "INSERT INTO attempts VALUES (?,?,'claimed',0,?)",
@@ -197,20 +176,6 @@ pub fn claim(store: &mut Store) -> Result<Option<Attempt>> {
     )?;
     transaction.commit()?;
     Ok(Some(attempt))
-}
-
-fn owner_priorities(db: &Connection) -> Result<BTreeMap<String, i64>> {
-    let exists: i64 = db.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='owner_priorities'",
-        [],
-        |r| r.get(0),
-    )?;
-    if exists == 0 {
-        return Ok(BTreeMap::new());
-    }
-    let mut stmt = db.prepare("SELECT owner, priority FROM owner_priorities")?;
-    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Operator scheduling priority for an owner; 0 (the default) removes it. Priority only orders
