@@ -580,7 +580,7 @@ async fn unavailable_artifacts_are_a_scoped_state_error_and_failed_logs_remain_r
             let output = Process::new(env!("CARGO_BIN_EXE_patchweft"))
                 .arg("--state")
                 .arg(&lab.root)
-                .args(["worker", "--drain"])
+                .args(["worker", "--drain", "--no-loopback-check"])
                 .output()
                 .unwrap();
             assert!(
@@ -1554,21 +1554,26 @@ async fn unregistered_executor_is_refused() {
 }
 
 #[tokio::test]
-async fn verified_outside_profile_allowlist_is_forbidden() {
+async fn verified_outside_profile_allowlist_is_ignored() {
+    // Gate P3-3: a narrowed grant narrows what is claimed; it does not refuse the executor,
+    // which would take a 403 for revocation and exit.
     let lab = Lab::new();
     register_mindy(&lab);
     let action = queue_job(&lab, &lab.a, "dep");
     let other = register(&lab, "other", "true");
-    let (status, error) = executor_post(
+    let (status, body) = executor_post(
         &lab,
         "claim",
         MINDY,
         json!({"claim_key":"k1","verified":[lab.profile, other]}),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{error}");
-    assert_eq!(error["error"]["code"], "forbidden");
-    assert_eq!(lab.rows("attempts"), 0);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["claim"]["action"]["id"],
+        json!(action),
+        "{body}"
+    );
     // Profiles are described only within the executor's allowlist.
     let (status, body) =
         executor_post(&lab, "profiles", MINDY, json!({"ids":[lab.profile, other]})).await;
@@ -1580,8 +1585,6 @@ async fn verified_outside_profile_allowlist_is_forbidden() {
         .map(|p| p["id"].as_str().unwrap())
         .collect();
     assert_eq!(described, [lab.profile.as_str()]);
-    let (_, _, claimed) = claim_as_mindy(&lab, "k2").await;
-    assert_eq!(claimed, action);
 }
 
 #[tokio::test]
@@ -1801,6 +1804,30 @@ async fn missing_blob_is_422_with_detail() {
     let (status, error) = executor_post(&lab, "complete", MINDY, report).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
     assert_eq!(error["error"]["code"], "invalid");
+}
+
+#[tokio::test]
+async fn a_complete_with_a_large_manifest_is_not_refused_for_its_size() {
+    // Review P2-3: the manifest travels twice, so the route takes more than the 2 MiB default.
+    let lab = Lab::new();
+    register_mindy(&lab);
+    let (attempt, lease, _) = running_on_mindy(&lab, "k1").await;
+    let artifacts: serde_json::Map<String, Value> = (0..30_000)
+        .map(|n| {
+            (
+                format!("dist/file-{n:05}.js"),
+                json!({"sha256":hash(format!("{n}").as_bytes()),"mode":0o644,"bytes":1}),
+            )
+        })
+        .collect();
+    let body = json!({"attempt":attempt,"lease":lease,"outcome":"completed","exit_code":0,
+        "evidence":{"exit_code":0,"reason":null,"artifacts":artifacts},"drained":true,
+        "artifacts":artifacts});
+    assert!(body.to_string().len() > 4 * 1024 * 1024);
+    let (status, error) = executor_post(&lab, "complete", MINDY, body).await;
+    // Refused for its missing uploads, not for its size.
+    assert_ne!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
+    assert_eq!(error["error"]["code"], "missing_blob", "{error}");
 }
 
 #[tokio::test]

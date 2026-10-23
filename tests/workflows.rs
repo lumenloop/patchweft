@@ -104,6 +104,10 @@ impl Lab {
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(AW);
         command.arg("--state").arg(&self.state).args(args);
+        // These jobs run no containers and this lab has no rootless daemon to inspect.
+        if args.first() == Some(&"worker") {
+            command.arg("--no-loopback-check");
+        }
         command
     }
     fn call(&self, args: &[&str]) -> Value {
@@ -2273,6 +2277,9 @@ fn supervisor_killed_before_command_drains_without_operator() {
     let control = lab.state.join("attempts").join(attempt).join("control");
     thread::sleep(Duration::from_millis(300));
     assert!(!control.join("command-started").exists());
+    // The held supervisor keeps the FIFO it opened; the next claim reads the real artifact.
+    fs::remove_file(&artifact).unwrap();
+    fs::write(&artifact, "built\n").unwrap();
     unsafe {
         assert_eq!(
             libc::kill(
@@ -2283,20 +2290,16 @@ fn supervisor_killed_before_command_drains_without_operator() {
         );
     }
     parsed(coordinator.wait_with_output().unwrap());
-    // Its command never started, so the coordinator reports it drained: no operator needed.
+    // Its command never started, so the coordinator reports it drained: no operator needed,
+    // and the action requeues instead of reddening the candidate (gate P3-2).
     assert_eq!(lab.row("attempts", attempt), ("interrupted".into(), true));
     let lost = lab.events_of("attempt.interrupted");
     assert_eq!(lost.len(), 1);
     assert_eq!(
         lost[0]["detail"],
         json!({"drained":true,"operator_confirmed":false,"reason":"supervisor-lost",
-               "executor":"local"})
+               "executor":"local","requeued":true})
     );
-    assert!(!lab.state.join("used").exists());
-    fs::remove_file(&artifact).unwrap();
-    fs::write(&artifact, "built\n").unwrap();
-    lab.call(&["retry", candidate["id"].as_str().unwrap()]);
-    lab.drain();
     assert_eq!(lab.state(&candidate), "passed");
     assert!(lab.state.join("used").exists());
 }

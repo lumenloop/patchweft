@@ -71,9 +71,13 @@ for your project, then register it:
 patchweft --state /path/to/state register profile.json
 patchweft --state /path/to/state submit --revision REVISION_ID \
   --profile PROFILE_ID --owner agent-a
-patchweft --state /path/to/state worker --drain
+patchweft --state /path/to/state worker --drain --no-loopback-check
 patchweft --state /path/to/state status CANDIDATE_ID
 ```
+
+`--no-loopback-check` is for a machine whose jobs run no containers. A host whose
+jobs use rootless Docker runs `worker` without it, so job containers can never reach
+an unlisted loopback service ([operations](operations.md)).
 
 Use IDs returned by the preceding commands. `worker --drain` exits when runnable
 work finishes. A long-running `worker` command also waits for future requests.

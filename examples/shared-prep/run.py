@@ -86,7 +86,7 @@ def main():
             "--job", "check-b", "--owner", "second-requester",
         )
         assert shared["id"] == candidate["required"]["check-b"], "outstanding work was duplicated"
-        call("worker", "--drain")
+        call("worker", "--drain", "--no-loopback-check")
         status = call("status", candidate["id"])
         assert status["state"] == "passed", json.dumps(status)
         events = call("events")

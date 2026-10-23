@@ -40,6 +40,8 @@ const REVERIFY: Duration = Duration::from_secs(600);
 const MATERIALIZE_PATIENCE: Duration = Duration::from_secs(300);
 const PUBLISH_RETRY: Duration = Duration::from_secs(1);
 const PUBLISH_RETRY_MAX: Duration = Duration::from_secs(60);
+/// Uploads again after `missing_blob` within one delivery before the publisher's backoff.
+const MISSING_BLOB_UPLOADS: u32 = 3;
 /// An upload quota still full after this long makes a report undeliverable (MUST-FIX 3).
 const QUOTA_PATIENCE: Duration = Duration::from_secs(30 * 60);
 /// Retained attempt directories past their retention are looked for this often.
@@ -712,10 +714,20 @@ impl<T: Transport> Coordinator<T> {
     fn declining(&self, free: Option<u64>) -> Option<String> {
         let floor = self.guards.min_free;
         let low = floor > 0 && free.is_none_or(|bytes| bytes < floor);
-        let reason = self
-            .guards
-            .loopback_refusal()
-            .or_else(|| low.then(|| format!("free space below the {} MiB floor", floor / MIB)));
+        let stuck = self.guards.disk.as_ref().map_or(0, |disk| disk.stuck());
+        let reason = self.guards.loopback_refusal().or_else(|| {
+            low.then(|| {
+                let mut reason = format!("free space below the {} MiB floor", floor / MIB);
+                if stuck > 0 {
+                    // Undeletable without an operator: say so where mauve can see it (gate P3-5).
+                    reason.push_str(&format!(
+                        "; {stuck} retained attempt directories could not be deleted (foreign-owned \
+                         files) and need an operator"
+                    ));
+                }
+                reason
+            })
+        });
         let mut state = self.lock();
         if low
             && state
@@ -967,13 +979,14 @@ impl<T: Transport> Coordinator<T> {
             state.partitioned = false;
             if let Some(lease_seconds) = lease_seconds {
                 // The server's lease is the one it expires by, so it is adopted even when shorter
-                // than three heartbeats; `partition` keeps a positive deadline (review P3-5).
+                // than three heartbeats; renewals then come every third of it (gate P3-1).
                 if self.options.heartbeat * 3 > Duration::from_secs(lease_seconds)
                     && state.lease_seconds != lease_seconds
                 {
-                    log(json!({"event":"lease_short","executor":self.executor,
+                    log(json!({"event":"heartbeat_adapted","executor":self.executor,
                                "lease_seconds":lease_seconds,
-                               "heartbeat_seconds":self.options.heartbeat.as_secs_f64()}));
+                               "heartbeat_seconds":(Duration::from_secs(lease_seconds) / 3)
+                                   .as_secs_f64()}));
                 }
                 state.lease_seconds = lease_seconds;
             }
@@ -1027,9 +1040,17 @@ impl<T: Transport> Coordinator<T> {
         }
     }
 
+    /// The renewal interval for a lease: the configured heartbeat, or a third of the lease when
+    /// the server shortened it, so a healthy host never runs out of margin (gate P3-1).
+    fn interval(&self, lease_seconds: u64) -> Duration {
+        self.options
+            .heartbeat
+            .min(Duration::from_secs(lease_seconds) / 3)
+    }
+
     /// The heartbeat thread: renews when due or woken, backing off while renewals fail.
     fn beat(&self) {
-        let mut delay = self.options.heartbeat;
+        let mut delay = self.interval(self.lock().lease_seconds);
         loop {
             {
                 let state = self.lock();
@@ -1042,13 +1063,16 @@ impl<T: Transport> Coordinator<T> {
                 }
                 state.wake = false;
             }
-            delay = match self.heartbeat_once() {
-                Ok(()) => self.options.heartbeat,
+            let renewed = self.heartbeat_once();
+            let lease_seconds = self.lock().lease_seconds;
+            let interval = self.interval(lease_seconds);
+            delay = match renewed {
+                Ok(()) => interval,
                 Err(error) => {
                     log(json!({"event":"renew_failed","executor":self.executor,
                                "error":format!("{error:#}")}));
-                    let cap = Duration::from_secs(self.lock().lease_seconds) / 4;
-                    (delay * 2).min(cap).max(self.options.heartbeat)
+                    let cap = Duration::from_secs(lease_seconds) / 4;
+                    (delay * 2).min(cap).max(interval)
                 }
             };
         }
@@ -1104,7 +1128,8 @@ impl<T: Transport> Coordinator<T> {
             let lease = Duration::from_secs(state.lease_seconds);
             // At most half the lease, so a lease shortened below three heartbeats while running
             // still leaves renewals time to land instead of stopping every job at once.
-            let margin = (self.options.heartbeat * 2).max(lease / 5).min(lease / 2);
+            let heartbeat = self.options.heartbeat.min(lease / 3);
+            let margin = (heartbeat * 2).max(lease / 5).min(lease / 2);
             if now <= state.last_renewal + lease.saturating_sub(margin) {
                 return;
             }
@@ -1871,7 +1896,7 @@ impl Transport for HttpTransport {
         }
         self.upload(&request.attempt, &blobs, None)?;
         let timeout = Some(Duration::from_secs(TRANSFER_TIMEOUT_SECONDS));
-        let mut uploaded_again = false;
+        let mut uploaded_again = 0;
         loop {
             match self.remote.executor("complete", request, timeout) {
                 Ok(response) => {
@@ -1879,12 +1904,15 @@ impl Transport for HttpTransport {
                     return Ok(response);
                 }
                 Err(error) => match missing_blobs(&error) {
-                    // Purged since it was uploaded: once more, then the publisher's backoff.
-                    Some(missing) if !uploaded_again => {
+                    // Purged or taken by a concurrent report since it was uploaded: upload again.
+                    Some(missing) if uploaded_again < MISSING_BLOB_UPLOADS => {
                         self.upload(&request.attempt, &blobs, Some(&missing))?;
-                        uploaded_again = true;
+                        uploaded_again += 1;
                     }
-                    _ => return Err(classify(error)),
+                    // Always recoverable by uploading, so never a reason to discard the result:
+                    // the publisher's backoff tries again (gate P3-4).
+                    Some(_) => return Err(TransportError::Transient(error)),
+                    None => return Err(classify(error)),
                 },
             }
         }
@@ -1943,6 +1971,11 @@ pub struct Disk {
     locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     /// Last use of entries whose file time could not be set.
     used: Mutex<BTreeMap<String, SystemTime>>,
+    /// Retained entries that could not be deleted (foreign-owned files): retried, logged once,
+    /// and named when the disk floor declines work, since only an operator can remove them.
+    stuck: Mutex<BTreeSet<String>>,
+    /// Deletes a retained entry; tests stand in a failing one for foreign-owned files.
+    remove: fn(&Path) -> Result<()>,
 }
 
 impl Disk {
@@ -1953,7 +1986,14 @@ impl Disk {
             retain,
             locks: Mutex::default(),
             used: Mutex::default(),
+            stuck: Mutex::default(),
+            remove: remove_tree,
         }
+    }
+
+    /// Retained entries an operator must remove.
+    pub fn stuck(&self) -> usize {
+        locked(&self.stuck).len()
     }
 
     fn cas(&self) -> PathBuf {
@@ -2105,13 +2145,18 @@ impl Disk {
                 .map(|modified| now.duration_since(modified).unwrap_or_default() > self.retain);
             match expired.map_err(anyhow::Error::from) {
                 Ok(false) => continue,
-                Ok(true) => match remove_tree(&entry.path()) {
+                Ok(true) => match (self.remove)(&entry.path()) {
                     Ok(()) => {
                         log(json!({"event":"retained_purged","attempt":name}));
+                        locked(&self.stuck).remove(&name);
                         purged.push(name);
                     }
-                    Err(error) => log(json!({"event":"retained_purge_failed","attempt":name,
-                                             "error":format!("{error:#}")})),
+                    Err(error) => {
+                        if locked(&self.stuck).insert(name.clone()) {
+                            log(json!({"event":"retained_purge_failed","attempt":name,
+                                       "error":format!("{error:#}")}));
+                        }
+                    }
                 },
                 Err(error) => log(json!({"event":"retained_purge_failed","attempt":name,
                                          "error":format!("{error:#}")})),
@@ -2770,6 +2815,28 @@ mod tests {
     }
 
     #[test]
+    fn a_shortened_lease_adapts_the_heartbeat_and_keeps_a_margin() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut fake = fake(temp.path());
+        fake.renewal = "unreachable";
+        let coordinator = coordinator(fake);
+        // Heartbeat 1 s: a 2 s lease is renewed every third of it, not every second (gate P3-1).
+        assert_eq!(coordinator.interval(2), Duration::from_secs(2) / 3);
+        assert_eq!(coordinator.interval(10), Duration::from_secs(1));
+        let supervisor = Live::new();
+        let control = launched(&coordinator, "a1", Some(&supervisor.identity()));
+        fs::write(control.join("registered"), "").unwrap();
+        assert!(coordinator.reconcile(false).unwrap().is_empty());
+        coordinator.lock().lease_seconds = 3;
+        let last = coordinator.lock().last_renewal;
+        // Lease 3 s: the margin max(2 × 1 s, 0.6 s) is capped at half the lease, 1.5 s.
+        coordinator.poll(last + Duration::from_millis(1_400));
+        assert!(!control.join("stop").exists());
+        coordinator.poll(last + Duration::from_millis(1_600));
+        assert!(control.join("stop").exists());
+    }
+
+    #[test]
     fn pending_claim_is_replayed_first() {
         let temp = tempfile::tempdir().unwrap();
         let fake = fake(temp.path());
@@ -3041,6 +3108,72 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn an_undeletable_retained_entry_does_not_stop_the_purge() {
+        // Review P2-2: a foreign-owned file inside one entry must not keep the others.
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path();
+        let now = SystemTime::now();
+        for name in ["a-foreign", "b-own"] {
+            let directory = work.join("retained").join(name);
+            fs::create_dir_all(&directory).unwrap();
+            File::open(&directory)
+                .unwrap()
+                .set_modified(now - Duration::from_secs(100 * 3600))
+                .unwrap();
+        }
+        let mut disk = Disk::new(work, u64::MAX, Duration::from_secs(72 * 3600));
+        disk.remove = |path| {
+            if path.ends_with("a-foreign") {
+                bail!("Operation not permitted (os error 1)")
+            }
+            remove_tree(path)
+        };
+        assert_eq!(disk.purge_retained(now).unwrap(), ["b-own"]);
+        assert_eq!(disk.stuck(), 1);
+        assert!(work.join("retained/a-foreign").exists());
+        // Retried later without erroring, and still counted for the operator.
+        assert!(disk.purge_retained(now).unwrap().is_empty());
+        assert_eq!(disk.stuck(), 1);
+    }
+
+    #[test]
+    fn only_content_matching_its_digest_enters_the_cache() {
+        // Review P3-8: a mismatched file is refused, so a cache hit can be trusted.
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path();
+        fs::create_dir_all(work.join("cas")).unwrap();
+        let disk = Disk::new(work, u64::MAX, Duration::from_secs(3600));
+        let file = work.join("artifact");
+        fs::write(&file, "content").unwrap();
+        let wrong = "0".repeat(64);
+        assert!(disk.adopt(&file, &wrong).is_err());
+        assert!(!work.join("cas").join(&wrong).exists());
+        let right = file_hash(&file).unwrap();
+        disk.adopt(&file, &right).unwrap();
+        assert!(work.join("cas").join(&right).exists());
+    }
+
+    #[test]
+    fn transient_materialize_failures_are_retried() {
+        // Review P2-1: a serve restart or full transfer permits are ridden out, not a red.
+        let temp = tempfile::tempdir().unwrap();
+        let coordinator = coordinator(fake(temp.path()));
+        let mut left = 2;
+        let fetched = coordinator.retrying(|| {
+            if left > 0 {
+                left -= 1;
+                Err(TransportError::Transient(anyhow::anyhow!("busy")))
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(fetched, Ok(7));
+        let permanent: Result<u8, String> =
+            coordinator.retrying(|| Err(TransportError::Permanent(anyhow::anyhow!("gone"))));
+        assert!(permanent.is_err());
     }
 
     #[test]

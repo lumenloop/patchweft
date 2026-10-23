@@ -5,7 +5,6 @@ use patchweft::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
     fs,
     net::SocketAddr,
     path::PathBuf,
@@ -152,10 +151,14 @@ enum Operation {
         /// Claims wait while less is free under the state directory.
         #[arg(long, default_value_t = 0)]
         min_free_gb: u64,
-        /// Refuse work while job containers can reach a host loopback listener on any other
-        /// port. Without ports, every such listener refuses; without the option, no check.
-        #[arg(long, value_delimiter = ',', num_args = 0..=1)]
-        loopback_allow: Option<Vec<u16>>,
+        /// Host loopback ports job containers may reach when the rootless Docker daemon exposes
+        /// host loopback; any other loopback listener refuses all work. Checked by default
+        /// (MUST-FIX 8), so it cannot regress silently.
+        #[arg(long, value_delimiter = ',')]
+        loopback_allow: Vec<u16>,
+        /// Skip the loopback check: only for hosts that run no job containers.
+        #[arg(long)]
+        no_loopback_check: bool,
     },
     /// Run a remote executor's coordinator against an API; --drain exits when all currently
     /// runnable work is finished. A second coordinator for the same work directory waits as a
@@ -519,6 +522,7 @@ fn run(cli: Cli) -> Result<Value> {
             heartbeat_seconds,
             min_free_gb,
             loopback_allow,
+            no_loopback_check,
         } => executor::local(
             &store,
             executor::Options {
@@ -528,7 +532,7 @@ fn run(cli: Cli) -> Result<Value> {
             },
             executor::Guards {
                 min_free: min_free_gb * GIB,
-                loopback: loopback_allow.map(BTreeSet::from_iter),
+                loopback: (!no_loopback_check).then(|| loopback_allow.into_iter().collect()),
                 ..executor::Guards::default()
             },
         )?,

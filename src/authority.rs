@@ -238,6 +238,11 @@ pub fn select(
         if reservation.slots > capacity.slots || reservation.memory_mb > capacity.memory_mb {
             continue;
         }
+        // A claim inlines its dependencies' manifests: one a remote executor could not read is
+        // never served remotely, so it cannot loop holding a slot; `local` reads none (P2-1).
+        if record.id != LOCAL && dependency_manifests(db, &action)? > api::MAX_CLAIM_MANIFESTS {
+            continue;
+        }
         let trusted = verified.contains(&action.profile);
         if !trusted && unverified.len() < MAX_UNVERIFIED && !unverified.contains(&action.profile) {
             unverified.push(action.profile.clone());
@@ -277,6 +282,23 @@ pub fn select(
         .filter(|(_, _, trusted, _)| *trusted)
         .map(|(.., choice)| choice);
     Ok(Selection { choice, unverified })
+}
+
+/// Bytes of the dependency manifests a claim of `action` would inline.
+fn dependency_manifests(db: &Connection, action: &Action) -> Result<u64> {
+    let mut total = 0;
+    for dependency in &action.dependencies {
+        let producer: Option<String> = db.query_row(
+            "SELECT attempt FROM actions WHERE id=?",
+            [dependency],
+            |r| r.get(0),
+        )?;
+        let Some(producer) = producer else { continue };
+        if let Some(evidence) = record::<Attempt>(db, "attempts", &producer)?.result {
+            total += serde_json::to_vec(&evidence["artifacts"])?.len() as u64;
+        }
+    }
+    Ok(total)
 }
 
 /// Legacy actions carry neither field; their creating profile's job values apply.
@@ -366,10 +388,14 @@ pub fn claim_for(
             "A 1–128 byte visible-ASCII claim key is required.".into(),
         ));
     }
-    let verified: BTreeSet<String> = request.verified.iter().cloned().collect();
-    if !verified.iter().all(|profile| scope.allows_profile(profile)) {
-        return Err(AuthorityError::Forbidden);
-    }
+    // A narrowed grant only narrows what can be claimed: verified profiles outside the scope are
+    // ignored rather than refused, so the executor keeps working instead of exiting (gate P3-3).
+    let verified: BTreeSet<String> = request
+        .verified
+        .iter()
+        .filter(|profile| scope.allows_profile(profile))
+        .cloned()
+        .collect();
     let transaction = store.transaction()?;
     let mut record = load(&transaction, executor)?.ok_or(AuthorityError::Unregistered)?;
     observe(&transaction, &mut record, request, verified.clone())?;
@@ -867,6 +893,47 @@ fn record_completion(
             drain_recorded: false,
         });
     }
+    // Still live but no longer in this credential's scope: its evidence is not trusted, but the
+    // capacity it holds is released and the action waits for an executor in scope (gate P3-3).
+    if holding(&transaction, scope, &attempt, &state)?.is_none()
+        && let Some((action, _)) = holding(&transaction, &Scope::all(), &attempt, &state)?
+    {
+        let action_state = if request.drained {
+            "queued"
+        } else {
+            "interrupted"
+        };
+        transaction.execute(
+            "UPDATE attempts SET state='interrupted',drained=? WHERE id=?",
+            params![request.drained, attempt.id],
+        )?;
+        if request.drained {
+            transaction.execute(
+                "UPDATE actions SET state='queued',attempt=NULL WHERE id=? AND attempt=?",
+                params![action.id, attempt.id],
+            )?;
+        } else {
+            transaction.execute(
+                "UPDATE actions SET state='interrupted' WHERE id=? AND attempt=?",
+                params![action.id, attempt.id],
+            )?;
+        }
+        event(
+            &transaction,
+            "attempt.out_of_scope",
+            &attempt.id,
+            &json!({"executor":executor,"drained":request.drained,"action":action_state}),
+        )?;
+        transaction.commit()?;
+        return Ok(CompleteResponse {
+            attempt: attempt.id,
+            status: "fenced".into(),
+            state: Some("interrupted".into()),
+            drained: request.drained,
+            replayed: false,
+            drain_recorded: request.drained,
+        });
+    }
     let Some((action, _)) = holding(&transaction, scope, &attempt, &state)? else {
         // A2: the holder of an expired lease may still report that its attempt drained.
         if state == "interrupted" && !drained && request.drained {
@@ -1000,6 +1067,9 @@ fn verified_evidence(
     Ok(evidence)
 }
 
+/// Not-started attempts an action may requeue before it waits for an operator (gate P3-2).
+const REQUEUE_BUDGET: i64 = 3;
+
 /// Stops after which the action may simply be retried: nothing about the revision failed.
 const INTERRUPTIONS: [&str; 4] = ["supervisor-stop", "partition", "fenced", "revoked"];
 
@@ -1024,6 +1094,14 @@ pub fn record_result(
     let evidence = &request.evidence;
     let reason = request.reason.as_deref();
     let executor = attempt.executor.as_deref().unwrap_or(LOCAL);
+    // Requeueing needs drained resources and a budget left: a failure that repeats on every host
+    // ends interrupted for an operator instead of looping.
+    let interrupted: i64 = db.query_row(
+        "SELECT COUNT(*) FROM attempts WHERE action=? AND state='interrupted'",
+        [&action.id],
+        |r| r.get(0),
+    )?;
+    let requeue = request.drained && interrupted < REQUEUE_BUDGET;
     let (state, action_state, kind, detail) = match request.outcome {
         Outcome::Completed => {
             let state = if request.exit_code == 0 {
@@ -1041,24 +1119,24 @@ pub fn record_result(
         Outcome::NotStarted => {
             let (state, action_state) = match reason {
                 Some("no-requesters") => ("canceled", "canceled"),
-                // Tool drift on one host says nothing about the revision: the action waits.
-                Some("runtime-mismatch") => ("interrupted", "queued"),
-                // Nothing of the attempt ran, so an infrastructure failure (materialize, launch,
-                // registration, a lost coordinator) says nothing about the revision either: the
-                // action waits for another claim. Undrained resources keep it held until confirmed.
-                _ if request.drained => ("interrupted", "queued"),
+                // Nothing of the attempt ran, so tool drift or an infrastructure failure (setup,
+                // materialize, launch, registration) says nothing about the revision: the action
+                // waits for another claim. Undrained resources keep it held until confirmed, and
+                // a bounded budget stops a deterministic failure from requeueing forever.
+                _ if requeue => ("interrupted", "queued"),
                 _ => ("interrupted", "interrupted"),
             };
             let detail = json!({"reason":reason,"error":evidence["error"],
                                 "requeued":action_state == "queued"});
             (state, action_state, "attempt.launch_failed", detail)
         }
+        // A lost supervisor reported drained never started its command (gate P3-2).
         Outcome::Lost => (
             "interrupted",
-            "interrupted",
+            if requeue { "queued" } else { "interrupted" },
             "attempt.interrupted",
             json!({"drained":request.drained,"operator_confirmed":false,
-                   "reason":"supervisor-lost","executor":executor}),
+                   "reason":"supervisor-lost","executor":executor,"requeued":requeue}),
         ),
         Outcome::Undeliverable => (
             "interrupted",
@@ -1655,6 +1733,27 @@ mod tests {
         }
     }
 
+    /// A claim by the local executor through the production path (gate P3-6): every registered
+    /// profile verified, as the worker verifies them at start.
+    fn local_claim(store: &mut Store) -> Option<Attempt> {
+        let verified: Vec<String> = {
+            let mut stmt = store.db.prepare("SELECT id FROM profiles").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let request = ClaimRequest {
+            claim_key: unique(),
+            verified,
+            ..ClaimRequest::default()
+        };
+        let response = claim_for(store, LOCAL, &Scope::all(), &request).unwrap();
+        response
+            .claim
+            .map(|claim| store.attempt(&claim.attempt.id).unwrap())
+    }
+
     fn claimed(response: &ClaimResponse) -> Option<&str> {
         response.claim.as_ref().map(|c| c.action.id.as_str())
     }
@@ -1766,7 +1865,7 @@ mod tests {
         let response = claim_for(&mut store, "mindy", &Scope::all(), &ask("k2", &["f-1"])).unwrap();
         assert!(response.claim.is_none() && response.fenced.is_none());
         assert_eq!(state(&store.db, "second"), "queued");
-        assert!(crate::worker::claim(&mut store).unwrap().is_none());
+        assert!(local_claim(&mut store).is_none());
         store
             .db
             .execute("UPDATE attempts SET drained=1 WHERE id='legacy'", [])
@@ -1778,7 +1877,7 @@ mod tests {
                 memory_mb: 0
             }
         );
-        let local = crate::worker::claim(&mut store).unwrap().unwrap();
+        let local = local_claim(&mut store).unwrap();
         assert_eq!(local.action, "second");
         assert_eq!(
             held_by(&store, LOCAL),
@@ -1846,9 +1945,9 @@ mod tests {
         .unwrap();
         let head = selection.choice.unwrap();
         assert_eq!(head.action.id, "heavy");
-        let heavy = crate::worker::claim(&mut store).unwrap().unwrap();
+        let heavy = local_claim(&mut store).unwrap();
         assert_eq!(heavy.action, "heavy");
-        let wide = crate::worker::claim(&mut store).unwrap().unwrap();
+        let wide = local_claim(&mut store).unwrap();
         assert_eq!(wide.action, "wide");
         assert_eq!(
             (wide.slots, wide.memory_mb, wide.timeout_seconds),
@@ -1969,8 +2068,12 @@ mod tests {
             projects: Some(["p-a".to_owned()].into()),
             profiles: Some(["f-1".to_owned(), "f-3".to_owned()].into()),
         };
-        let outside = claim_for(&mut store, "mindy", &scope, &ask("k0", &["f-1", "f-2"]));
-        assert!(matches!(outside, Err(AuthorityError::Forbidden)));
+        // A verified profile the grant no longer covers is ignored, not refused: a narrowed grant
+        // must not stop the executor (gate P3-3). Nothing outside the scope is claimed.
+        let narrowed = claim_for(&mut store, "mindy", &scope, &ask("k0", &["f-1", "f-2"])).unwrap();
+        // f-3 is in scope but not verified: it heads the queue and waits, as before.
+        assert_eq!(claimed(&narrowed), None);
+        assert_eq!(narrowed.unverified, ["f-3"]);
         let mut request = ask("k1", &["f-1"]);
         request.refused.insert("f-3".into(), "tool drift".into());
         let response = claim_for(&mut store, "mindy", &scope, &request).unwrap();
@@ -1991,10 +2094,12 @@ mod tests {
         assert_eq!(observed.verified, BTreeSet::from(["f-1".to_owned()]));
         assert_eq!(observed.refused["f-3"], "tool drift");
         assert!(observed.last_seen.is_some());
+        // The narrowed claim reported too; only verified profiles in scope were recorded.
         let reports = events(&store.db, "executor.observed");
-        assert_eq!(reports.len(), 1);
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].1["verified"], json!(["f-1"]));
         assert_eq!(
-            reports[0].1,
+            reports[1].1,
             json!({"verified":["f-1"],"refused":{"f-3":"tool drift"}})
         );
     }
@@ -2256,7 +2361,7 @@ mod tests {
             order.push(remote(&mut store, key));
         }
         // Fair share is global: local and remote claims are served from one owner history.
-        order.push(crate::worker::claim(&mut store).unwrap().unwrap().action);
+        order.push(local_claim(&mut store).unwrap().action);
         for key in ["k4", "k5", "k6"] {
             order.push(remote(&mut store, key));
         }
@@ -2645,6 +2750,55 @@ mod tests {
         };
         let status = heartbeat(&mut store, LOCAL, &Scope::all(), vec![legacy]);
         assert_eq!(status[0].status, "fenced");
+    }
+
+    #[test]
+    fn remote_claims_skip_actions_whose_manifests_exceed_the_response_budget() {
+        // One size owner (gate P2-1): mindy must never be granted a claim it cannot read.
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 16, 16384);
+        queue(
+            &store.db,
+            Queue {
+                id: "producer",
+                ..Queue::default()
+            },
+        );
+        queue(
+            &store.db,
+            Queue {
+                id: "consumer",
+                created: 2.0,
+                ..Queue::default()
+            },
+        );
+        let big = "x".repeat(api::MAX_CLAIM_MANIFESTS as usize + 1);
+        let attempt = json!({"id":"p-1","action":"producer","worker_pid":0,"worker_start":"",
+            "supervisor_pid":null,"supervisor_start":null,"slots":1,"memory_mb":1,"created":0.0,
+            "started":null,"ended":null,"exit_code":0,
+            "result":{"artifacts":{"dist/a":{"sha256":big,"mode":420,"bytes":1}}}});
+        let db = &store.db;
+        db.execute(
+            "INSERT INTO attempts VALUES ('p-1','producer','passed',1,?)",
+            [attempt.to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE actions SET state='passed',attempt='p-1' WHERE id='producer'",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE actions SET body=json_set(body,'$.dependencies',json('[\"producer\"]'))
+             WHERE id='consumer'",
+            [],
+        )
+        .unwrap();
+        let remote = claim_for(&mut store, "mindy", &Scope::all(), &ask("k1", &["f-1"])).unwrap();
+        assert_eq!(claimed(&remote), None);
+        // The local executor reads no claim response, so it runs the action.
+        let local = claim_for(&mut store, LOCAL, &Scope::all(), &ask("k2", &["f-1"])).unwrap();
+        assert_eq!(claimed(&local), Some("consumer"));
     }
 
     #[test]
@@ -3043,7 +3197,7 @@ mod tests {
         let claim = grant(&mut store, "k1");
         let id = claim.attempt.id.clone();
         queued(&store.db, "local", 2.0);
-        let local = crate::worker::claim(&mut store).unwrap().unwrap();
+        let local = local_claim(&mut store).unwrap();
         let expires = claim.attempt.lease_expires;
         // An API restarted 5 s before the lease ran out gives the executor a full lease to renew.
         let restarted = expires - 5.0;
@@ -3059,6 +3213,8 @@ mod tests {
             expire(&mut store, expires + 5.1, restarted).unwrap(),
             [id.as_str()]
         );
+        // The local executor's hour-long lease outlives a remote one (review P3-6).
+        assert_eq!(row(&store.db, &local.id), ("claimed".into(), false));
         // The store cannot know whether anything ran, so capacity stays held.
         assert_eq!(row(&store.db, &id), ("interrupted".into(), false));
         assert_eq!(state(&store.db, "first"), "interrupted");
@@ -3071,15 +3227,15 @@ mod tests {
         );
         assert!((lapsed[0].1["lease_expires"].as_f64().unwrap() - expires).abs() < 1e-3);
         assert!((lapsed[0].1["effective"].as_f64().unwrap() - expires - 5.0).abs() < 1e-3);
-        // Expiry happens once, and attempts without a lease are never expired.
-        assert!(
-            expire(&mut store, expires + 3600.0, 0.0)
-                .unwrap()
-                .is_empty()
+        // Expiry happens once, and attempts without a lease are never expired; the local
+        // attempt's own hour runs out in its turn.
+        assert_eq!(
+            expire(&mut store, expires + 3600.0, 0.0).unwrap(),
+            [local.id.as_str()]
         );
         assert_eq!(row(&store.db, "legacy"), ("running".into(), false));
-        assert_eq!(row(&store.db, &local.id), ("claimed".into(), false));
-        assert_eq!(events(&store.db, "attempt.lease_expired").len(), 1);
+        assert_eq!(row(&store.db, &local.id), ("interrupted".into(), false));
+        assert_eq!(events(&store.db, "attempt.lease_expired").len(), 2);
         // An executor whose record is gone gets the default lease as grace.
         queued(&store.db, "second", 3.0);
         let orphan = grant(&mut store, "k2");
@@ -3269,7 +3425,8 @@ mod tests {
                 Lost => (
                     "attempt.interrupted",
                     json!({"drained":drained,"operator_confirmed":false,
-                           "reason":"supervisor-lost","executor":"mindy"}),
+                           "reason":"supervisor-lost","executor":"mindy",
+                           "requeued":false}),
                 ),
                 Undeliverable => (
                     "attempt.interrupted",

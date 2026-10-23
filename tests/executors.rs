@@ -261,7 +261,13 @@ impl Lab {
 
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(AW);
-        command.arg("--state").arg(&self.state).args(args);
+        // The local worker checks loopback by default; this lab's daemon keeps it off.
+        command
+            .arg("--state")
+            .arg(&self.state)
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &self.runtime)
+            .env_remove("DOCKER_HOST");
         command
     }
 
@@ -1059,6 +1065,36 @@ fn executor_upload_quota_frees_after_complete() {
         patchweft::file_hash(&directory.join("output.log")).unwrap(),
         build["result"]["log_sha256"].as_str().unwrap()
     );
+}
+
+#[test]
+fn local_worker_checks_loopback_by_default() {
+    // The gate's probe: mauve's worker ran a job beside an exposed, unlisted listener (P2-2).
+    let lab = Lab::new(json!([job("work", "true", json!({}))]), &["work"]);
+    let candidate = lab.submit("agent");
+    let exposed = lab.temp.path().join("exposed");
+    let _daemon = Daemon::start(&exposed, "--port-driver=builtin");
+    let output = lab
+        .command(&["worker", "--drain"])
+        .env("XDG_RUNTIME_DIR", &exposed)
+        .output()
+        .unwrap();
+    assert_eq!(
+        lab.count("attempt.claimed"),
+        0,
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_ne!(lab.state_of(&candidate), "passed");
+    // Allowlisting nothing is not an opt-out; only --no-loopback-check is.
+    lab.command(&["worker", "--drain", "--loopback-allow", "1"])
+        .env("XDG_RUNTIME_DIR", &exposed)
+        .output()
+        .unwrap();
+    assert_eq!(lab.count("attempt.claimed"), 0);
+    // The same worker beside a daemon that keeps containers off host loopback works.
+    lab.call(&["worker", "--drain"]);
+    assert_eq!(lab.state_of(&candidate), "passed");
 }
 
 #[test]

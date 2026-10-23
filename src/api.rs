@@ -1228,8 +1228,13 @@ pub const MAX_ATTEMPT_OUTPUT_BYTES: u64 = MAX_RETAINED_UPLOADS;
 /// A result's artifact manifest, serialized; every host enforces it at capture, so a result that
 /// passes locally is deliverable from a remote executor too (review P2-3).
 pub const MAX_MANIFEST_BYTES: u64 = 12 * 1024 * 1024;
-/// `executor/complete` carries the manifest twice (evidence and uploads) plus log references.
-pub const MAX_COMPLETE_BODY: usize = 32 * 1024 * 1024;
+/// The one limit on JSON either side reads (gate P2-1): `executor/complete` requests, which carry
+/// a manifest twice, and responses such as claims, which inline their dependencies' manifests.
+pub const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_COMPLETE_BODY: usize = MAX_RESPONSE_BYTES as usize;
+/// Dependency manifests a claim may inline: the response budget less one manifest of headroom for
+/// the profile, action and revision it also carries.
+pub const MAX_CLAIM_MANIFESTS: u64 = MAX_RESPONSE_BYTES - MAX_MANIFEST_BYTES;
 pub const TRANSFER_TIMEOUT_SECONDS: u64 = 600;
 impl Api {
     pub fn begin_upload(&self, token: &str, sha256: &str) -> ApiResult<tempfile::NamedTempFile> {
@@ -1423,18 +1428,18 @@ impl Api {
             return Err(AuthorityError::Fenced.into());
         };
         // A recorded completion never changes, so the authority answers it from the store.
-        let outputs = if attempt.completion.is_some() {
-            Outputs::InPlace
+        let (outputs, used) = if attempt.completion.is_some() {
+            (Outputs::InPlace, vec![])
         } else {
-            Outputs::Staged(stage(&store, &principal.id, request)?)
+            let (staging, used) = stage(&store, &principal.id, request)?;
+            (Outputs::Staged(staging), used)
         };
-        Ok(authority::complete(
-            &mut store,
-            &principal.id,
-            &scope,
-            request,
-            outputs,
-        )?)
+        let result = authority::complete(&mut store, &principal.id, &scope, request, outputs);
+        // Staged reports consume their uploads whatever the authority decided: the quota frees.
+        for sha256 in used {
+            let _ = fs::remove_file(upload_path(&store, &principal.id, &sha256));
+        }
+        Ok(result?)
     }
 
     pub fn artifact(&self, token: &str, action: &str, sha256: &str) -> ApiResult<File> {
@@ -1518,7 +1523,11 @@ fn invalid_evidence(message: String) -> ApiError {
 /// Moves a report's verified uploads out of the principal's upload area into
 /// `.incoming-<unique>/{output.log,cleanup.log,artifacts/<path>,artifacts.json}`. Nothing moves
 /// unless every blob is present with its declared length and digest.
-fn stage(store: &Store, principal: &str, request: &CompleteRequest) -> ApiResult<PathBuf> {
+fn stage(
+    store: &Store,
+    principal: &str,
+    request: &CompleteRequest,
+) -> ApiResult<(PathBuf, Vec<String>)> {
     let blobs: Vec<BlobRef> = request
         .artifacts
         .values()
@@ -1611,7 +1620,9 @@ fn stage(store: &Store, principal: &str, request: &CompleteRequest) -> ApiResult
                 // One digest named by several paths: each gets its own copy.
                 fs::copy(first, &target).map_err(ApiError::internal)?;
             } else {
-                match fs::rename(upload_path(store, principal, &blob.sha256), &target) {
+                // A link, not a move: a concurrent report of the same digest still finds the
+                // upload; the names are consumed once this report is recorded (gate P3-4).
+                match fs::hard_link(upload_path(store, principal, &blob.sha256), &target) {
                     Ok(()) => {}
                     // Consumed by a concurrent report since it was checked.
                     Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -1636,7 +1647,10 @@ fn stage(store: &Store, principal: &str, request: &CompleteRequest) -> ApiResult
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
-    Ok(staging)
+    Ok((
+        staging,
+        lengths.keys().map(|sha256| sha256.to_string()).collect(),
+    ))
 }
 
 const UPLOAD_RETENTION: Duration = Duration::from_secs(24 * 3600);

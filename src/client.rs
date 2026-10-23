@@ -1,5 +1,5 @@
 use crate::{
-    api::{Command, MAX_BUNDLE, MAX_HAVES, Query, TRANSFER_TIMEOUT_SECONDS},
+    api::{self, Command, MAX_BUNDLE, MAX_HAVES, Query, TRANSFER_TIMEOUT_SECONDS},
     mcp::Backend,
     source,
 };
@@ -90,8 +90,14 @@ impl Remote {
     fn json_response(response: Response) -> Result<Value> {
         let status = response.status();
         let mut bytes = Vec::new();
-        response.take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
-        ensure!(bytes.len() <= 8 * 1024 * 1024, "response exceeds 8 MiB");
+        response
+            .take(api::MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 <= api::MAX_RESPONSE_BYTES,
+            "response exceeds {} bytes",
+            api::MAX_RESPONSE_BYTES
+        );
         let value: Value = serde_json::from_slice(&bytes).context("response was not JSON")?;
         if !status.is_success() && value.get("error").is_none() {
             bail!("HTTP {status}");

@@ -78,14 +78,19 @@ containers can reach host loopback: the rootless Docker daemon behind
 counts as exposing it. While it is exposed, every TCP listener on `127.0.0.0/8`
 or `::1` must be in `--loopback-allow PORT[,PORT…]`; otherwise the executor
 refuses all work and its record shows `refused: {"*": "loopback listener … not
-allowlisted"}`. `executor` always checks. `worker` checks only when given
-`--loopback-allow`, with or without ports.
+allowlisted"}`. Both `executor` and `worker` check by default; `worker
+--no-loopback-check` skips it, only for a host that runs no job containers. The
+check covers TCP listeners bound to loopback. A listener on a wildcard address
+(`0.0.0.0`, `::`) is reachable on the host's own addresses whatever this check
+says, so it is outside its model: keep such services off executor hosts or
+firewall them.
 
 Attempts hold leases: 300 seconds by default for a remote executor and 3600 seconds
 for `local`, whose supervisors keep running while its worker is stopped
 (`executor-set --lease-seconds`). Stopping the local worker for longer than its
 lease expires its running jobs, so drain it first for longer maintenance.
-renewed every second by `worker` and every ten seconds by `executor`. A coordinator
+Leases are renewed every second by `worker` and every ten seconds by `executor`,
+and never less often than a third of the lease. A coordinator
 that cannot renew stops its jobs once the lease minus `max(2 × heartbeat,
 lease / 5)`, at most half the lease, has passed since its last renewal, before the
 API could expire it.

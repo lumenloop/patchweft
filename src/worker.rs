@@ -95,92 +95,6 @@ fn reap_adopted(main: u32) {
     }
 }
 
-/// A claim as the previous binary's worker made it: a local attempt without executor or lease.
-/// Production claims go through `authority::claim_for`; tests keep this to write legacy rows.
-#[cfg(test)]
-pub(crate) fn claim(store: &mut Store) -> Result<Option<Attempt>> {
-    use crate::authority::{self, Choice, Scope};
-    let transaction = store.transaction()?;
-    let local = authority::load(&transaction, authority::LOCAL)?
-        .context("local executor record missing")?;
-    let capacity = authority::capacity(&transaction, &local)?;
-    // That worker trusted every registered profile.
-    let verified: std::collections::BTreeSet<String> = {
-        let mut stmt = transaction.prepare("SELECT id FROM profiles")?;
-        stmt.query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?
-    };
-    let selection = authority::select(
-        &transaction,
-        &local,
-        &Scope::all(),
-        &verified,
-        &Default::default(),
-        capacity,
-    )?;
-    let Some(Choice {
-        owner,
-        action,
-        reservation,
-        timeout_seconds,
-    }) = selection.choice
-    else {
-        return Ok(None);
-    };
-    // Drain for the next owner's action. Later tiny tasks cannot starve this reservation.
-    if !authority::fits(
-        authority::held(&transaction, authority::LOCAL)?,
-        reservation,
-        capacity,
-    ) {
-        return Ok(None);
-    }
-    let attempt = Attempt {
-        id: crate::unique(),
-        action: action.id.clone(),
-        worker_pid: std::process::id(),
-        worker_start: process_start(std::process::id())
-            .context("Linux process identity unavailable")?,
-        supervisor_pid: None,
-        supervisor_start: None,
-        slots: reservation.slots,
-        memory_mb: reservation.memory_mb,
-        created: crate::now(),
-        started: None,
-        ended: None,
-        exit_code: None,
-        result: None,
-        timeout_seconds: Some(timeout_seconds),
-        executor: None,
-        lease: None,
-        lease_expires: None,
-        claim_key: None,
-        completion: None,
-        stop: None,
-    };
-    transaction.execute(
-        "INSERT INTO attempts VALUES (?,?,'claimed',0,?)",
-        params![attempt.id, action.id, serde_json::to_string(&attempt)?],
-    )?;
-    transaction.execute(
-        "UPDATE actions SET state='running',attempt=? WHERE id=? AND state='queued'",
-        params![attempt.id, action.id],
-    )?;
-    transaction.execute(
-        "INSERT INTO dispatches VALUES (?,?) ON CONFLICT(owner) DO UPDATE SET last=excluded.last",
-        params![owner, crate::now()],
-    )?;
-    event(
-        &transaction,
-        "attempt.claimed",
-        &attempt.id,
-        &json!({"action":action.id,"owner":owner,"slots":reservation.slots,
-                "memory_mb":reservation.memory_mb,"timeout_seconds":timeout_seconds}),
-    )?;
-    transaction.commit()?;
-    Ok(Some(attempt))
-}
-
 /// Operator scheduling priority for an owner; 0 (the default) removes it. Priority only orders
 /// admission: it never preempts running work or changes action identity.
 pub fn set_priority(store: &Store, owner: &str, priority: i64) -> Result<Value> {
@@ -356,6 +270,30 @@ impl std::fmt::Display for StoppedBeforeCommand {
 }
 impl std::error::Error for StoppedBeforeCommand {}
 
+/// The host could not set the job up (checkout, dependency copies, a full disk): nothing of the
+/// job ran and nothing about the revision failed (gate P3-2).
+#[derive(Debug)]
+struct PreCommand(anyhow::Error);
+
+impl std::fmt::Display for PreCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+impl std::error::Error for PreCommand {}
+
+fn setup<T>(result: Result<T, impl Into<anyhow::Error>>) -> Result<T> {
+    result.map_err(|error| {
+        let error = error.into();
+        // Tool drift keeps its own, more specific outcome.
+        if error.is::<RuntimeMismatch>() {
+            error
+        } else {
+            PreCommand(error).into()
+        }
+    })
+}
+
 /// Output a result may carry, per file (artifacts and logs) and per attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Limits {
@@ -420,11 +358,11 @@ fn execute_command(
         );
     }
     let timeout_seconds = claim.attempt.timeout_seconds;
-    let (view, preparation) = prepare(claim, job, directory)?;
+    let (view, preparation) = setup(prepare(claim, job, directory))?;
     let scratch = directory.join("scratch");
     let home = directory.join("home");
-    fs::create_dir(&scratch)?;
-    fs::create_dir(&home)?;
+    setup(fs::create_dir(&scratch))?;
+    setup(fs::create_dir(&home))?;
     if ["vitest", "junit"].contains(&job.report.kind.as_str()) {
         let report = view.join(source::relative_path(&job.report.path)?);
         contained_parent(&view, &report)?;
@@ -432,7 +370,7 @@ fn execute_command(
             fs::remove_file(&report)?;
         }
     }
-    let log = File::create(directory.join("output.log"))?;
+    let log = setup(File::create(directory.join("output.log")))?;
     let paths: Vec<PathBuf> = profile
         .definition
         .tools
@@ -663,6 +601,12 @@ fn conclude(
         Err(error) if error.is::<RuntimeMismatch>() => (
             Outcome::NotStarted,
             Some("runtime-mismatch".into()),
+            125,
+            failure(claim, job, Some(format!("{error:#}"))),
+        ),
+        Err(error) if error.is::<PreCommand>() => (
+            Outcome::NotStarted,
+            Some("setup-failed".into()),
             125,
             failure(claim, job, Some(format!("{error:#}"))),
         ),
@@ -1181,6 +1125,96 @@ mod tests {
                 manifest: api::MAX_MANIFEST_BYTES,
             }
         );
+    }
+
+    #[test]
+    fn a_stop_recorded_during_setup_wins_before_the_command() {
+        // Gate P3-4: setup can take seconds after registration; a stop recorded meanwhile must
+        // end the attempt not started, never spawn the command and then kill it.
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("mirror");
+        fs::create_dir(&repository).unwrap();
+        let git = |args: &[&str]| source::git(&repository, args).unwrap();
+        git(&["init", "--quiet"]);
+        fs::write(repository.join("input.txt"), "x\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@local.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ]);
+        let commit = git(&["rev-parse", "HEAD"]);
+        let root = temp.path().join("root");
+        let definition: Profile = serde_json::from_value(json!({
+            "version":1,"name":"fixture","tools":{"sh":"/bin/sh"},"jobs":[
+                {"name":"full","command":["sh","-c","touch \"$PATCHWEFT_STATE/ran\""]}]}))
+        .unwrap();
+        let profile = RegisteredProfile {
+            id: "f-1".into(),
+            definition,
+            tools: BTreeMap::from([("sh".to_owned(), file_hash(Path::new("/bin/sh")).unwrap())]),
+            engine: file_hash(&std::env::current_exe().unwrap()).unwrap(),
+            platform: engine::platform(),
+        };
+        let claim = ClaimFile {
+            version: CONTROL_VERSION,
+            executor: "mindy".into(),
+            root: root.clone(),
+            attempt: Grant {
+                id: "a1".into(),
+                lease: "lease".into(),
+                lease_expires: 0.0,
+                slots: 1,
+                memory_mb: 512,
+                timeout_seconds: 60,
+            },
+            action: Action {
+                id: "act".into(),
+                key: "key".into(),
+                revision: "rev".into(),
+                profile: "f-1".into(),
+                job: "full".into(),
+                dependencies: vec![],
+                created: 0.0,
+                identity: None,
+                reservation: None,
+                origin: None,
+            },
+            profile: profile.clone(),
+            revision: RevisionRef {
+                id: "rev".into(),
+                project: "p".into(),
+                commit,
+            },
+            repository,
+            dependencies: vec![],
+            transfer: json!({}),
+        };
+        let directory = root.join("attempts").join("a1");
+        let control = directory.join("control");
+        fs::create_dir_all(&control).unwrap();
+        fs::write(
+            control.join("stop"),
+            json!({"reason":"no-requesters"}).to_string(),
+        )
+        .unwrap();
+        let job = engine::job(&profile, "full").unwrap();
+        let result = execute_command(&claim, job, &directory, &FileControl { control: &control });
+        let error = result.unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<StoppedBeforeCommand>()
+                .map(|stop| stop.0.as_str()),
+            Some("no-requesters"),
+            "{error:#}"
+        );
+        assert!(!root.join("ran").exists());
+        assert!(!control.join("command-started").exists());
     }
 
     #[test]
