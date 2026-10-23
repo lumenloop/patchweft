@@ -824,6 +824,27 @@ pub fn eligible(db: &Connection, action: &Action) -> Result<bool> {
             return Ok(false);
         }
     }
+    requested(db, action)
+}
+
+/// Eligible as soon as its running dependencies pass: every dependency passed or running, at
+/// least one running, and wanted by a candidate whose prerequisites passed. A train's shard waits
+/// like this on its prepare.
+pub fn eligible_soon(db: &Connection, action: &Action) -> Result<bool> {
+    let mut running = false;
+    for dependency in &action.dependencies {
+        match action_state(db, dependency)?.as_str() {
+            "passed" => {}
+            "running" => running = true,
+            _ => return Ok(false),
+        }
+    }
+    Ok(running && requested(db, action)?)
+}
+
+/// Whether an interest still wants the action: a direct request, or a candidate whose
+/// prerequisites passed.
+fn requested(db: &Connection, action: &Action) -> Result<bool> {
     let mut stmt = db.prepare("SELECT context FROM interests WHERE action=? AND active=1")?;
     let contexts: Vec<String> = stmt
         .query_map([&action.id], |r| r.get(0))?

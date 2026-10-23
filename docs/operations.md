@@ -18,7 +18,10 @@ Initialize the local executor's slot and memory budget. Admission is fair betwee
 owners across all executors; `priority OWNER N`
 admits a higher-priority owner's work first (for example a landing-ready merge train)
 and `0` clears it. Priority orders admission only: it never preempts running work or
-changes action identity. Jobs hold reservations until their supervised
+changes action identity. A higher-priority owner's job that waits only on a running dependency
+(every dependency passed or running) holds the capacity it will need on each executor that may
+run it: a lower-priority job is admitted only if it fits beside that demand. The hold ends when
+the dependency passes, fails or is interrupted. Jobs hold reservations until their supervised
 processes and declared cleanup finish. A coordinator exit does not imply that
 its jobs have stopped.
 

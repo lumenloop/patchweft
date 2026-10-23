@@ -190,6 +190,8 @@ pub fn fits(held: Reservation, wanted: Reservation, capacity: Reservation) -> bo
 
 pub struct Choice {
     pub owner: String,
+    /// The owner's scheduling priority.
+    pub priority: i64,
     pub action: Action,
     pub reservation: Reservation,
     pub timeout_seconds: u64,
@@ -199,6 +201,9 @@ pub struct Selection {
     pub choice: Option<Choice>,
     /// Profiles of admissible work the executor has not verified (at most 32).
     pub unverified: Vec<String>,
+    /// Capacity held for prioritized work this executor could run once a running dependency
+    /// passes (the train-first hold): what it needs, and the highest priority among it.
+    pub hold: Option<(i64, Reservation)>,
 }
 
 /// The head of one executor's queue: work it may run and could ever fit, ordered by owner
@@ -223,13 +228,17 @@ pub fn select(
     let mut profiles = BTreeMap::new();
     let mut unverified = Vec::new();
     let mut choices = Vec::new();
+    let mut hold: Option<(i64, Reservation)> = None;
     for action in queued {
         if !scope.allows_profile(&action.profile)
             || refused.contains(&action.profile)
             || refused.contains(REFUSE_ALL)
             || !record.placement.permits(&action.job)
-            || !engine::eligible(db, &action)?
         {
+            continue;
+        }
+        let eligible = engine::eligible(db, &action)?;
+        if !eligible && !engine::eligible_soon(db, &action)? {
             continue;
         }
         if scope.projects.is_some() && !scope.allows_project(&project(db, &action.revision)?) {
@@ -238,6 +247,36 @@ pub fn select(
         let (reservation, timeout_seconds) = budget(db, &mut profiles, &action)?;
         // Work this executor can never fit must not idle it behind the head.
         if reservation.slots > capacity.slots || reservation.memory_mb > capacity.memory_mb {
+            continue;
+        }
+        if !eligible {
+            // The train-first hold (chief, #4204): a prioritized owner's job waiting only on a
+            // running dependency keeps the capacity it will need from lower-priority owners.
+            let mut stmt =
+                db.prepare("SELECT DISTINCT owner FROM interests WHERE action=? AND active=1")?;
+            let priority = stmt
+                .query_map([&action.id], |r| r.get::<_, String>(0))?
+                .map(|owner| Ok(priorities.get(&owner?).copied().unwrap_or(0)))
+                .collect::<Result<Vec<i64>>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+            if priority > 0 {
+                let (top, demand) = hold.unwrap_or((
+                    priority,
+                    Reservation {
+                        slots: 0,
+                        memory_mb: 0,
+                    },
+                ));
+                hold = Some((
+                    top.max(priority),
+                    Reservation {
+                        slots: demand.slots.saturating_add(reservation.slots),
+                        memory_mb: demand.memory_mb.saturating_add(reservation.memory_mb),
+                    },
+                ));
+            }
             continue;
         }
         // A claim inlines its dependencies' manifests: one a remote executor could not read is
@@ -264,6 +303,7 @@ pub fn select(
             let priority = priorities.get(&owner).copied().unwrap_or(0);
             let choice = Choice {
                 owner,
+                priority,
                 action: action.clone(),
                 reservation,
                 timeout_seconds,
@@ -283,7 +323,11 @@ pub fn select(
         .next()
         .filter(|(_, _, trusted, _)| *trusted)
         .map(|(.., choice)| choice);
-    Ok(Selection { choice, unverified })
+    Ok(Selection {
+        choice,
+        unverified,
+        hold,
+    })
 }
 
 /// The serialized size of an attempt's artifact manifest, as a claim inlines it. Recorded once
@@ -428,10 +472,28 @@ pub fn claim_for(
     }
     let capacity = capacity(&transaction, &record)?;
     let refused = request.refused.keys().cloned().collect();
-    let Selection { choice, unverified } =
-        select(&transaction, &record, scope, &verified, &refused, capacity)?;
+    let Selection {
+        choice,
+        unverified,
+        hold,
+    } = select(&transaction, &record, scope, &verified, &refused, capacity)?;
+    let held = held(&transaction, executor)?;
+    // A lower-priority head is admitted only beside the capacity held for the train.
+    let beside_hold = |choice: &Choice| {
+        hold.is_none_or(|(priority, demand)| {
+            priority <= choice.priority
+                || fits(
+                    Reservation {
+                        slots: held.slots.saturating_add(demand.slots),
+                        memory_mb: held.memory_mb.saturating_add(demand.memory_mb),
+                    },
+                    choice.reservation,
+                    capacity,
+                )
+        })
+    };
     let choice = match choice {
-        Some(choice) if fits(held(&transaction, executor)?, choice.reservation, capacity) => choice,
+        Some(choice) if fits(held, choice.reservation, capacity) && beside_hold(&choice) => choice,
         // Drain for the head: later small actions cannot starve its reservation.
         _ => {
             transaction.commit()?;
@@ -1674,6 +1736,7 @@ mod tests {
         created: f64,
         /// None writes a legacy action whose reservation and timeout come from its profile.
         reservation: Option<(u32, u32)>,
+        dependencies: &'a [&'a str],
     }
 
     impl Default for Queue<'_> {
@@ -1686,6 +1749,7 @@ mod tests {
                 owner: "lane",
                 created: 1.0,
                 reservation: Some((1, 512)),
+                dependencies: &[],
             }
         }
     }
@@ -1697,7 +1761,7 @@ mod tests {
             revision: q.revision.into(),
             profile: q.profile.into(),
             job: q.job.into(),
-            dependencies: vec![],
+            dependencies: q.dependencies.iter().map(|d| d.to_string()).collect(),
             created: q.created,
             identity: q.reservation.map(|_| ActionIdentity {
                 version: JOB_RECIPE.into(),
@@ -2398,6 +2462,122 @@ mod tests {
                 "train", "bob-1", "carol", "alice-1", "lane", "bob-2", "alice-2"
             ]
         );
+    }
+
+    /// A train (priority 1) whose shard waits on its prepare, beside a lane's eligible job, on
+    /// mindy (8 slots, 8192 MiB). `prepare` is the prepare action's state.
+    fn train_beside_lane(
+        prepare: &str,
+        shard: (u32, u32),
+        lane: (u32, u32),
+    ) -> (tempfile::TempDir, Store) {
+        let (root, store) = lab();
+        register(&store.db, "mindy", 8, 8192);
+        let base = Queue::default();
+        queue(
+            &store.db,
+            Queue {
+                id: "prepare",
+                owner: "train",
+                job: "prepare",
+                ..base
+            },
+        );
+        store
+            .db
+            .execute("UPDATE actions SET state=? WHERE id='prepare'", [prepare])
+            .unwrap();
+        queue(
+            &store.db,
+            Queue {
+                id: "shard",
+                owner: "train",
+                job: "vitest",
+                created: 2.0,
+                reservation: Some(shard),
+                dependencies: &["prepare"],
+                ..base
+            },
+        );
+        queue(
+            &store.db,
+            Queue {
+                id: "lane",
+                owner: "lane",
+                created: 3.0,
+                reservation: Some(lane),
+                ..base
+            },
+        );
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        (root, store)
+    }
+
+    fn mindy_claims(store: &mut Store, key: &str) -> Option<String> {
+        let response = claim_for(store, "mindy", &Scope::all(), &ask(key, &["f-1"])).unwrap();
+        claimed(&response).map(str::to_owned)
+    }
+
+    #[test]
+    fn a_train_waiting_on_its_running_prepare_holds_the_capacity_its_shard_needs() {
+        // Train 10b (#4204): a lane's shards took mindy three minutes before the train's prepare
+        // finished, and the train's shards waited 34 minutes behind them.
+        let (_root, mut store) = train_beside_lane("running", (6, 6144), (4, 4096));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        // Once prepare passes, the shard is the head and nothing is held.
+        store
+            .db
+            .execute("UPDATE actions SET state='passed' WHERE id='prepare'", [])
+            .unwrap();
+        let record = load(&store.db, "mindy").unwrap().unwrap();
+        let capacity = capacity(&store.db, &record).unwrap();
+        let verified = BTreeSet::from(["f-1".to_owned()]);
+        let selection = select(
+            &store.db,
+            &record,
+            &Scope::all(),
+            &verified,
+            &BTreeSet::new(),
+            capacity,
+        )
+        .unwrap();
+        assert_eq!(selection.choice.unwrap().action.id, "shard");
+        assert_eq!(selection.hold, None);
+    }
+
+    #[test]
+    fn the_hold_leaves_room_the_train_will_not_need() {
+        let (_root, mut store) = train_beside_lane("running", (6, 6144), (2, 1024));
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("lane"));
+    }
+
+    #[test]
+    fn no_hold_for_a_dependency_not_yet_running_or_one_that_failed() {
+        // Holding for a whole chain would idle the executor for longer than one dependency runs.
+        for prepare in ["queued", "failed"] {
+            let (_root, mut store) = train_beside_lane(prepare, (6, 6144), (4, 4096));
+            // mindy may not run the train's prepare itself, which would otherwise be its head.
+            let mut record = load(&store.db, "mindy").unwrap().unwrap();
+            record.placement.deny = BTreeSet::from(["prepare".to_owned()]);
+            save(&store.db, &record).unwrap();
+            assert_eq!(
+                mindy_claims(&mut store, "k1").as_deref(),
+                Some("lane"),
+                "{prepare}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_hold_for_work_this_executor_may_not_run_or_for_an_owner_without_priority() {
+        let (_root, mut store) = train_beside_lane("running", (6, 6144), (4, 4096));
+        let mut record = load(&store.db, "mindy").unwrap().unwrap();
+        record.placement.deny = BTreeSet::from(["vitest".to_owned()]);
+        save(&store.db, &record).unwrap();
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("lane"));
+        let (_root, mut store) = train_beside_lane("running", (6, 6144), (4, 4096));
+        crate::worker::set_priority(&store, "train", 0).unwrap();
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("lane"));
     }
 
     fn queued(db: &Connection, id: &str, created: f64) {
