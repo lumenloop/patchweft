@@ -57,6 +57,9 @@ pub enum Reuse {
     Exact,
     /// Explicitly audited files-only action; every input must be listed.
     Files,
+    /// Keyed on the files the project declares the job reads (its `inputs_file`); an earlier
+    /// pass with the same declared inputs is reused. Undeclared jobs behave as `inflight`.
+    Declared,
     /// Each request is physically independent.
     Never,
 }
@@ -120,6 +123,9 @@ pub struct Profile {
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
     pub jobs: Vec<Job>,
+    /// The revision's declarations file (`patchweft.inputs/1`) for `declared` jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +214,19 @@ pub struct Action {
     pub reservation: Option<Reservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<Origin>,
+    /// sha256 of a declared job's input identity, exported as `PATCHWEFT_INPUTS`. Absent on the
+    /// fail-safe path and for every other policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_inputs: Option<String>,
+}
+
+/// A declared job's earlier pass that a candidate requires instead of a new action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Reused {
+    pub action: String,
+    /// The candidate the action was created for; empty for a direct request.
+    pub from_candidate: String,
+    pub from_revision: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +244,8 @@ pub struct Candidate {
     pub retained: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub not_retained: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reused: BTreeMap<String, Reused>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

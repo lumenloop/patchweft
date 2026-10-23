@@ -2831,6 +2831,7 @@ mod tests {
                 identity: None,
                 reservation: None,
                 origin: None,
+                declared_inputs: None,
             },
             profile: profile("p-ok", "e"),
             revision: RevisionRef {

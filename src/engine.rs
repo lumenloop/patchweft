@@ -1,8 +1,10 @@
 use crate::{
-    authority, file_hash, identity,
+    authority,
+    declared::{self, Declared},
+    file_hash, identity,
     model::*,
     now, source,
-    store::{Store, event, record},
+    store::{Store, event, passed_key_of, prepare_passed_keys, record},
     unique,
 };
 use anyhow::{Context, Result, ensure};
@@ -71,7 +73,7 @@ pub fn validate_profile(profile: &Profile, capacity: (u32, u32)) -> Result<()> {
         if ["vitest", "junit"].contains(&job.report.kind.as_str()) {
             source::relative_path(&job.report.path)?;
         }
-        if [Reuse::Exact, Reuse::Files].contains(&job.reuse) {
+        if [Reuse::Exact, Reuse::Files, Reuse::Declared].contains(&job.reuse) {
             ensure!(
                 job.audit.len() >= 20,
                 "completed-result reuse requires a recorded input audit"
@@ -110,6 +112,14 @@ pub fn validate_profile(profile: &Profile, capacity: (u32, u32)) -> Result<()> {
             );
         }
     }
+    if let Some(file) = &profile.inputs_file {
+        source::relative_path(file)?;
+    }
+    ensure!(
+        profile.inputs_file.is_some()
+            || profile.jobs.iter().all(|job| job.reuse != Reuse::Declared),
+        "declared jobs require the profile's inputs_file"
+    );
     let mut ordered = BTreeSet::new();
     loop {
         let old = ordered.len();
@@ -232,6 +242,7 @@ pub fn recipes_for(profile: &RegisteredProfile, version: &str) -> Result<BTreeMa
         tools: tool_paths,
         environment: profile_environment,
         jobs,
+        inputs_file,
     } = definition;
     // Every tool directory is on every job's PATH, so every tool is part of every recipe.
     let tools = tool_paths
@@ -279,7 +290,7 @@ pub fn recipes_for(profile: &RegisteredProfile, version: &str) -> Result<BTreeMa
                 .iter()
                 .map(|d| (d.clone(), memo[d].clone()))
                 .collect();
-            let recipe = identity(&json!({
+            let mut recipe = json!({
                 "recipe": JOB_RECIPE,
                 "job": name,
                 "command": command,
@@ -294,7 +305,12 @@ pub fn recipes_for(profile: &RegisteredProfile, version: &str) -> Result<BTreeMa
                 "dependencies": dependencies,
                 "engine": engine,
                 "platform": platform,
-            }))?;
+            });
+            // Only when set, so every recipe recorded under this tag before it existed still holds.
+            if let Some(file) = inputs_file {
+                recipe["inputs_file"] = json!(file);
+            }
+            let recipe = identity(&recipe)?;
             memo.insert(name.clone(), recipe);
         }
         ensure!(memo.len() != before, "profile contains a dependency cycle");
@@ -313,6 +329,21 @@ pub fn action_key(
     identity(
         &json!({"key":"patchweft.action/2","project":project,"recipe":recipe,"class":class,
                      "timeout_seconds":timeout_seconds,"inputs":inputs,"dependencies":dependencies}),
+    )
+}
+
+/// The key under which a declared job's pass is reused: its declared inputs, without dependency
+/// actions. The recipe already hashes the dependencies' recipes.
+pub fn passed_key(
+    project: &str,
+    recipe: &str,
+    class: &str,
+    timeout_seconds: u64,
+    inputs: &Value,
+) -> Result<String> {
+    identity(
+        &json!({"key":"patchweft.declared/1","project":project,"recipe":recipe,"class":class,
+                     "timeout_seconds":timeout_seconds,"inputs":inputs}),
     )
 }
 
@@ -337,7 +368,32 @@ pub fn job<'a>(profile: &'a RegisteredProfile, name: &str) -> Result<&'a Job> {
         .context("unknown job")
 }
 
-pub fn input_identity(store: &Store, revision: &Revision, job: &Job) -> Result<Value> {
+/// The profile's declarations at the revision, read only when one of its jobs is declared.
+pub fn declarations(store: &Store, revision: &Revision, profile: &Profile) -> Declared {
+    if profile.jobs.iter().any(|job| job.reuse == Reuse::Declared) {
+        declared::resolve(
+            &source::repository(store, &revision.project),
+            &revision.commit,
+            profile,
+        )
+    } else {
+        Declared::default()
+    }
+}
+
+/// A declared job off the fail-safe path is keyed on its declared inputs; every other job not
+/// projected to files is keyed on the whole commit.
+pub fn input_identity(
+    store: &Store,
+    revision: &Revision,
+    job: &Job,
+    declared: &Declared,
+) -> Result<Value> {
+    if job.reuse == Reuse::Declared
+        && let Some(identity) = declared.identity(&job.name)
+    {
+        return Ok(identity.clone());
+    }
     if job.reuse != Reuse::Files {
         return Ok(json!({"commit":revision.commit}));
     }
@@ -377,6 +433,44 @@ struct Requester<'a> {
     context: &'a str,
     requested: BTreeMap<String, String>,
     retention: Option<Retention>,
+    declared: Declared,
+    reused: BTreeMap<String, Reused>,
+}
+
+/// Records why declared jobs keep the commit key and which keys name no job. Never fails a
+/// submit: an invalid file only puts every declared job on the fail-safe path.
+fn report_declarations(db: &Connection, candidate: &str, declared: &Declared) -> Result<()> {
+    if let Some(reason) = &declared.invalid {
+        event(
+            db,
+            "inputs.invalid",
+            candidate,
+            &json!({"candidate":candidate,"reason":reason}),
+        )?;
+    }
+    for key in &declared.unmatched {
+        event(
+            db,
+            "inputs.unmatched",
+            candidate,
+            &json!({"candidate":candidate,"key":key}),
+        )?;
+    }
+    Ok(())
+}
+
+/// The earliest passed action with this passed key. Nothing else is reused: not a failed,
+/// interrupted, canceled or stopping action.
+fn reusable(db: &Connection, key: &str) -> Result<Option<Action>> {
+    let body: Option<String> = db
+        .query_row(
+            "SELECT a.body FROM passed_keys p JOIN actions a ON a.id=p.action
+             WHERE p.key=? AND a.state='passed' ORDER BY a.created LIMIT 1",
+            [key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(body.map(|body| serde_json::from_str(&body)).transpose()?)
 }
 
 /// The predecessor's action when every retention condition holds, else the first failed one.
@@ -432,18 +526,39 @@ fn retainable(
     if executed.as_ref() != Some(recipe) || identity.recipe != *recipe {
         return refuse("job identity changed");
     }
-    if action.dependencies != dependencies {
+    // The predecessor reused this pass from another candidate, whose dependency actions it
+    // consumed; its passed key deliberately excludes them, so that key is checked instead.
+    let reused = retention
+        .source
+        .reused
+        .get(&definition.name)
+        .is_some_and(|reused| reused.action == *id);
+    if !reused && action.dependencies != dependencies {
         return refuse("dependency actions differ");
     }
-    let key = action_key(
-        &request.revision.project,
-        recipe,
-        &identity.class,
-        identity.timeout_seconds,
-        inputs,
-        dependencies,
-    )?;
-    if key != action.key {
+    let (key, recorded) = if reused {
+        (
+            passed_key(
+                &request.revision.project,
+                recipe,
+                &identity.class,
+                identity.timeout_seconds,
+                inputs,
+            )?,
+            passed_key_of(&store.db, id)?,
+        )
+    } else {
+        let key = action_key(
+            &request.revision.project,
+            recipe,
+            &identity.class,
+            identity.timeout_seconds,
+            inputs,
+            dependencies,
+        )?;
+        (key, Some(action.key.clone()))
+    };
+    if recorded.as_ref() != Some(&key) {
         return refuse("action key differs");
     }
     if !evidence["timer_seconds"]
@@ -464,7 +579,7 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
     for dependency in &definition.dependencies {
         dependencies.push(request_job(store, request, dependency)?);
     }
-    let inputs = input_identity(store, request.revision, &definition)?;
+    let inputs = input_identity(store, request.revision, &definition, &request.declared)?;
     let recipe = request
         .recipes
         .get(name)
@@ -479,6 +594,17 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
         &inputs,
         &dependencies,
     )?;
+    // Only a declared job off the fail-safe path has a passed key.
+    let passed = match request.declared.identity(name) {
+        Some(_) => Some(passed_key(
+            &request.revision.project,
+            &recipe,
+            class,
+            definition.timeout_seconds,
+            &inputs,
+        )?),
+        None => None,
+    };
     let (owner, context, profile) = (request.owner, request.context, request.profile);
     // Before the generic lookup, so an unrelated queued row cannot capture the job and break the chain.
     let outcome = match request.retention {
@@ -507,12 +633,45 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
                 )?;
                 transaction.commit()?;
                 retention.retained.push(name.into());
+                if let Some(reused) = retention.source.reused.get(name)
+                    && reused.action == action.id
+                {
+                    request.reused.insert(name.into(), reused.clone());
+                }
                 request.requested.insert(name.into(), action.id.clone());
                 return Ok(action.id);
             }
             Err(reason) => {
                 retention.not_retained.insert(name.into(), reason);
             }
+        }
+    }
+    if let Some(passed) = &passed {
+        prepare_passed_keys(&store.db)?;
+        if let Some(action) = reusable(&store.db, passed)? {
+            let reused = Reused {
+                action: action.id.clone(),
+                from_candidate: action
+                    .origin
+                    .as_ref()
+                    .map(|origin| origin.context.clone())
+                    .unwrap_or_default(),
+                from_revision: action.revision.clone(),
+            };
+            let transaction = store.transaction()?;
+            transaction.execute("INSERT INTO interests VALUES (?,?,?,1) ON CONFLICT(action,owner,context) DO UPDATE SET active=1",
+                                params![action.id, owner, context])?;
+            event(
+                &transaction,
+                "action.reused",
+                &action.id,
+                &json!({"candidate":context,"owner":owner,"from":reused.from_candidate,
+                        "recipe":recipe,"key":passed}),
+            )?;
+            transaction.commit()?;
+            request.reused.insert(name.into(), reused);
+            request.requested.insert(name.into(), action.id.clone());
+            return Ok(action.id);
         }
     }
     let requirement = Reservation::from(&definition);
@@ -598,11 +757,15 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
                 owner: owner.into(),
                 context: context.into(),
             }),
+            declared_inputs: passed.as_ref().map(|_| identity(&inputs)).transpose()?,
         };
         transaction.execute(
             "INSERT INTO actions VALUES (?,?,'queued',NULL,?,?)",
             params![id, key, serde_json::to_string(&action)?, action.created],
         )?;
+        if let Some(passed) = &passed {
+            transaction.execute("INSERT INTO passed_keys VALUES (?,?)", params![id, passed])?;
+        }
         event(
             &transaction,
             "action.queued",
@@ -639,6 +802,8 @@ pub fn request(
     let revision = store.revision(revision)?;
     let profile = store.profile(profile)?;
     verify_runtime(&profile)?;
+    let declared = declarations(store, &revision, &profile.definition);
+    report_declarations(&store.db, "", &declared)?;
     let mut request = Requester {
         revision: &revision,
         recipes: recipes(&profile)?,
@@ -647,6 +812,8 @@ pub fn request(
         context: "",
         requested: BTreeMap::new(),
         retention: None,
+        declared,
+        reused: BTreeMap::new(),
     };
     let id = request_job(store, &mut request, name)?;
     store.action(&id)
@@ -726,6 +893,7 @@ fn submit_inner(
         retained_from: retain_from.map(Into::into),
         retained: vec![],
         not_retained: BTreeMap::new(),
+        reused: BTreeMap::new(),
     };
     let transaction = store.transaction()?;
     transaction.execute(
@@ -734,6 +902,8 @@ fn submit_inner(
     )?;
     event(&transaction, "candidate.submitted", &id, &candidate)?;
     transaction.commit()?;
+    let declared = declarations(store, &revision_row, &profile_row.definition);
+    report_declarations(&store.db, &id, &declared)?;
     let mut request = Requester {
         revision: &revision_row,
         recipes: recipes(&profile_row)?,
@@ -746,11 +916,14 @@ fn submit_inner(
             retained: vec![],
             not_retained: BTreeMap::new(),
         }),
+        declared,
+        reused: BTreeMap::new(),
     };
     for job in &profile_row.definition.jobs {
         request_job(store, &mut request, &job.name)?;
     }
     candidate.required = request.requested;
+    candidate.reused = request.reused;
     if let Some(mut retention) = request.retention {
         retention.retained.sort();
         candidate.retained = retention.retained;
@@ -791,10 +964,11 @@ fn candidate_status_db(
     visited.remove(id);
     let mut jobs = BTreeMap::new();
     for (name, action) in &candidate.required {
-        jobs.insert(
-            name,
-            json!({"action":action,"state":action_state(db, action)?}),
-        );
+        let mut job = json!({"action":action,"state":action_state(db, action)?});
+        if let Some(reused) = candidate.reused.get(name) {
+            job["reused"] = json!(reused);
+        }
+        jobs.insert(name, job);
     }
     let state = if candidate.required.len() != profile.definition.jobs.len() {
         "incomplete"
@@ -812,8 +986,11 @@ fn candidate_status_db(
     } else {
         "pending"
     };
-    let value = json!({"id":id,"revision":candidate.revision,"profile":candidate.profile,"state":state,
+    let mut value = json!({"id":id,"revision":candidate.revision,"profile":candidate.profile,"state":state,
                     "jobs":jobs,"prerequisites":prerequisites});
+    if !candidate.reused.is_empty() {
+        value["reused"] = json!(candidate.reused.keys().collect::<Vec<_>>());
+    }
     memo.insert(id.into(), value.clone());
     Ok(value)
 }
@@ -1048,6 +1225,7 @@ pub fn promote(store: &mut Store, candidate_id: &str, expected: Option<&str>) ->
         "profile is exploratory, not a certification policy"
     );
     let recipes = recipes(&profile)?;
+    let declared = declarations(store, &revision, &profile.definition);
     // Once actions cross profiles, construction no longer guarantees identity; recompute it.
     let mut obligations = BTreeMap::new();
     for name in candidate.required.keys() {
@@ -1058,7 +1236,7 @@ pub fn promote(store: &mut Store, candidate_id: &str, expected: Option<&str>) ->
             .iter()
             .map(|d| candidate.required.get(d).cloned().unwrap_or_default())
             .collect();
-        let inputs = input_identity(store, &revision, definition)?;
+        let inputs = input_identity(store, &revision, definition, &declared)?;
         obligations.insert(name.clone(), (definition.clone(), dependencies, inputs));
     }
     let transaction = store.transaction()?;
@@ -1127,21 +1305,44 @@ pub fn promote(store: &mut Store, candidate_id: &str, expected: Option<&str>) ->
         let mismatch = format!(
             "obligation {name} does not match the certifying profile's job identity or wiring"
         );
+        // A reused pass consumed another candidate's dependency actions; its passed key
+        // deliberately excludes them, so that key is checked instead of the wiring.
+        let reused = candidate
+            .reused
+            .get(name)
+            .filter(|reused| reused.action == *action);
         ensure!(
-            row.job == *name && row.dependencies == *dependencies,
+            row.job == *name && (reused.is_some() || row.dependencies == *dependencies),
             "{mismatch}"
         );
         if let Some(identity) = &row.identity {
-            let key = action_key(
-                &revision.project,
-                &recipes[name],
-                "certifying",
-                identity.timeout_seconds,
-                inputs,
-                dependencies,
-            )?;
+            let (key, recorded) = match reused {
+                Some(_) => (
+                    passed_key(
+                        &revision.project,
+                        &recipes[name],
+                        "certifying",
+                        identity.timeout_seconds,
+                        inputs,
+                    )?,
+                    passed_key_of(&transaction, action)?,
+                ),
+                None => {
+                    let key = action_key(
+                        &revision.project,
+                        &recipes[name],
+                        "certifying",
+                        identity.timeout_seconds,
+                        inputs,
+                        dependencies,
+                    )?;
+                    (key, Some(row.key.clone()))
+                }
+            };
             ensure!(
-                identity.version == JOB_RECIPE && identity.class == "certifying" && key == row.key,
+                identity.version == JOB_RECIPE
+                    && identity.class == "certifying"
+                    && recorded == Some(key),
                 "{mismatch}"
             );
             if identity.timeout_seconds != definition.timeout_seconds {
@@ -1154,7 +1355,10 @@ pub fn promote(store: &mut Store, candidate_id: &str, expected: Option<&str>) ->
             }
         } else {
             let key = legacy_key(&revision.project, &profile.id, name, inputs, dependencies)?;
-            ensure!(row.profile == profile.id && key == row.key, "{mismatch}");
+            ensure!(
+                reused.is_none() && row.profile == profile.id && key == row.key,
+                "{mismatch}"
+            );
         }
         let (total, failed): (i64, i64) = transaction.query_row(
             "SELECT COUNT(*),COALESCE(SUM(state<>'passed'),0) FROM attempts WHERE action=?",
@@ -1163,6 +1367,8 @@ pub fn promote(store: &mut Store, candidate_id: &str, expected: Option<&str>) ->
         )?;
         let route = if candidate.retained.contains(name) {
             "retained"
+        } else if reused.is_some() {
+            "reused"
         } else if row.identity.is_none() {
             "legacy"
         } else if row
@@ -1179,8 +1385,11 @@ pub fn promote(store: &mut Store, candidate_id: &str, expected: Option<&str>) ->
             "key":row.key,"route":route,"reuse":definition.reuse,
             "observed":{"started":evidence.started,"ended":evidence.ended},
             "attempts":{"total":total,"failed":failed}});
-        if [Reuse::Exact, Reuse::Files].contains(&definition.reuse) {
+        if [Reuse::Exact, Reuse::Files, Reuse::Declared].contains(&definition.reuse) {
             receipt["audit"] = json!(definition.audit);
+        }
+        if let Some(reused) = reused {
+            receipt["reused"] = json!(reused);
         }
         receipts.insert(name, receipt);
     }
@@ -1399,7 +1608,7 @@ mod identity_tests {
             build(p).environment.insert("SHARED".into(), "1".into());
         };
         assert!(!changed(&moved, "build"), "same-value move between levels");
-        let changes: [Edit; 18] = [
+        let changes: [Edit; 19] = [
             ("command", &|p| build(p).command.push("-j2".into())),
             ("cleanup", &|p| build(p).cleanup = vec!["sh".into()]),
             ("unused tool hash", &|p| {
@@ -1429,6 +1638,9 @@ mod identity_tests {
             ("export flag", &|p| build(p).export_slots = false),
             ("engine", &|p| p.engine = "other-engine".into()),
             ("platform", &|p| p.platform = "linux-aarch64".into()),
+            ("inputs file", &|p| {
+                p.definition.inputs_file = Some("ci/inputs.json".into())
+            }),
             ("dependency command", &|p| {
                 build(p).command.push("-j2".into())
             }),
@@ -1441,6 +1653,11 @@ mod identity_tests {
             };
             assert!(changed(edit, job), "{field} did not change {job}");
         }
+        // A profile-level field, so every job's identity.
+        let mut declared = base.clone();
+        declared.definition.inputs_file = Some("ci/inputs.json".into());
+        let declared = recipes(&declared).unwrap();
+        assert!(golden.iter().all(|(job, recipe)| declared[job] != *recipe));
         // Renaming a job renames its identity; the consumer's dependency map follows it.
         let mut renamed = base.clone();
         build(&mut renamed).name = "compile".into();
@@ -1617,5 +1834,496 @@ mod identity_tests {
         assert_eq!(certificate["certificate"], 2);
         assert_eq!(certificate["receipts"]["test"]["route"], "legacy");
         assert_eq!(certificate["receipts"]["build"]["executed_under"], p.id);
+    }
+}
+
+#[cfg(test)]
+mod declared_tests {
+    use super::*;
+    use crate::declared::SCHEMA;
+
+    const FILE: &str = "ci/inputs.json";
+    const AUDIT: &str = "the declarations file names every read";
+    const DECLARATIONS: &str = r#"{"schema":"patchweft.inputs/1","common":["package.json"],
+        "jobs":{"check":{"paths":["src/**"],"why":"check reads src and package.json"},
+                "solo":{"paths":["src/**"],"exclude":["src/*.md"],"why":"solo reads src and package.json"},
+                "census":{"whole_tree":"lists the whole tree"},
+                "ghost":{"paths":["src/**"],"why":"a job this profile does not have"}}}"#;
+
+    struct Lab {
+        _temp: tempfile::TempDir,
+        store: Store,
+        repo: std::path::PathBuf,
+        root: std::path::PathBuf,
+    }
+
+    fn job(name: &str, reuse: &str, dependencies: &[&str]) -> Value {
+        let mut job = json!({"name":name,"command":["sh","-c","true"],"report":{"kind":"command"},
+            "dependencies":dependencies});
+        if reuse != "inflight" {
+            job["reuse"] = json!(reuse);
+            job["audit"] = json!(AUDIT);
+        }
+        job
+    }
+
+    impl Lab {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = temp.path().join("repo");
+            fs::create_dir(&repo).unwrap();
+            source::git(&repo, &["init", "--quiet"]).unwrap();
+            let store = Store::init(&temp.path().join("state"), 4, 4096).unwrap();
+            let mut lab = Self {
+                root: temp.path().into(),
+                _temp: temp,
+                store,
+                repo,
+            };
+            lab.commit(&[
+                ("package.json", Some("{}")),
+                ("src/a.ts", Some("a")),
+                ("src/notes.md", Some("notes")),
+                ("README", Some("readme")),
+            ]);
+            lab
+        }
+        /// Writes (Some) or deletes (None) files, commits and imports the commit.
+        fn commit(&mut self, files: &[(&str, Option<&str>)]) -> Revision {
+            for (name, text) in files {
+                let target = self.repo.join(name);
+                match text {
+                    Some(text) => {
+                        fs::create_dir_all(target.parent().unwrap()).unwrap();
+                        fs::write(target, text).unwrap();
+                    }
+                    None => fs::remove_file(target).unwrap(),
+                }
+            }
+            source::git(&self.repo, &["add", "-A"]).unwrap();
+            source::git(
+                &self.repo,
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@local.invalid",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "fixture",
+                ],
+            )
+            .unwrap();
+            source::import(&mut self.store, "fixture", &self.repo, "HEAD", "fixture").unwrap()
+        }
+        fn register(&mut self, name: &str, jobs: Value) -> RegisteredProfile {
+            let path = self.root.join(format!("{name}.json"));
+            fs::write(
+                &path,
+                json!({"version":1,"name":name,"certifying":true,"tools":{"sh":"/usr/bin/sh"},
+                    "inputs_file":FILE,"jobs":jobs})
+                .to_string(),
+            )
+            .unwrap();
+            register(&mut self.store, &path).unwrap()
+        }
+        /// `prep` (inflight) feeds `check` (declared); `solo` is declared, `census` whole-tree.
+        fn profile(&mut self) -> RegisteredProfile {
+            self.register(
+                "declared",
+                json!([
+                    job("prep", "inflight", &[]),
+                    job("check", "declared", &["prep"]),
+                    job("solo", "declared", &[]),
+                    job("census", "declared", &[])
+                ]),
+            )
+        }
+        fn submit(&mut self, revision: &Revision, profile: &RegisteredProfile) -> Candidate {
+            submit(&mut self.store, &revision.id, &profile.id, "agent", vec![]).unwrap()
+        }
+        fn pass(&self, action: &str) {
+            let attempt = unique();
+            let body = json!({"id":attempt,"action":action,"worker_pid":0,"worker_start":"0",
+                "supervisor_pid":null,"supervisor_start":null,"slots":1,"memory_mb":1,
+                "created":0.0,"started":0.5,"ended":1.0,"exit_code":0,
+                "result":{"timer_seconds":0.5}});
+            self.store
+                .db
+                .execute(
+                    "INSERT INTO attempts VALUES (?,?,'passed',1,?)",
+                    params![attempt, action, body.to_string()],
+                )
+                .unwrap();
+            self.set(action, "passed");
+            self.store
+                .db
+                .execute(
+                    "UPDATE actions SET attempt=? WHERE id=?",
+                    params![attempt, action],
+                )
+                .unwrap();
+        }
+        fn pass_all(&self, candidate: &Candidate) {
+            for action in candidate.required.values() {
+                if action_state(&self.store.db, action).unwrap() != "passed" {
+                    self.pass(action);
+                }
+            }
+        }
+        fn set(&self, action: &str, state: &str) {
+            self.store
+                .db
+                .execute(
+                    "UPDATE actions SET state=? WHERE id=?",
+                    params![state, action],
+                )
+                .unwrap();
+        }
+        fn events(&self, kind: &str) -> Vec<Value> {
+            self.store
+                .events(0)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e["kind"] == kind)
+                .collect()
+        }
+        fn actions(&self, job: &str) -> i64 {
+            self.store
+                .db
+                .query_row(
+                    "SELECT COUNT(*) FROM actions WHERE json_extract(body,'$.job')=?",
+                    [job],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn declared_jobs_need_an_audit_and_the_profile_an_inputs_file() {
+        let profile = |jobs: Value, file: Value| -> Profile {
+            serde_json::from_value(json!({"version":1,"name":"p","tools":{"sh":"/usr/bin/sh"},
+                "inputs_file":file,"jobs":jobs}))
+            .unwrap()
+        };
+        let ok = profile(
+            json!([job("a", "inflight", &[]), job("b", "declared", &["a"])]),
+            json!(FILE),
+        );
+        validate_profile(&ok, (4, 4096)).unwrap();
+        let refused = |p: Profile, message: &str| {
+            let error = validate_profile(&p, (4, 4096)).unwrap_err().to_string();
+            assert!(error.contains(message), "{error}");
+        };
+        let mut short = job("b", "declared", &[]);
+        short["audit"] = json!("too short");
+        refused(profile(json!([short]), json!(FILE)), "audit");
+        let mut projected = job("b", "declared", &[]);
+        projected["inputs"] = json!(["src/a.ts"]);
+        refused(profile(json!([projected]), json!(FILE)), "input projection");
+        refused(
+            profile(json!([job("b", "declared", &[])]), Value::Null),
+            "inputs_file",
+        );
+        refused(
+            profile(json!([job("b", "declared", &[])]), json!("../inputs.json")),
+            "relative",
+        );
+        refused(
+            profile(json!([job("b", "inflight", &[])]), json!("/inputs.json")),
+            "relative",
+        );
+        validate_profile(
+            &profile(json!([job("b", "inflight", &[])]), Value::Null),
+            (4, 4096),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_declared_pass_is_reused_across_commits_that_differ_only_outside() {
+        let mut lab = Lab::new();
+        let profile = lab.profile();
+        let first = lab.commit(&[(FILE, Some(DECLARATIONS))]);
+        let a = lab.submit(&first, &profile);
+        assert!(a.reused.is_empty());
+        lab.pass_all(&a);
+        let outside = lab.commit(&[("README", Some("changed"))]);
+        let b = lab.submit(&outside, &profile);
+        for job in ["prep", "census"] {
+            assert_ne!(
+                b.required[job], a.required[job],
+                "{job} keeps the commit key"
+            );
+        }
+        for job in ["check", "solo"] {
+            assert_eq!(b.required[job], a.required[job], "{job}");
+            assert_eq!(lab.actions(job), 1, "{job} has no new action");
+            assert_eq!(
+                b.reused[job],
+                Reused {
+                    action: a.required[job].clone(),
+                    from_candidate: a.id.clone(),
+                    from_revision: first.id.clone(),
+                }
+            );
+        }
+        assert_eq!(b.reused.len(), 2);
+        let events = lab.events("action.reused");
+        assert_eq!(events.len(), 2);
+        let check = events
+            .iter()
+            .find(|e| e["subject"] == a.required["check"])
+            .unwrap();
+        let recipe = recipes(&profile).unwrap()["check"].clone();
+        let key = passed_key_of(&lab.store.db, &a.required["check"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            check["detail"],
+            json!({"candidate":b.id,"owner":"agent","from":a.id,"recipe":recipe,"key":key})
+        );
+        let status = candidate_status(&lab.store, &b.id).unwrap();
+        assert_eq!(status["reused"], json!(["check", "solo"]));
+        assert_eq!(status["jobs"]["check"]["state"], "passed");
+        assert_eq!(status["jobs"]["check"]["reused"], json!(b.reused["check"]));
+        assert!(status["jobs"]["prep"].get("reused").is_none());
+        assert!(
+            candidate_status(&lab.store, &a.id)
+                .unwrap()
+                .get("reused")
+                .is_none()
+        );
+
+        // Inputs are per job: `solo` excludes the notes `check` reads.
+        let notes = lab.commit(&[("src/notes.md", None)]);
+        let n = lab.submit(&notes, &profile);
+        assert_eq!(n.reused.keys().collect::<Vec<_>>(), ["solo"]);
+        assert_eq!(n.required["solo"], a.required["solo"]);
+        assert_ne!(n.required["check"], a.required["check"]);
+        let inside = lab.commit(&[("src/a.ts", Some("a2"))]);
+        let c = lab.submit(&inside, &profile);
+        assert!(c.reused.is_empty());
+        for job in ["check", "solo"] {
+            assert_ne!(c.required[job], a.required[job], "{job}");
+            assert_ne!(c.required[job], n.required[job], "{job}");
+        }
+        assert_eq!((lab.actions("check"), lab.actions("solo")), (3, 2));
+    }
+
+    #[test]
+    fn only_a_passed_action_is_reused() {
+        let mut lab = Lab::new();
+        let profile = lab.profile();
+        let mut readme = String::from("readme");
+        let mut revision = lab.commit(&[(FILE, Some(DECLARATIONS))]);
+        let mut previous = lab.submit(&revision, &profile);
+        for state in ["failed", "interrupted", "canceled", "stopping"] {
+            lab.set(&previous.required["solo"], state);
+            readme.push('!');
+            revision = lab.commit(&[("README", Some(&readme))]);
+            let next = lab.submit(&revision, &profile);
+            assert_ne!(next.required["solo"], previous.required["solo"], "{state}");
+            assert!(next.reused.is_empty(), "{state}");
+            previous = next;
+        }
+        assert!(lab.events("action.reused").is_empty());
+        lab.pass(&previous.required["solo"]);
+        readme.push('!');
+        let revision = lab.commit(&[("README", Some(&readme))]);
+        let last = lab.submit(&revision, &profile);
+        assert_eq!(last.required["solo"], previous.required["solo"]);
+    }
+
+    #[test]
+    fn absent_or_invalid_declarations_keep_the_commit_key() {
+        let mut lab = Lab::new();
+        let profile = lab.profile();
+        let invalid = DECLARATIONS.replacen("\"common\"", "\"extra\":1,\"common\"", 1);
+        let mut readme = String::from("readme");
+        for (text, reason) in [
+            (None, "missing"),
+            (Some(invalid.as_str()), "unknown field `extra`"),
+        ] {
+            let revision = match text {
+                Some(text) => lab.commit(&[(FILE, Some(text))]),
+                None => lab.commit(&[]),
+            };
+            let first = lab.submit(&revision, &profile);
+            let events = lab.events("inputs.invalid");
+            let event = events.last().unwrap();
+            assert_eq!(event["detail"]["candidate"], first.id);
+            assert!(
+                event["detail"]["reason"].as_str().unwrap().contains(reason),
+                "{event}"
+            );
+            let recipes = recipes(&profile).unwrap();
+            for job in ["check", "solo"] {
+                let action = lab.store.action(&first.required[job]).unwrap();
+                let dependencies: Vec<String> = match job {
+                    "check" => vec![first.required["prep"].clone()],
+                    _ => vec![],
+                };
+                let today = action_key(
+                    &revision.project,
+                    &recipes[job],
+                    "certifying",
+                    1800,
+                    &json!({"commit":revision.commit}),
+                    &dependencies,
+                )
+                .unwrap();
+                assert_eq!(action.key, today, "{job}");
+                assert_eq!(action.declared_inputs, None, "{job}");
+                assert_eq!(passed_key_of(&lab.store.db, &action.id).unwrap(), None);
+            }
+            lab.pass_all(&first);
+            readme.push('!');
+            let next = lab.commit(&[("README", Some(&readme))]);
+            let second = lab.submit(&next, &profile);
+            assert!(second.reused.is_empty());
+            for job in ["check", "solo"] {
+                assert_ne!(second.required[job], first.required[job], "{job}");
+            }
+        }
+        assert!(lab.events("action.reused").is_empty());
+    }
+
+    #[test]
+    fn unmatched_keys_are_reported_and_declared_inputs_recorded() {
+        let mut lab = Lab::new();
+        let profile = lab.profile();
+        let revision = lab.commit(&[(FILE, Some(DECLARATIONS))]);
+        let candidate = lab.submit(&revision, &profile);
+        let unmatched = lab.events("inputs.unmatched");
+        assert_eq!(unmatched.len(), 1);
+        assert_eq!(
+            unmatched[0]["detail"],
+            json!({"candidate":candidate.id,"key":"ghost"})
+        );
+        assert!(lab.events("inputs.invalid").is_empty());
+        let declared = declarations(&lab.store, &revision, &profile.definition);
+        for job in ["check", "solo"] {
+            let action = lab.store.action(&candidate.required[job]).unwrap();
+            let inputs = declared.identity(job).unwrap();
+            assert_eq!(inputs["declared"]["schema"], SCHEMA);
+            assert_eq!(
+                action.declared_inputs,
+                Some(identity(inputs).unwrap()),
+                "{job}"
+            );
+            assert_eq!(
+                passed_key_of(&lab.store.db, &action.id).unwrap(),
+                Some(
+                    passed_key(
+                        &revision.project,
+                        &recipes(&profile).unwrap()[job],
+                        "certifying",
+                        1800,
+                        inputs
+                    )
+                    .unwrap()
+                )
+            );
+        }
+        for job in ["prep", "census"] {
+            let action = lab.store.action(&candidate.required[job]).unwrap();
+            assert_eq!(action.declared_inputs, None, "{job}");
+            assert_eq!(passed_key_of(&lab.store.db, &action.id).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn promote_accepts_a_reused_receipt_by_its_passed_key() {
+        let mut lab = Lab::new();
+        let profile = lab.profile();
+        let first = lab.commit(&[(FILE, Some(DECLARATIONS))]);
+        let a = lab.submit(&first, &profile);
+        lab.pass_all(&a);
+        let outside = lab.commit(&[("README", Some("changed"))]);
+        let b = lab.submit(&outside, &profile);
+        let check = lab.store.action(&b.required["check"]).unwrap();
+        // The reused pass consumed the earlier candidate's `prep`.
+        assert_eq!(check.dependencies, [a.required["prep"].clone()]);
+        assert_ne!(b.required["prep"], a.required["prep"]);
+        lab.pass_all(&b);
+        review(&mut lab.store, &outside.id, "reviewer").unwrap();
+        let refused = |lab: &mut Lab| {
+            let error = promote(&mut lab.store, &b.id, None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("obligation check does not match"), "{error}");
+        };
+        let key = passed_key_of(&lab.store.db, &check.id).unwrap().unwrap();
+        lab.store
+            .db
+            .execute(
+                "UPDATE passed_keys SET key='other' WHERE action=?",
+                [&check.id],
+            )
+            .unwrap();
+        refused(&mut lab);
+        lab.store
+            .db
+            .execute(
+                "UPDATE passed_keys SET key=? WHERE action=?",
+                [&key, &check.id],
+            )
+            .unwrap();
+        let strip = "UPDATE candidates SET body=json_remove(body,'$.reused.check') WHERE id=?";
+        lab.store.db.execute(strip, [&b.id]).unwrap();
+        refused(&mut lab);
+        lab.store
+            .db
+            .execute(
+                "UPDATE candidates SET body=? WHERE id=?",
+                params![serde_json::to_string(&b).unwrap(), b.id],
+            )
+            .unwrap();
+        let certificate = promote(&mut lab.store, &b.id, None).unwrap();
+        let receipt = &certificate["receipts"]["check"];
+        assert_eq!(receipt["route"], "reused");
+        assert_eq!(receipt["reused"], json!(b.reused["check"]));
+        assert_eq!(receipt["audit"], AUDIT);
+        assert_eq!(certificate["receipts"]["solo"]["route"], "reused");
+        assert_eq!(certificate["receipts"]["prep"]["route"], "own");
+    }
+
+    #[test]
+    fn retention_keeps_a_reused_pass_whose_dependency_actions_differ() {
+        let mut lab = Lab::new();
+        let profile = lab.profile();
+        let first = lab.commit(&[(FILE, Some(DECLARATIONS))]);
+        let a = lab.submit(&first, &profile);
+        lab.pass_all(&a);
+        let outside = lab.commit(&[("README", Some("changed"))]);
+        let b = lab.submit(&outside, &profile);
+        lab.pass_all(&b);
+        let retained = submit_retaining(
+            &mut lab.store,
+            &outside.id,
+            &profile.id,
+            "agent",
+            vec![],
+            Some(&b.id),
+        )
+        .unwrap();
+        assert_eq!(retained.retained, ["census", "check", "prep", "solo"]);
+        assert!(
+            retained.not_retained.is_empty(),
+            "{:?}",
+            retained.not_retained
+        );
+        assert_eq!(retained.reused, b.reused);
+        review(&mut lab.store, &outside.id, "reviewer").unwrap();
+        let certificate = promote(&mut lab.store, &retained.id, None).unwrap();
+        assert_eq!(certificate["receipts"]["check"]["route"], "retained");
+        assert_eq!(
+            certificate["receipts"]["check"]["reused"],
+            json!(b.reused["check"])
+        );
     }
 }

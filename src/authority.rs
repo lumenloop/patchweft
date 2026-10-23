@@ -1869,6 +1869,7 @@ mod tests {
                 .reservation
                 .map(|(slots, memory_mb)| Reservation { slots, memory_mb }),
             origin: None,
+            declared_inputs: None,
         };
         db.execute(
             "INSERT INTO actions VALUES (?,?,'queued',NULL,?,?)",

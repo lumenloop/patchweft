@@ -108,6 +108,7 @@ impl Lab {
             tools: BTreeMap::from([("sh".into(), PathBuf::from("/usr/bin/sh"))]),
             environment: BTreeMap::new(),
             jobs: vec![job],
+            inputs_file: None,
         };
         let profile = RegisteredProfile {
             id: "f-1".into(),
@@ -153,6 +154,7 @@ impl Lab {
                     memory_mb: 512,
                 }),
                 origin: None,
+                declared_inputs: None,
             },
             profile,
             revision: RevisionRef {
