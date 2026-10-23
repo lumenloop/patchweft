@@ -985,8 +985,7 @@ impl<T: Transport> Coordinator<T> {
                 {
                     log(json!({"event":"heartbeat_adapted","executor":self.executor,
                                "lease_seconds":lease_seconds,
-                               "heartbeat_seconds":(Duration::from_secs(lease_seconds) / 3)
-                                   .as_secs_f64()}));
+                               "heartbeat_seconds":self.interval(lease_seconds).as_secs_f64()}));
                 }
                 state.lease_seconds = lease_seconds;
             }

@@ -92,6 +92,8 @@ impl From<serde_json::Error> for AuthorityError {
 pub fn prepare(db: &Connection) -> Result<()> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS executors (id TEXT PRIMARY KEY, body TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS manifest_sizes (attempt TEXT PRIMARY KEY, bytes INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS requeues (action TEXT PRIMARY KEY, count INTEGER NOT NULL);
          CREATE INDEX IF NOT EXISTS attempts_held ON attempts(drained, state);
          CREATE INDEX IF NOT EXISTS attempts_claim_key ON attempts(json_extract(body,'$.claim_key'));",
     )?;
@@ -284,19 +286,40 @@ pub fn select(
     Ok(Selection { choice, unverified })
 }
 
+/// The serialized size of an attempt's artifact manifest, as a claim inlines it. Recorded once
+/// with the result, so the claim path reads a number instead of parsing manifests (gate P2-A).
+fn record_manifest_size(db: &Connection, attempt: &str, evidence: &Value) -> Result<u64> {
+    let bytes = serde_json::to_vec(&evidence["artifacts"])?.len() as u64;
+    db.execute(
+        "INSERT OR REPLACE INTO manifest_sizes VALUES (?,?)",
+        params![attempt, bytes as i64],
+    )?;
+    Ok(bytes)
+}
+
 /// Bytes of the dependency manifests a claim of `action` would inline.
 fn dependency_manifests(db: &Connection, action: &Action) -> Result<u64> {
     let mut total = 0;
     for dependency in &action.dependencies {
-        let producer: Option<String> = db.query_row(
-            "SELECT attempt FROM actions WHERE id=?",
-            [dependency],
-            |r| r.get(0),
-        )?;
-        let Some(producer) = producer else { continue };
-        if let Some(evidence) = record::<Attempt>(db, "attempts", &producer)?.result {
-            total += serde_json::to_vec(&evidence["artifacts"])?.len() as u64;
-        }
+        let row: Option<(Option<String>, Option<i64>)> = db
+            .query_row(
+                "SELECT a.attempt, m.bytes FROM actions a
+                 LEFT JOIN manifest_sizes m ON m.attempt = a.attempt WHERE a.id=?",
+                [dependency],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        total += match row {
+            Some((_, Some(bytes))) => bytes as u64,
+            // Recorded before sizes were stored: measured once, then read like the rest.
+            Some((Some(producer), None)) => {
+                match record::<Attempt>(db, "attempts", &producer)?.result {
+                    Some(evidence) => record_manifest_size(db, &producer, &evidence)?,
+                    None => 0,
+                }
+            }
+            _ => 0,
+        };
     }
     Ok(total)
 }
@@ -893,42 +916,28 @@ fn record_completion(
             drain_recorded: false,
         });
     }
-    // Still live but no longer in this credential's scope: its evidence is not trusted, but the
-    // capacity it holds is released and the action waits for an executor in scope (gate P3-3).
+    // Still live but no longer in this credential's scope: its evidence is not trusted, so it is
+    // recorded through the one result writer as an outcome without evidence, which releases the
+    // capacity and honours a recorded stop (gate P3-C).
     if holding(&transaction, scope, &attempt, &state)?.is_none()
-        && let Some((action, _)) = holding(&transaction, &Scope::all(), &attempt, &state)?
+        && holding(&transaction, &Scope::all(), &attempt, &state)?.is_some()
     {
-        let action_state = if request.drained {
-            "queued"
-        } else {
-            "interrupted"
+        let unrecorded = CompleteRequest {
+            outcome: Outcome::Lost,
+            reason: Some("out-of-scope".into()),
+            exit_code: 125,
+            evidence: json!({"error":"the executor's grant no longer covers this action"}),
+            log: None,
+            cleanup_log: None,
+            artifacts: BTreeMap::new(),
+            ..request.clone()
         };
-        transaction.execute(
-            "UPDATE attempts SET state='interrupted',drained=? WHERE id=?",
-            params![request.drained, attempt.id],
-        )?;
-        if request.drained {
-            transaction.execute(
-                "UPDATE actions SET state='queued',attempt=NULL WHERE id=? AND attempt=?",
-                params![action.id, attempt.id],
-            )?;
-        } else {
-            transaction.execute(
-                "UPDATE actions SET state='interrupted' WHERE id=? AND attempt=?",
-                params![action.id, attempt.id],
-            )?;
-        }
-        event(
-            &transaction,
-            "attempt.out_of_scope",
-            &attempt.id,
-            &json!({"executor":executor,"drained":request.drained,"action":action_state}),
-        )?;
+        let state = record_result(&transaction, &unrecorded, &hash)?;
         transaction.commit()?;
         return Ok(CompleteResponse {
             attempt: attempt.id,
             status: "fenced".into(),
-            state: Some("interrupted".into()),
+            state: Some(state.into()),
             drained: request.drained,
             replayed: false,
             drain_recorded: request.drained,
@@ -1095,13 +1104,19 @@ pub fn record_result(
     let reason = request.reason.as_deref();
     let executor = attempt.executor.as_deref().unwrap_or(LOCAL);
     // Requeueing needs drained resources and a budget left: a failure that repeats on every host
-    // ends interrupted for an operator instead of looping.
-    let interrupted: i64 = db.query_row(
-        "SELECT COUNT(*) FROM attempts WHERE action=? AND state='interrupted'",
-        [&action.id],
-        |r| r.get(0),
-    )?;
-    let requeue = request.drained && interrupted < REQUEUE_BUDGET;
+    // ends interrupted for an operator instead of looping. The budget counts not-started requeues
+    // since the action's last retry only (gate P3-D); `retry` resets it.
+    let requeued: i64 = db
+        .query_row(
+            "SELECT count FROM requeues WHERE action=?",
+            [&action.id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    // A recorded no-requesters stop means nobody wants the work: canceled, never requeued (P3-C).
+    let unwanted = attempt.stop.as_deref() == Some("no-requesters");
+    let requeue = request.drained && !unwanted && requeued < REQUEUE_BUDGET;
     let (state, action_state, kind, detail) = match request.outcome {
         Outcome::Completed => {
             let state = if request.exit_code == 0 {
@@ -1130,14 +1145,21 @@ pub fn record_result(
                                 "requeued":action_state == "queued"});
             (state, action_state, "attempt.launch_failed", detail)
         }
-        // A lost supervisor reported drained never started its command (gate P3-2).
-        Outcome::Lost => (
-            "interrupted",
-            if requeue { "queued" } else { "interrupted" },
-            "attempt.interrupted",
-            json!({"drained":request.drained,"operator_confirmed":false,
-                   "reason":"supervisor-lost","executor":executor,"requeued":requeue}),
-        ),
+        // A lost supervisor reported drained never started its command (gate P3-2); an attempt
+        // whose result is not recorded (out of scope, P3-C) reports this outcome with its reason.
+        Outcome::Lost => {
+            let (state, action_state) = if unwanted && request.drained {
+                ("canceled", "canceled")
+            } else if requeue {
+                ("interrupted", "queued")
+            } else {
+                ("interrupted", "interrupted")
+            };
+            let detail = json!({"drained":request.drained,"operator_confirmed":false,
+                                "reason":reason.unwrap_or("supervisor-lost"),"executor":executor,
+                                "requeued":action_state == "queued"});
+            (state, action_state, "attempt.interrupted", detail)
+        }
         Outcome::Undeliverable => (
             "interrupted",
             "interrupted",
@@ -1149,6 +1171,7 @@ pub fn record_result(
     attempt.ended = Some(now());
     attempt.exit_code = Some(request.exit_code);
     attempt.result = Some(evidence.clone());
+    record_manifest_size(db, &attempt.id, evidence)?;
     attempt.completion = Some(hash.into());
     db.execute(
         "UPDATE attempts SET state=?,drained=?,body=? WHERE id=?",
@@ -1163,6 +1186,10 @@ pub fn record_result(
         db.execute(
             "UPDATE actions SET state='queued',attempt=NULL WHERE id=? AND attempt=?",
             params![action.id, attempt.id],
+        )?;
+        db.execute(
+            "INSERT INTO requeues VALUES (?,1) ON CONFLICT(action) DO UPDATE SET count=count+1",
+            [&action.id],
         )?;
     } else {
         db.execute(
@@ -2796,9 +2823,212 @@ mod tests {
         .unwrap();
         let remote = claim_for(&mut store, "mindy", &Scope::all(), &ask("k1", &["f-1"])).unwrap();
         assert_eq!(claimed(&remote), None);
+        // The producer recorded before sizes were stored was measured once, then kept.
+        let stored: i64 = store
+            .db
+            .query_row(
+                "SELECT bytes FROM manifest_sizes WHERE attempt='p-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(stored as u64 > api::MAX_CLAIM_MANIFESTS);
         // The local executor reads no claim response, so it runs the action.
         let local = claim_for(&mut store, LOCAL, &Scope::all(), &ask("k2", &["f-1"])).unwrap();
         assert_eq!(claimed(&local), Some("consumer"));
+    }
+
+    #[test]
+    fn the_claim_path_reads_the_recorded_manifest_size() {
+        // Gate P2-A: select compares the size recorded with the result; it never parses the
+        // producer's manifest inside the write transaction. A tiny manifest recorded as huge proves
+        // the stored number is what counts.
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 16, 16384);
+        queue(
+            &store.db,
+            Queue {
+                id: "producer",
+                ..Queue::default()
+            },
+        );
+        queue(
+            &store.db,
+            Queue {
+                id: "consumer",
+                created: 2.0,
+                ..Queue::default()
+            },
+        );
+        let attempt = json!({"id":"p-1","action":"producer","worker_pid":0,"worker_start":"",
+            "supervisor_pid":null,"supervisor_start":null,"slots":1,"memory_mb":1,"created":0.0,
+            "started":null,"ended":null,"exit_code":0,"result":{"artifacts":{}}});
+        store
+            .db
+            .execute(
+                "INSERT INTO attempts VALUES ('p-1','producer','passed',1,?)",
+                [attempt.to_string()],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE actions SET state='passed',attempt='p-1' WHERE id='producer'",
+                [],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE actions SET body=json_set(body,'$.dependencies',json('[\"producer\"]'))
+             WHERE id='consumer'",
+                [],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO manifest_sizes VALUES ('p-1',?)",
+                [api::MAX_CLAIM_MANIFESTS as i64 + 1],
+            )
+            .unwrap();
+        let remote = claim_for(&mut store, "mindy", &Scope::all(), &ask("k1", &["f-1"])).unwrap();
+        assert_eq!(claimed(&remote), None);
+        // And record_result stores the size with every result it writes.
+        store.db.execute("DELETE FROM manifest_sizes", []).unwrap();
+        store
+            .db
+            .execute("DELETE FROM actions WHERE id='consumer'", [])
+            .unwrap();
+        queued(&store.db, "built", 3.0);
+        let claim = grant(&mut store, "k2");
+        register_supervisor(&mut store, &claim);
+        let evidence = json!({"exit_code":0,"reason":null,
+                              "artifacts":{"dist/a":{"sha256":"0".repeat(64),"mode":420,"bytes":1}}});
+        let request = CompleteRequest {
+            artifacts: serde_json::from_value(evidence["artifacts"].clone()).unwrap(),
+            ..finish(&claim, Outcome::Completed, None, 0, evidence.clone())
+        };
+        complete(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &request,
+            Outputs::InPlace,
+        )
+        .unwrap();
+        let bytes: i64 = store
+            .db
+            .query_row(
+                "SELECT bytes FROM manifest_sizes WHERE attempt=?",
+                [&claim.attempt.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bytes as usize,
+            serde_json::to_vec(&evidence["artifacts"]).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn out_of_scope_results_go_through_the_one_result_writer() {
+        // Gate P3-C: a report the narrowed grant no longer covers is recorded without its evidence,
+        // releases its capacity, and honours a recorded stop like any other result.
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        queued(&store.db, "wanted", 1.0);
+        queued(&store.db, "unwanted", 2.0);
+        let narrowed = Scope {
+            projects: None,
+            profiles: Some(["f-other".to_owned()].into()),
+        };
+        let wanted = grant(&mut store, "k1");
+        register_supervisor(&mut store, &wanted);
+        let request = finish(&wanted, Outcome::Completed, None, 0, json!({"exit_code":0}));
+        let response =
+            complete(&mut store, "mindy", &narrowed, &request, Outputs::InPlace).unwrap();
+        assert_eq!(
+            (response.status.as_str(), response.state.as_deref()),
+            ("fenced", Some("interrupted"))
+        );
+        assert_eq!(state(&store.db, "wanted"), "queued");
+        let recorded = store.attempt(&wanted.attempt.id).unwrap();
+        assert_eq!(
+            recorded.result.unwrap()["error"],
+            "the executor's grant no longer covers this action"
+        );
+        // Out of the way of the next claim.
+        store
+            .db
+            .execute("UPDATE actions SET state='canceled' WHERE id='wanted'", [])
+            .unwrap();
+        // A recorded no-requesters stop wins: nobody wants it, so it is canceled, not requeued.
+        let unwanted = grant(&mut store, "k2");
+        register_supervisor(&mut store, &unwanted);
+        let recorded = stopping(
+            &store.db,
+            "unwanted",
+            &unwanted.attempt.id,
+            Some("no-requesters"),
+        )
+        .unwrap();
+        assert_eq!(recorded.as_deref(), Some("no-requesters"));
+        assert_eq!(
+            store.attempt(&unwanted.attempt.id).unwrap().stop.as_deref(),
+            Some("no-requesters")
+        );
+        let request = finish(
+            &unwanted,
+            Outcome::Completed,
+            None,
+            0,
+            json!({"exit_code":0}),
+        );
+        let response =
+            complete(&mut store, "mindy", &narrowed, &request, Outputs::InPlace).unwrap();
+        assert_eq!(response.state.as_deref(), Some("canceled"));
+        assert_eq!(state(&store.db, "unwanted"), "canceled");
+    }
+
+    #[test]
+    fn the_requeue_budget_counts_not_started_requeues_since_the_last_retry() {
+        // Gate P3-D: three not-started requeues, then the action waits for an operator; a retry
+        // starts the count again, and earlier interruptions of other kinds never spend it.
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        queued(&store.db, "flaky", 1.0);
+        let not_started = |store: &mut Store, key: &str| {
+            let claim = grant(store, key);
+            let request = finish(
+                &claim,
+                Outcome::NotStarted,
+                Some("launch-failed"),
+                125,
+                json!({}),
+            );
+            complete(store, "mindy", &Scope::all(), &request, Outputs::InPlace).unwrap();
+        };
+        for key in ["k1", "k2", "k3"] {
+            not_started(&mut store, key);
+            assert_eq!(state(&store.db, "flaky"), "queued", "{key}");
+        }
+        not_started(&mut store, "k4");
+        assert_eq!(state(&store.db, "flaky"), "interrupted");
+        // An operator's retry resets the budget (engine::retry deletes the row).
+        store
+            .db
+            .execute("DELETE FROM requeues WHERE action='flaky'", [])
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE actions SET state='queued',attempt=NULL WHERE id='flaky'",
+                [],
+            )
+            .unwrap();
+        not_started(&mut store, "k5");
+        assert_eq!(state(&store.db, "flaky"), "queued");
     }
 
     #[test]

@@ -127,24 +127,31 @@ fn prepare(claim: &ClaimFile, job: &Job, directory: &Path) -> Result<(PathBuf, V
     engine::verify_runtime(&claim.profile).map_err(RuntimeMismatch)?;
     let view = directory.join("work");
     let (repo, commit) = (&claim.repository, &claim.revision.commit);
+    // Infrastructure (this host's I/O, its checkout) is marked `setup`; content checks the revision
+    // or its producers fail stay failures with a repair (gate P3-B: classified by cause).
     if job.reuse == Reuse::Files {
-        fs::create_dir(&view)?;
+        setup(fs::create_dir(&view))?;
         for input in &job.inputs {
             let path = source::relative_path(input)?;
-            let output = source::git_command(repo)
-                .args(["show", &format!("{commit}:{input}")])
-                .output()?;
+            let output = setup(
+                source::git_command(repo)
+                    .args(["show", &format!("{commit}:{input}")])
+                    .output(),
+            )?;
             ensure!(output.status.success(), "declared source input unavailable");
             let target = view.join(path);
-            fs::create_dir_all(target.parent().context("input parent")?)?;
-            fs::write(&target, output.stdout)?;
-            let entry = source::git(repo, &["ls-tree", commit, "--", input])?;
+            setup(fs::create_dir_all(target.parent().context("input parent")?))?;
+            setup(fs::write(&target, output.stdout))?;
+            let entry = setup(source::git(repo, &["ls-tree", commit, "--", input]))?;
             if entry.starts_with("100755 ") {
-                fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
+                setup(fs::set_permissions(
+                    target,
+                    fs::Permissions::from_mode(0o755),
+                ))?;
             }
         }
     } else {
-        source::checkout_from(repo, commit, &view)?;
+        setup(source::checkout_from(repo, commit, &view))?;
     }
     let source_seconds = source_started.elapsed().as_secs_f64();
     let dependencies_started = Instant::now();
@@ -154,13 +161,12 @@ fn prepare(claim: &ClaimFile, job: &Job, directory: &Path) -> Result<(PathBuf, V
     for dependency in &claim.dependencies {
         let name = &dependency.name;
         let relative = source::relative_path(name)?;
+        let metadata = setup(fs::symlink_metadata(&dependency.path))?;
         ensure!(
-            !fs::symlink_metadata(&dependency.path)?
-                .file_type()
-                .is_symlink(),
+            !metadata.file_type().is_symlink(),
             "dependency artifact is a symlink"
         );
-        let hash = file_hash(&dependency.path)?;
+        let hash = setup(file_hash(&dependency.path))?;
         ensure!(
             dependency.sha256 == hash,
             "dependency artifact is corrupt: {name}"
@@ -176,8 +182,11 @@ fn prepare(claim: &ClaimFile, job: &Job, directory: &Path) -> Result<(PathBuf, V
         );
         contained_parent(&view, &target)?;
         let copy_started = Instant::now();
-        copied_bytes += fs::copy(&dependency.path, &target)?;
-        fs::set_permissions(&target, fs::Permissions::from_mode(dependency.mode))?;
+        copied_bytes += setup(fs::copy(&dependency.path, &target))?;
+        setup(fs::set_permissions(
+            &target,
+            fs::Permissions::from_mode(dependency.mode),
+        ))?;
         copy_seconds += copy_started.elapsed().as_secs_f64();
         restored.insert(name.clone(), hash);
     }
@@ -358,7 +367,7 @@ fn execute_command(
         );
     }
     let timeout_seconds = claim.attempt.timeout_seconds;
-    let (view, preparation) = setup(prepare(claim, job, directory))?;
+    let (view, preparation) = prepare(claim, job, directory)?;
     let scratch = directory.join("scratch");
     let home = directory.join("home");
     setup(fs::create_dir(&scratch))?;

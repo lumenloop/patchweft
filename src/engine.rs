@@ -937,6 +937,11 @@ pub fn retry_owned(
             "UPDATE actions SET state='queued',attempt=NULL,body=? WHERE id=?",
             params![serde_json::to_string(&action)?, id],
         )?;
+        // An operator's retry restarts the not-started requeue budget (gate P3-D).
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS requeues (action TEXT PRIMARY KEY, count INTEGER NOT NULL)",
+        )?;
+        transaction.execute("DELETE FROM requeues WHERE action=?", [id])?;
         transaction.execute(
             "UPDATE interests SET active=1 WHERE action=? AND context=? AND (? IS NULL OR owner=?)",
             params![id, candidate_id, owner, owner],

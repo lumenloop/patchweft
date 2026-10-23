@@ -5,8 +5,8 @@
 use patchweft::{
     engine, file_hash,
     model::{
-        Action, ActionIdentity, CONTROL_VERSION, ClaimFile, Grant, JOB_RECIPE, Job, Outcome,
-        Profile, RegisteredProfile, Reservation, RevisionRef, SupervisorResult,
+        Action, ActionIdentity, CONTROL_VERSION, ClaimFile, DependencyFile, Grant, JOB_RECIPE, Job,
+        Outcome, Profile, RegisteredProfile, Reservation, RevisionRef, SupervisorResult,
     },
     unique,
 };
@@ -365,6 +365,67 @@ fn supervisor_records_its_own_timeout_as_stopping() {
     assert_eq!(stopping, json!({"reason":"timeout"}));
     // A supervisor reports its own stops; `stop` is only ever its coordinator's.
     assert!(!lab.control(&claim).join("stop").exists());
+}
+
+/// A dependency of `claim` at `path` named `name`, whose digest is that of `content`.
+fn dependency(lab: &Lab, name: &str, path: PathBuf, content: &str) -> DependencyFile {
+    let sample = lab.root.join(format!("sample-{}", unique()));
+    fs::write(&sample, content).unwrap();
+    DependencyFile {
+        action: "producer".into(),
+        attempt: "p-1".into(),
+        name: name.into(),
+        sha256: file_hash(&sample).unwrap(),
+        mode: 0o644,
+        bytes: content.len() as u64,
+        path,
+    }
+}
+
+#[test]
+fn setup_failures_are_classified_by_cause() {
+    // Gate P3-B. This host failing to set the job up says nothing about the revision: not started,
+    // requeued elsewhere.
+    let lab = Lab::new();
+    let mut claim = lab.claim("touch \"$PATCHWEFT_STATE/ran\"", None, 60);
+    claim
+        .dependencies
+        .push(dependency(&lab, "dist/x", lab.root.join("vanished"), "x"));
+    lab.write(&claim);
+    lab.register(&claim);
+    let result = lab.result(&claim, lab.spawn(&claim));
+    assert_eq!(
+        (result.outcome, result.reason.as_deref()),
+        (Outcome::NotStarted, Some("setup-failed")),
+        "{}",
+        result.evidence
+    );
+    // A producer's artifact that would overwrite the revision's own file is the content's fault:
+    // it fails, with a repair, as before.
+    let present = lab.root.join("present");
+    fs::write(&present, "y").unwrap();
+    let mut claim = lab.claim("touch \"$PATCHWEFT_STATE/ran\"", None, 60);
+    claim
+        .dependencies
+        .push(dependency(&lab, "README", present, "y"));
+    lab.write(&claim);
+    lab.register(&claim);
+    let result = lab.result(&claim, lab.spawn(&claim));
+    assert_eq!(
+        (result.outcome, result.exit_code),
+        (Outcome::Completed, 125),
+        "{}",
+        result.evidence
+    );
+    assert!(
+        result.evidence["error"]
+            .as_str()
+            .unwrap()
+            .contains("would overwrite source"),
+        "{}",
+        result.evidence
+    );
+    assert!(!lab.root.join("ran").exists());
 }
 
 #[test]
