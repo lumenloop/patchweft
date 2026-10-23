@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
-use patchweft::{api, client, engine, http, mcp, source, store::Store, worker};
+use patchweft::{api, client, engine, executor, http, mcp, source, store::Store, worker};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -135,10 +135,15 @@ enum Operation {
         #[arg(long)]
         retain_from: Option<String>,
     },
-    /// Run a local coordinator; --drain exits when all currently runnable work is finished.
+    /// Run the local executor's coordinator; --drain exits when all currently runnable work is
+    /// finished. A second coordinator waits as a standby.
     Worker {
         #[arg(long)]
         drain: bool,
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..))]
+        poll_ms: u64,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+        heartbeat_seconds: u64,
     },
     /// Inspect exact source identities, action states and unmet prerequisites.
     Status { candidate: Option<String> },
@@ -188,7 +193,8 @@ enum Operation {
         #[arg(long)]
         candidate: String,
     },
-    /// Recover dead coordinators. Supervisor loss retains capacity until an operator confirms drain.
+    /// Reconcile the local executor while no worker runs. Supervisor loss retains capacity until
+    /// an operator confirms drain.
     Recover {
         #[arg(long)]
         confirm_drained: Option<String>,
@@ -215,8 +221,6 @@ enum Operation {
         #[arg(value_parser=["projects","revisions","workspaces","profiles"])]
         kind: String,
     },
-    #[command(name = "_execute", hide = true)]
-    Execute { attempt: String },
     /// Supervise one claimed attempt from its control files; never opens the store.
     #[command(name = "_supervise", hide = true)]
     Supervise { root: PathBuf, attempt: String },
@@ -419,7 +423,18 @@ fn run(cli: Cli) -> Result<Value> {
             requires,
             retain_from.as_deref(),
         )?)?,
-        Operation::Worker { drain } => worker::run(&mut store, drain)?,
+        Operation::Worker {
+            drain,
+            poll_ms,
+            heartbeat_seconds,
+        } => executor::local(
+            &store,
+            executor::Options {
+                drain,
+                poll: Duration::from_millis(poll_ms),
+                heartbeat: Duration::from_secs(heartbeat_seconds),
+            },
+        )?,
         Operation::Status { candidate } => match candidate {
             Some(candidate) => engine::candidate_status(&store, &candidate)?,
             None => engine::status(&store)?,
@@ -462,7 +477,7 @@ fn run(cli: Cli) -> Result<Value> {
             engine::resolve_repair(&mut store, &repair, &candidate)?
         }
         Operation::Recover { confirm_drained } => {
-            worker::recover(&mut store, confirm_drained.as_deref())?
+            executor::recover(&mut store, confirm_drained.as_deref())?
         }
         Operation::Events { after } => serde_json::to_value(store.events(after)?)?,
         Operation::Logs { attempt } => {
@@ -496,7 +511,6 @@ fn run(cli: Cli) -> Result<Value> {
                 .collect::<Result<Vec<_>>>()?;
             json!(values)
         }
-        Operation::Execute { attempt } => worker::execute(&mut store, &attempt)?,
     })
 }
 

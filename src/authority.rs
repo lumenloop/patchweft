@@ -301,6 +301,47 @@ fn owner_priorities(db: &Connection) -> Result<BTreeMap<String, i64>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+const MAX_PROFILE_IDS: usize = 32;
+
+/// The executor's lease and the profiles it should verify: the ones named, or else those with
+/// queued work. Profiles outside its scope are never handed out.
+pub fn hello(
+    db: &Connection,
+    executor: &str,
+    scope: &Scope,
+    ids: &[String],
+) -> Result<Hello, AuthorityError> {
+    if ids.len() > MAX_PROFILE_IDS {
+        return Err(AuthorityError::Invalid(format!(
+            "At most {MAX_PROFILE_IDS} profiles are described at once."
+        )));
+    }
+    let record = load(db, executor)?.ok_or(AuthorityError::Unregistered)?;
+    let ids: Vec<String> = if ids.is_empty() {
+        let mut stmt = db.prepare(
+            "SELECT DISTINCT json_extract(body,'$.profile') FROM actions WHERE state='queued' ORDER BY 1",
+        )?;
+        stmt.query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    } else {
+        ids.to_vec()
+    };
+    let mut profiles = Vec::new();
+    for id in ids.iter().filter(|id| scope.allows_profile(id)) {
+        let body: Option<String> = db
+            .query_row("SELECT body FROM profiles WHERE id=?", [id], |r| r.get(0))
+            .optional()?;
+        if let Some(body) = body {
+            profiles.push(serde_json::from_str(&body)?);
+        }
+    }
+    Ok(Hello {
+        executor: executor.into(),
+        lease_seconds: record.lease_seconds,
+        profiles,
+    })
+}
+
 /// Admit the head of this executor's queue. The same claim key returns the attempt it already
 /// claimed, so a lost response never claims twice.
 pub fn claim_for(
@@ -642,7 +683,7 @@ fn holding(
     Ok(Some((action, action_state)))
 }
 
-const MAX_LEASES: usize = 64;
+pub const MAX_LEASES: usize = 64;
 /// Stops a supervisor decides itself. `no-requesters` is decided by the store alone.
 const SUPERVISOR_STOPS: [&str; 2] = ["timeout", "supervisor-stop"];
 

@@ -1,20 +1,17 @@
 use crate::{
-    api,
-    authority::{self, Choice, Scope},
-    engine, file_hash, identity,
+    api, engine, file_hash,
     model::*,
-    now, source,
+    source,
     store::{Store, event},
-    unique,
 };
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::{Connection, params};
+use rusqlite::params;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs::{self, File},
     io::{ErrorKind, Write},
-    os::unix::{fs::PermissionsExt, process::CommandExt},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
@@ -98,13 +95,17 @@ fn reap_adopted(main: u32) {
     }
 }
 
-pub fn claim(store: &mut Store) -> Result<Option<Attempt>> {
+/// A claim as the previous binary's worker made it: a local attempt without executor or lease.
+/// Production claims go through `authority::claim_for`; tests keep this to write legacy rows.
+#[cfg(test)]
+pub(crate) fn claim(store: &mut Store) -> Result<Option<Attempt>> {
+    use crate::authority::{self, Choice, Scope};
     let transaction = store.transaction()?;
     let local = authority::load(&transaction, authority::LOCAL)?
         .context("local executor record missing")?;
     let capacity = authority::capacity(&transaction, &local)?;
-    // `prepare` verifies the runtime of each claimed profile, so every registered one qualifies.
-    let verified: BTreeSet<String> = {
+    // That worker trusted every registered profile.
+    let verified: std::collections::BTreeSet<String> = {
         let mut stmt = transaction.prepare("SELECT id FROM profiles")?;
         stmt.query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?
@@ -114,7 +115,7 @@ pub fn claim(store: &mut Store) -> Result<Option<Attempt>> {
         &local,
         &Scope::all(),
         &verified,
-        &BTreeSet::new(),
+        &Default::default(),
         capacity,
     )?;
     let Some(Choice {
@@ -135,7 +136,7 @@ pub fn claim(store: &mut Store) -> Result<Option<Attempt>> {
         return Ok(None);
     }
     let attempt = Attempt {
-        id: unique(),
+        id: crate::unique(),
         action: action.id.clone(),
         worker_pid: std::process::id(),
         worker_start: process_start(std::process::id())
@@ -144,7 +145,7 @@ pub fn claim(store: &mut Store) -> Result<Option<Attempt>> {
         supervisor_start: None,
         slots: reservation.slots,
         memory_mb: reservation.memory_mb,
-        created: now(),
+        created: crate::now(),
         started: None,
         ended: None,
         exit_code: None,
@@ -167,7 +168,7 @@ pub fn claim(store: &mut Store) -> Result<Option<Attempt>> {
     )?;
     transaction.execute(
         "INSERT INTO dispatches VALUES (?,?) ON CONFLICT(owner) DO UPDATE SET last=excluded.last",
-        params![owner, now()],
+        params![owner, crate::now()],
     )?;
     event(
         &transaction,
@@ -204,147 +205,6 @@ pub fn set_priority(store: &Store, owner: &str, priority: i64) -> Result<Value> 
         &json!({"priority":priority}),
     )?;
     Ok(json!({"owner":owner,"priority":priority}))
-}
-
-fn launch(store: &Store, attempt: &Attempt) -> Result<std::process::Child> {
-    let directory = store.root.join("attempts").join(&attempt.id);
-    fs::create_dir_all(&directory)?;
-    let diagnostic = File::create(directory.join("supervisor.log"))?;
-    let child = Command::new(std::env::current_exe()?)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .args(["--state"])
-        .arg(&store.root)
-        .args(["_execute", &attempt.id])
-        .stdin(Stdio::null())
-        .stdout(diagnostic.try_clone()?)
-        .stderr(diagnostic)
-        .process_group(0)
-        .spawn()?;
-    Ok(child)
-}
-
-pub fn recover(store: &mut Store, confirmed: Option<&str>) -> Result<Value> {
-    let attempts: Vec<(String, Attempt)> = {
-        let mut stmt = store
-            .db
-            .prepare("SELECT state,body FROM attempts WHERE drained=0")?;
-        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .map(|v| {
-                let (state, body) = v?;
-                Ok((state, serde_json::from_str(&body)?))
-            })
-            .collect::<Result<_>>()?
-    };
-    let mut recovered = Vec::new();
-    let mut uncertain = Vec::new();
-    for (state, attempt) in attempts {
-        if state == "interrupted" && confirmed != Some(&attempt.id) {
-            uncertain.push(attempt.id);
-            continue;
-        }
-        if state == "claimed" && alive(attempt.worker_pid, &attempt.worker_start) {
-            continue;
-        }
-        if let (Some(pid), Some(start)) =
-            (attempt.supervisor_pid, attempt.supervisor_start.as_ref())
-            && alive(pid, start)
-        {
-            ensure!(
-                confirmed != Some(&attempt.id),
-                "supervisor is still alive; cannot confirm drain"
-            );
-            continue;
-        }
-        let transaction = store.transaction()?;
-        let current: String = transaction.query_row(
-            "SELECT state FROM attempts WHERE id=?",
-            [&attempt.id],
-            |r| r.get(0),
-        )?;
-        if current != state {
-            continue;
-        } // Supervisor registered before this transaction.
-        // No execution can start before registration. A surviving late launcher is fenced by state.
-        let drained = state == "claimed" || confirmed == Some(&attempt.id);
-        transaction.execute(
-            "UPDATE attempts SET state='interrupted',drained=? WHERE id=?",
-            params![drained, attempt.id],
-        )?;
-        transaction.execute(
-            "UPDATE actions SET state='interrupted' WHERE id=? AND attempt=?",
-            params![attempt.action, attempt.id],
-        )?;
-        event(
-            &transaction,
-            "attempt.interrupted",
-            &attempt.id,
-            &json!({"drained":drained,"operator_confirmed":confirmed == Some(&attempt.id)}),
-        )?;
-        transaction.commit()?;
-        if drained {
-            recovered.push(attempt.id);
-        } else {
-            uncertain.push(attempt.id);
-        }
-    }
-    Ok(json!({"interrupted_and_drained":recovered,"needs_drain_confirmation":uncertain}))
-}
-
-pub fn run(store: &mut Store, drain: bool) -> Result<Value> {
-    recover(store, None)?;
-    let mut children: Vec<std::process::Child> = Vec::new();
-    let mut launched = 0;
-    loop {
-        let mut keep = Vec::new();
-        for mut child in children {
-            if child.try_wait()?.is_none() {
-                keep.push(child);
-            }
-        }
-        children = keep;
-        recover(store, None)?;
-        if let Some(attempt) = claim(store)? {
-            match launch(store, &attempt) {
-                Ok(child) => {
-                    children.push(child);
-                    launched += 1;
-                }
-                Err(error) => {
-                    // Launch failed before any supervisor existed.
-                    let transaction = store.transaction()?;
-                    transaction.execute(
-                        "UPDATE attempts SET state='interrupted',drained=1 WHERE id=?",
-                        [&attempt.id],
-                    )?;
-                    transaction.execute(
-                        "UPDATE actions SET state='interrupted' WHERE id=? AND attempt=?",
-                        params![attempt.action, attempt.id],
-                    )?;
-                    event(
-                        &transaction,
-                        "attempt.launch_failed",
-                        &attempt.id,
-                        &json!({"error":error.to_string()}),
-                    )?;
-                    transaction.commit()?;
-                }
-            }
-            continue;
-        }
-        if drain {
-            let active: i64 = store.db.query_row(
-                "SELECT COUNT(*) FROM attempts WHERE drained=0 AND state IN ('claimed','running')",
-                [],
-                |r| r.get(0),
-            )?;
-            if children.is_empty() && active == 0 {
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    Ok(json!({"launched":launched}))
 }
 
 /// Source and dependencies for the job, from the repository and files the claim names.
@@ -421,88 +281,22 @@ fn prepare(claim: &ClaimFile, job: &Job, directory: &Path) -> Result<(PathBuf, V
     ))
 }
 
-/// How a running job hears of stops decided elsewhere and reports the stops its supervisor
-/// decides: `_execute` through the store, `_supervise` through its attempt's control files.
-trait Control {
-    fn command_started(&mut self) -> Result<()>;
-    /// A stop decided outside the supervisor, once one is recorded.
-    fn requested(&mut self) -> Result<Option<String>>;
-    /// Reports a stop the supervisor decided itself: `supervisor-stop` or `timeout`.
-    fn stopping(&mut self, reason: &str) -> Result<()>;
-}
-
-/// `_execute`: the supervisor records stops in the store itself.
-struct StoreControl<'a> {
-    db: &'a Connection,
-    action: &'a str,
-    attempt: &'a str,
-}
-
-impl StoreControl<'_> {
-    fn active(&self, db: &Connection) -> Result<i64> {
-        Ok(db.query_row(
-            "SELECT COUNT(*) FROM interests WHERE action=? AND active=1",
-            [self.action],
-            |r| r.get(0),
-        )?)
-    }
-    fn record(&self, db: &Connection, reason: &str) -> Result<()> {
-        db.execute(
-            "UPDATE actions SET state='stopping' WHERE id=? AND attempt=?",
-            params![self.action, self.attempt],
-        )?;
-        event(
-            db,
-            "attempt.stopping",
-            self.attempt,
-            &json!({"reason":reason}),
-        )
-    }
-}
-
-impl Control for StoreControl<'_> {
-    fn command_started(&mut self) -> Result<()> {
-        Ok(())
-    }
-    fn requested(&mut self) -> Result<Option<String>> {
-        if self.active(self.db)? != 0 {
-            return Ok(None);
-        }
-        let transaction = rusqlite::Transaction::new_unchecked(
-            self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
-        // A requester may have joined since.
-        let stopped = self.active(&transaction)? == 0;
-        if stopped {
-            self.record(&transaction, "no-requesters")?;
-        }
-        transaction.commit()?;
-        Ok(stopped.then(|| "no-requesters".to_owned()))
-    }
-    fn stopping(&mut self, reason: &str) -> Result<()> {
-        let transaction = rusqlite::Transaction::new_unchecked(
-            self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
-        self.record(&transaction, reason)?;
-        Ok(transaction.commit()?)
-    }
-}
-
-/// `_supervise`: the coordinator relays stops both ways through `control/`.
+/// A supervisor hears of stops decided elsewhere and reports the stops it decides itself
+/// through its attempt's control files; its coordinator relays both.
 struct FileControl<'a> {
     control: &'a Path,
 }
 
-impl Control for FileControl<'_> {
-    fn command_started(&mut self) -> Result<()> {
+impl FileControl<'_> {
+    fn command_started(&self) -> Result<()> {
         write_atomically(&self.control.join("command-started"), b"")
     }
-    fn requested(&mut self) -> Result<Option<String>> {
+    /// A stop decided outside the supervisor, once its coordinator wrote one.
+    fn requested(&self) -> Result<Option<String>> {
         stop_reason(self.control)
     }
-    fn stopping(&mut self, reason: &str) -> Result<()> {
+    /// Reports a stop the supervisor decided itself: `supervisor-stop` or `timeout`.
+    fn stopping(&self, reason: &str) -> Result<()> {
         write_atomically(
             &self.control.join("stopping"),
             json!({"reason":reason}).to_string().as_bytes(),
@@ -511,7 +305,7 @@ impl Control for FileControl<'_> {
 }
 
 /// Readers of a control file never see it half written.
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(path.parent().context("control directory")?)?;
     temp.write_all(bytes)?;
     temp.persist(path)?;
@@ -519,8 +313,13 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// The reason in `control/stop`, once the coordinator wrote one.
-fn stop_reason(control: &Path) -> Result<Option<String>> {
-    let bytes = match fs::read(control.join("stop")) {
+pub(crate) fn stop_reason(control: &Path) -> Result<Option<String>> {
+    control_reason(&control.join("stop"))
+}
+
+/// The reason in a `stop` or `stopping` control file, once one was written.
+pub(crate) fn control_reason(path: &Path) -> Result<Option<String>> {
+    let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -529,7 +328,7 @@ fn stop_reason(control: &Path) -> Result<Option<String>> {
     Ok(Some(
         stop["reason"]
             .as_str()
-            .context("stop file lacks a reason")?
+            .context("control file lacks a reason")?
             .to_owned(),
     ))
 }
@@ -593,7 +392,7 @@ fn execute_command(
     claim: &ClaimFile,
     job: &Job,
     directory: &Path,
-    control: &mut dyn Control,
+    control: &FileControl,
 ) -> Result<(i32, Value)> {
     let (action, profile) = (&claim.action, &claim.profile);
     let started = Instant::now();
@@ -737,7 +536,7 @@ pub(crate) fn evidence_identity(action: &Action) -> Value {
     )
 }
 
-fn host() -> Option<String> {
+pub(crate) fn host() -> Option<String> {
     fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
         .map(|name| name.trim().to_owned())
@@ -873,147 +672,6 @@ fn conclude(
     }
 }
 
-pub fn execute(store: &mut Store, attempt_id: &str) -> Result<Value> {
-    dedicate()?;
-    let mut attempt = store.attempt(attempt_id)?;
-    let action = store.action(&attempt.action)?;
-    let profile = store.profile(&action.profile)?;
-    let job = engine::job(&profile, &action.job)?.clone();
-    let revision = store.revision(&action.revision)?;
-    let transaction = store.transaction()?;
-    let state: String =
-        transaction.query_row("SELECT state FROM attempts WHERE id=?", [attempt_id], |r| {
-            r.get(0)
-        })?;
-    ensure!(
-        state == "claimed",
-        "attempt is already registered or was fenced"
-    );
-    attempt.supervisor_pid = Some(std::process::id());
-    attempt.supervisor_start = process_start(std::process::id());
-    attempt.started = Some(now());
-    transaction.execute(
-        "UPDATE attempts SET state='running',body=? WHERE id=? AND state='claimed'",
-        params![serde_json::to_string(&attempt)?, attempt_id],
-    )?;
-    event(
-        &transaction,
-        "attempt.started",
-        attempt_id,
-        &json!({"pid":std::process::id()}),
-    )?;
-    transaction.commit()?;
-    let directory = store.root.join("attempts").join(attempt_id);
-    fs::create_dir_all(&directory)?;
-    let mut claim = local_claim(store, &attempt, action, profile, revision, &job);
-    let result = local_dependencies(store, &claim.action).and_then(|dependencies| {
-        claim.dependencies = dependencies;
-        let mut control = StoreControl {
-            db: &store.db,
-            action: &claim.action.id,
-            attempt: attempt_id,
-        };
-        execute_command(&claim, &job, &directory, &mut control)
-    });
-    let result = conclude(&claim, &job, &directory, result);
-    // This worker keeps no refused profiles and would claim a drifted one again at once, so
-    // here a runtime mismatch still fails the attempt.
-    let request = CompleteRequest {
-        attempt: attempt_id.into(),
-        lease: claim.attempt.lease,
-        outcome: Outcome::Completed,
-        reason: result.evidence["reason"].as_str().map(String::from),
-        exit_code: result.exit_code,
-        evidence: result.evidence,
-        drained: result.drained,
-        log: None,
-        cleanup_log: None,
-        artifacts: BTreeMap::new(),
-    };
-    let transaction = store.transaction()?;
-    let state = authority::record_result(&transaction, &request, &identity(&request)?)?;
-    transaction.commit()?;
-    Ok(json!({"attempt":attempt_id,"state":state}))
-}
-
-/// The claim `_execute` runs: the store's own repository and attempt directories.
-fn local_claim(
-    store: &Store,
-    attempt: &Attempt,
-    action: Action,
-    profile: RegisteredProfile,
-    revision: Revision,
-    job: &Job,
-) -> ClaimFile {
-    ClaimFile {
-        version: CONTROL_VERSION,
-        executor: attempt
-            .executor
-            .clone()
-            .unwrap_or_else(|| authority::LOCAL.into()),
-        root: store.root.clone(),
-        attempt: Grant {
-            id: attempt.id.clone(),
-            lease: attempt.lease.clone().unwrap_or_default(),
-            lease_expires: attempt.lease_expires.unwrap_or_default(),
-            slots: attempt.slots,
-            memory_mb: attempt.memory_mb,
-            timeout_seconds: attempt.timeout_seconds.unwrap_or(job.timeout_seconds),
-        },
-        action,
-        profile,
-        repository: source::repository(store, &revision.project),
-        revision: RevisionRef {
-            id: revision.id,
-            project: revision.project,
-            commit: revision.commit,
-        },
-        dependencies: Vec::new(),
-        transfer: json!({"seconds":0.0,"bytes":0}),
-    }
-}
-
-/// Dependency artifacts in their producers' attempt directories.
-fn local_dependencies(store: &Store, action: &Action) -> Result<Vec<DependencyFile>> {
-    let mut files = Vec::new();
-    for dependency in &action.dependencies {
-        ensure!(
-            engine::action_state(&store.db, dependency)? == "passed",
-            "dependency no longer passes"
-        );
-        let attempt_id: String = store.db.query_row(
-            "SELECT attempt FROM actions WHERE id=?",
-            [dependency],
-            |r| r.get(0),
-        )?;
-        let receipt = store
-            .attempt(&attempt_id)?
-            .result
-            .context("dependency lacks evidence")?;
-        let artifacts = receipt["artifacts"]
-            .as_object()
-            .context("dependency lacks artifacts")?;
-        for (name, expected) in artifacts {
-            files.push(DependencyFile {
-                action: dependency.clone(),
-                attempt: attempt_id.clone(),
-                name: name.clone(),
-                // A missing digest is refused as corrupt when the file is checked.
-                sha256: expected["sha256"].as_str().unwrap_or_default().into(),
-                mode: expected["mode"].as_u64().context("artifact mode")? as u32,
-                bytes: expected["bytes"].as_u64().unwrap_or_default(),
-                path: store
-                    .root
-                    .join("attempts")
-                    .join(&attempt_id)
-                    .join("artifacts")
-                    .join(source::relative_path(name)?),
-            });
-        }
-    }
-    Ok(files)
-}
-
 /// The coordinator gave up on a supervisor it never registered.
 const REGISTRATION_SECONDS: u64 = 3600;
 
@@ -1040,12 +698,8 @@ pub fn supervise(root: &Path, attempt: &str) -> Result<Value> {
     let result = match registration(&claim, job, &control)? {
         Some(result) => result,
         None => {
-            let result = execute_command(
-                &claim,
-                job,
-                &directory,
-                &mut FileControl { control: &control },
-            );
+            let result =
+                execute_command(&claim, job, &directory, &FileControl { control: &control });
             conclude(&claim, job, &directory, result)
         }
     };
