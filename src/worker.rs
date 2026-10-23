@@ -39,6 +39,11 @@ pub fn alive(pid: u32, start: &str) -> bool {
 }
 
 fn descendants(parent: u32) -> Vec<u32> {
+    descendants_of(&[parent])
+}
+
+/// Every live process descending from any of `roots`, the roots themselves excluded.
+pub(crate) fn descendants_of(roots: &[u32]) -> Vec<u32> {
     let mut relationships = Vec::new();
     if let Ok(entries) = fs::read_dir("/proc") {
         for entry in entries.flatten() {
@@ -61,7 +66,7 @@ fn descendants(parent: u32) -> Vec<u32> {
             relationships.push((pid, ppid));
         }
     }
-    let mut found = vec![parent];
+    let mut found = roots.to_vec();
     loop {
         let old = found.len();
         for (pid, ppid) in &relationships {
@@ -73,7 +78,10 @@ fn descendants(parent: u32) -> Vec<u32> {
             break;
         }
     }
-    found.into_iter().filter(|pid| *pid != parent).collect()
+    found
+        .into_iter()
+        .filter(|pid| !roots.contains(pid))
+        .collect()
 }
 
 fn signal_tree(signal: i32) {

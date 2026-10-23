@@ -665,6 +665,7 @@ fn observe(
         disk_free_mb: request.disk_free_mb,
         host: request.host.clone(),
         engine: request.engine.clone(),
+        loopback: request.loopback.clone(),
     };
     let previous = &record.observed;
     let profiles_changed =
@@ -673,6 +674,7 @@ fn observe(
         && previous.memory_limit_mb == observed.memory_limit_mb
         && previous.host == observed.host
         && previous.engine == observed.engine
+        && previous.loopback == observed.loopback
         && previous.last_seen.is_some_and(|last| seen - last <= 30.0)
     {
         return Ok(());
@@ -1774,6 +1776,7 @@ mod tests {
                 disk_free_mb: Some(70_000),
                 host: Some("mindy".into()),
                 engine: Some("e".repeat(64)),
+                loopback: None,
             },
             holding: None,
         };

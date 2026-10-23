@@ -348,7 +348,24 @@ impl Default for Guards {
 impl Guards {
     fn loopback_refusal(&self) -> Option<String> {
         let allow = self.loopback.as_ref()?;
-        loopback_refusal(&|path| fs::read(path), rootless_state().as_deref(), allow)
+        loopback_refusal(&|path| fs::read(path), allow, &|_| {
+            rootless_sockets(rootless_state().as_deref())
+        })
+    }
+
+    /// How this coordinator checks loopback, reported on its executor record (gate P3-1 on pw#8).
+    fn loopback_mode(&self) -> String {
+        match &self.loopback {
+            None => "off".into(),
+            Some(allow) => format!(
+                "allow [{}]",
+                allow
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        }
     }
 }
 
@@ -797,6 +814,7 @@ impl<T: Transport> Coordinator<T> {
             disk_free_mb: free.map(|bytes| bytes / MIB),
             host: self.host.clone(),
             engine: Some(self.engine.clone()),
+            loopback: Some(self.guards.loopback_mode()),
         }
     }
 
@@ -819,8 +837,8 @@ impl<T: Transport> Coordinator<T> {
         free()
     }
 
-    /// Why this host must take no work now, if it must not: a loopback listener job containers
-    /// could reach (MUST-FIX 8), or too little free disk (MUST-FIX 4).
+    /// Why this host must take no work now, if it must not: a listener jobs could reach and nobody
+    /// allowlisted (MUST-FIX 8), or too little free disk (MUST-FIX 4).
     fn declining(&self, free: Option<u64>) -> Option<String> {
         let floor = self.guards.min_free;
         let low = floor > 0 && free.is_none_or(|bytes| bytes < floor);
@@ -1582,6 +1600,7 @@ pub fn run<T: Transport + 'static>(
             memory_limit_mb: memory_limit(),
             host: worker::host(),
             engine: Some(engine),
+            loopback: Some(guards.loopback_mode()),
             ..ClaimRequest::default()
         };
         // Operators see the refusal on the executor record.
@@ -1729,7 +1748,7 @@ pub fn remote(
     work: &Path,
     options: Options,
     bounds: Bounds,
-    loopback: BTreeSet<u16>,
+    loopback: Option<BTreeSet<u16>>,
 ) -> Result<Value> {
     fs::create_dir_all(work)?;
     // Supervisors check out from the mirrors by absolute path.
@@ -1749,7 +1768,7 @@ pub fn remote(
     };
     let guards = Guards {
         min_free: bounds.min_free,
-        loopback: Some(loopback),
+        loopback,
         disk: Some(disk),
         ..Guards::default()
     };
@@ -2383,7 +2402,70 @@ fn memory_limit() -> Option<u32> {
     cgroup_memory_limit_mb(&cgroup, Path::new("/sys/fs/cgroup"))
 }
 
-/// Where the rootless Docker daemon jobs reach keeps its state: beside the socket `DOCKER_HOST`
+/// MUST-FIX 8 (follow-up 1): jobs run natively on executor hosts, so they reach every listener
+/// bound to loopback, and every wildcard (0.0.0.0, ::) listener at 127.0.0.1 with a loopback
+/// source, whatever a Docker daemon exposes to containers (gate P2-1 on pw#8). Each must be
+/// allowlisted unless `exempt`, given the unlisted listeners' inodes, returns it: the rootless
+/// daemon's own processes hold the ports it publishes for job containers. `read` reads a file.
+/// Returns why no work may be claimed, if none may.
+pub fn loopback_refusal(
+    read: &dyn Fn(&Path) -> io::Result<Vec<u8>>,
+    allow: &BTreeSet<u16>,
+    exempt: &dyn Fn(&BTreeSet<u64>) -> BTreeSet<u64>,
+) -> Option<String> {
+    if wsl(read) {
+        return Some(
+            "WSL: Windows listeners can answer at 127.0.0.1 without being listed; run executors in a Linux VM"
+                .into(),
+        );
+    }
+    let unlisted: Vec<(SocketAddr, u64)> = match reachable_listeners(read) {
+        Ok(listeners) => listeners
+            .into_iter()
+            .filter(|(listener, _)| !allow.contains(&listener.port()))
+            .collect(),
+        Err(error) => return Some(format!("cannot list loopback listeners: {error:#}")),
+    };
+    if unlisted.is_empty() {
+        return None;
+    }
+    let exempt = exempt(&unlisted.iter().map(|(_, inode)| *inode).collect());
+    unlisted
+        .into_iter()
+        .find(|(_, inode)| !exempt.contains(inode))
+        .map(|(listener, _)| {
+            let kind = if wildcard(listener.ip()) {
+                "wildcard"
+            } else {
+                "loopback"
+            };
+            format!("{kind} listener {listener} not allowlisted")
+        })
+}
+
+/// Whether this is a WSL kernel (re-gate P2 on pw#8): under mirrored networking the Windows host's
+/// listeners answer at 127.0.0.1 without appearing in /proc/net/tcp, so no listing is complete. The
+/// mode can't be ruled out from inside (an interface can be renamed, /sys masked, WSL1 has no
+/// `loopback0`), so any WSL kernel refuses: `microsoft` in the release, or the interop entry.
+fn wsl(read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) -> bool {
+    read(Path::new("/proc/sys/kernel/osrelease")).is_ok_and(|release| {
+        String::from_utf8_lossy(&release)
+            .to_lowercase()
+            .contains("microsoft")
+    }) || read(Path::new("/proc/sys/fs/binfmt_misc/WSLInterop")).is_ok()
+}
+
+/// An address listening on every interface: 0.0.0.0, ::, or ::ffff:0.0.0.0.
+fn wildcard(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_unspecified(),
+        IpAddr::V6(ip) => {
+            ip.is_unspecified() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_unspecified())
+        }
+    }
+}
+
+/// Where the rootless Docker daemon jobs use keeps its state: beside the socket `DOCKER_HOST`
 /// names, or in the user's runtime directory. None when `DOCKER_HOST` names no Unix socket.
 fn rootless_state() -> Option<PathBuf> {
     let socket = match std::env::var_os("DOCKER_HOST") {
@@ -2399,52 +2481,65 @@ fn rootless_state() -> Option<PathBuf> {
     Some(socket.parent()?.join("dockerd-rootless"))
 }
 
-/// MUST-FIX 8: a rootless Docker daemon with host loopback lets job containers reach this host's
-/// loopback listeners, so each one must be allowlisted. A daemon that cannot be identified counts
-/// as exposing host loopback. `read` reads a file; `rootless` is the daemon's state directory.
-/// Returns why no work may be claimed, if none may.
-pub fn loopback_refusal(
-    read: &dyn Fn(&Path) -> io::Result<Vec<u8>>,
-    rootless: Option<&Path>,
-    allow: &BTreeSet<u16>,
-) -> Option<String> {
-    if rootless.is_some_and(|state| host_loopback(read, state) == Some(false)) {
-        return None;
+/// Socket inodes held by the rootless daemon's `rootlesskit` (the parent of the `child_pid` its
+/// state records) and its descendants: the ports it publishes for job containers. An
+/// unidentified daemon holds none, so its listeners refuse.
+fn rootless_sockets(state: Option<&Path>) -> BTreeSet<u64> {
+    let rootlesskit = state.and_then(|state| {
+        let child: u32 = fs::read_to_string(state.join("child_pid"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        let stat = fs::read_to_string(format!("/proc/{child}/stat")).ok()?;
+        // The command name may hold spaces and parentheses; the fields after it cannot.
+        let parent: u32 = stat
+            .rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+        let cmdline = fs::read(format!("/proc/{parent}/cmdline")).ok()?;
+        let program =
+            String::from_utf8_lossy(cmdline.split(|byte| *byte == 0).next()?).into_owned();
+        (Path::new(&program).file_name()? == "rootlesskit").then_some(parent)
+    });
+    match rootlesskit {
+        Some(root) => sockets_held_by(&[root]),
+        None => BTreeSet::new(),
     }
-    match loopback_listeners(read) {
-        Ok(listeners) => listeners
+}
+
+/// Socket inodes open in `roots` or any of their descendants.
+fn sockets_held_by(roots: &[u32]) -> BTreeSet<u64> {
+    let mut held = BTreeSet::new();
+    for pid in roots.iter().copied().chain(worker::descendants_of(roots)) {
+        for fd in fs::read_dir(format!("/proc/{pid}/fd"))
             .into_iter()
-            .find(|listener| !allow.contains(&listener.port()))
-            .map(|listener| format!("loopback listener {listener} not allowlisted")),
-        Err(error) => Some(format!("cannot list loopback listeners: {error:#}")),
+            .flatten()
+            .flatten()
+        {
+            if let Some(inode) = fs::read_link(fd.path()).ok().and_then(|target| {
+                target
+                    .to_str()?
+                    .strip_prefix("socket:[")?
+                    .strip_suffix(']')?
+                    .parse()
+                    .ok()
+            }) {
+                held.insert(inode);
+            }
+        }
     }
+    held
 }
 
-/// Whether the rootless daemon keeping its state in `state` exposes host loopback: its
-/// `child_pid`'s parent is `rootlesskit`, run without `--disable-host-loopback`. None when the
-/// daemon cannot be identified.
-fn host_loopback(read: &dyn Fn(&Path) -> io::Result<Vec<u8>>, state: &Path) -> Option<bool> {
-    let text = |path: &Path| String::from_utf8(read(path).ok()?).ok();
-    let child: u32 = text(&state.join("child_pid"))?.trim().parse().ok()?;
-    let stat = text(Path::new(&format!("/proc/{child}/stat")))?;
-    // The command name may hold spaces and parentheses; the fields after it cannot.
-    let (_, fields) = stat.rsplit_once(')')?;
-    let parent: u32 = fields.split_whitespace().nth(1)?.parse().ok()?;
-    let cmdline = read(Path::new(&format!("/proc/{parent}/cmdline"))).ok()?;
-    let mut arguments = cmdline
-        .split(|byte| *byte == 0)
-        .map(|argument| String::from_utf8_lossy(argument).into_owned());
-    let program = arguments.next()?;
-    if Path::new(&program).file_name()? != "rootlesskit" {
-        return None;
-    }
-    Some(!arguments.any(|argument| {
-        argument == "--disable-host-loopback" || argument == "--disable-host-loopback=true"
-    }))
-}
-
-/// TCP sockets listening on 127.0.0.0/8 or ::1, IPv4-mapped included.
-fn loopback_listeners(read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) -> Result<Vec<SocketAddr>> {
+/// TCP sockets listening on 127.0.0.0/8, ::1 or a wildcard address (IPv4-mapped included), with
+/// their inodes: everything a native job can reach at 127.0.0.1.
+fn reachable_listeners(
+    read: &dyn Fn(&Path) -> io::Result<Vec<u8>>,
+) -> Result<Vec<(SocketAddr, u64)>> {
     let mut listeners = Vec::new();
     for (table, required) in [("/proc/net/tcp", true), ("/proc/net/tcp6", false)] {
         let bytes = match read(Path::new(table)) {
@@ -2462,14 +2557,22 @@ fn loopback_listeners(read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) -> Result<Vec
                 .get(1)
                 .and_then(|field| socket_address(field))
                 .with_context(|| format!("{table}: unreadable line {line:?}"))?;
-            let loopback = match address.ip() {
-                IpAddr::V4(ip) => ip.is_loopback(),
+            let reachable = match address.ip() {
+                IpAddr::V4(ip) => ip.is_loopback() || ip.is_unspecified(),
                 IpAddr::V6(ip) => {
-                    ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+                    ip.is_loopback()
+                        || ip.is_unspecified()
+                        || ip
+                            .to_ipv4_mapped()
+                            .is_some_and(|ip| ip.is_loopback() || ip.is_unspecified())
                 }
             };
-            if loopback {
-                listeners.push(address);
+            if reachable {
+                let inode = fields
+                    .get(9)
+                    .and_then(|field| field.parse().ok())
+                    .with_context(|| format!("{table}: unreadable inode in {line:?}"))?;
+                listeners.push((address, inode));
             }
         }
     }
@@ -3566,7 +3669,7 @@ mod tests {
 ";
 
     /// A host holding exactly `files`: listeners on 127.0.0.1:2375, 127.0.0.53:53 and [::1]:631,
-    /// plus a rootless daemon whose `rootlesskit` parent runs with `flags`.
+    /// plus, with `flags`, a rootless daemon whose `rootlesskit` parent runs with them.
     fn host(flags: Option<&str>) -> BTreeMap<PathBuf, Vec<u8>> {
         let mut files: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::from([
             ("/proc/net/tcp".into(), TCP.into()),
@@ -3574,7 +3677,6 @@ mod tests {
         ]);
         if let Some(flags) = flags {
             files.insert(Path::new(ROOTLESS).join("child_pid"), b"4242\n".to_vec());
-            // A command name may hold spaces and parentheses.
             files.insert(
                 "/proc/4242/stat".into(),
                 b"4242 (exe (child)) S 4200 4242 4200 0 -1 4194560".to_vec(),
@@ -3586,69 +3688,237 @@ mod tests {
     }
 
     fn refusal(files: &BTreeMap<PathBuf, Vec<u8>>, ports: &[u16]) -> Option<String> {
+        held_refusal(files, ports, &[])
+    }
+
+    /// As `refusal`, with the rootless daemon's own processes holding the sockets `held`.
+    fn held_refusal(
+        files: &BTreeMap<PathBuf, Vec<u8>>,
+        ports: &[u16],
+        held: &[u64],
+    ) -> Option<String> {
         let read = |path: &Path| {
             files
                 .get(path)
                 .cloned()
                 .ok_or_else(|| std::io::Error::from(ErrorKind::NotFound))
         };
-        loopback_refusal(
-            &read,
-            Some(Path::new(ROOTLESS)),
-            &ports.iter().copied().collect(),
-        )
+        loopback_refusal(&read, &ports.iter().copied().collect(), &|_| {
+            held.iter().copied().collect()
+        })
     }
 
     #[test]
-    fn loopback_check_refuses_unlisted_listener_when_host_loopback_enabled() {
-        let files = host(Some("--port-driver=builtin"));
+    fn wildcard_listeners_are_reachable_from_jobs_and_refuse_too() {
+        // Gate P2-1 on pw#8: a native job reaches 0.0.0.0:22 at 127.0.0.1 with a loopback source,
+        // so a service trusting loopback behind a wildcard bind (mindy's 8080/8443/9100) counts.
+        let files = host(None);
         assert_eq!(
-            refusal(&files, &[53]).as_deref(),
-            Some("loopback listener 127.0.0.1:2375 not allowlisted")
+            refusal(&files, &[53, 631, 2375]).as_deref(),
+            Some("wildcard listener 0.0.0.0:22 not allowlisted")
         );
         assert_eq!(
-            refusal(&files, &[53, 2375]).as_deref(),
-            Some("loopback listener [::1]:631 not allowlisted")
+            refusal(&files, &[22, 53, 631, 2375]).as_deref(),
+            Some("wildcard listener [::]:80 not allowlisted")
         );
-        // Wildcard listeners and established connections are not loopback listeners.
-        assert_eq!(refusal(&files, &[53, 631, 2375]), None);
-    }
-
-    #[test]
-    fn loopback_check_passes_when_host_loopback_disabled() {
-        assert_eq!(refusal(&host(Some("--disable-host-loopback")), &[]), None);
+        assert_eq!(refusal(&files, &[22, 53, 80, 631, 2375]), None);
+        // Ports the rootless daemon publishes for job containers are held by its rootlesskit.
         assert_eq!(
-            refusal(&host(Some("--disable-host-loopback=true")), &[]),
+            held_refusal(&files, &[53, 631, 2375], &[31003, 31006]),
             None
         );
     }
 
     #[test]
-    fn loopback_check_fails_closed_when_daemon_unknown() {
-        let expected = Some("loopback listener 127.0.0.1:2375 not allowlisted");
-        // No daemon state at all.
-        assert_eq!(refusal(&host(None), &[53]).as_deref(), expected);
-        // The child's parent is not rootlesskit.
-        let mut files = host(Some("--disable-host-loopback"));
-        files.insert(
-            "/proc/4200/cmdline".into(),
-            b"dockerd\0--disable-host-loopback\0".to_vec(),
+    fn any_wsl_kernel_refuses_because_windows_listeners_cannot_be_listed() {
+        // Re-gate P2 on pw#8 (robin): under mirrored networking Windows' SMB, RDP and others answer at
+        // 127.0.0.1 but are not in /proc/net/tcp. pw#8's PASS P3-1: requiring `loopback0` failed open
+        // on a renamed interface, a masked /sys or WSL1, so any WSL kernel refuses.
+        const WSL: &str = "WSL: Windows listeners can answer at 127.0.0.1 without being listed; run executors in a Linux VM";
+        let mut files = host(None);
+        let release = b"6.18.54.1-microsoft-standard-WSL2\n".to_vec();
+        files.insert("/proc/sys/kernel/osrelease".into(), release);
+        assert_eq!(
+            refusal(&files, &[22, 53, 80, 631, 2375]).as_deref(),
+            Some(WSL),
+            "WSL with NAT networking and no loopback0"
         );
-        assert_eq!(refusal(&files, &[53]).as_deref(), expected);
-        // The parent is gone.
-        files.remove(Path::new("/proc/4200/cmdline"));
-        assert_eq!(refusal(&files, &[53]).as_deref(), expected);
-        // DOCKER_HOST names no socket whose daemon could be inspected.
-        let files = host(Some("--disable-host-loopback"));
-        let read = |path: &Path| {
-            files
-                .get(path)
-                .cloned()
-                .ok_or_else(|| std::io::Error::from(ErrorKind::NotFound))
-        };
-        let allow = BTreeSet::from([53]);
-        assert_eq!(loopback_refusal(&read, None, &allow).as_deref(), expected);
-        // Listeners that cannot be listed refuse too; an unlisted daemon alone does not.
+        // A custom WSL kernel without `microsoft` in its release still exposes the interop entry.
+        files.insert(
+            "/proc/sys/kernel/osrelease".into(),
+            b"6.6.87-custom\n".to_vec(),
+        );
+        files.insert(
+            "/proc/sys/fs/binfmt_misc/WSLInterop".into(),
+            b"enabled\n".to_vec(),
+        );
+        assert_eq!(
+            refusal(&files, &[22, 53, 80, 631, 2375]).as_deref(),
+            Some(WSL)
+        );
+        // loopback0 alone, outside WSL, is not WSL.
+        files.remove(Path::new("/proc/sys/fs/binfmt_misc/WSLInterop"));
+        files.insert(
+            "/proc/sys/kernel/osrelease".into(),
+            b"6.8.0-136-generic\n".to_vec(),
+        );
+        files.insert("/sys/class/net/loopback0/type".into(), b"772\n".to_vec());
+        assert_eq!(refusal(&files, &[22, 53, 80, 631, 2375]), None);
+    }
+
+    #[test]
+    fn a_v4_mapped_wildcard_counts_as_a_wildcard() {
+        // Re-gate P3-2 on pw#8: [::ffff:0.0.0.0]:8080 listens on every IPv4 address.
+        let mut files = host(None);
+        files.insert(
+            "/proc/net/tcp6".into(),
+            format!("{}   0: 0000000000000000FFFF000000000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 31007 1 0000000000000000 100 0 0 10 0\n",
+                    TCP6.lines().next().unwrap().to_owned() + "\n")
+            .into_bytes(),
+        );
+        assert_eq!(
+            refusal(&files, &[22, 53, 2375]).as_deref(),
+            Some("wildcard listener [::ffff:0.0.0.0]:8080 not allowlisted")
+        );
+    }
+
+    #[test]
+    fn only_a_rootlesskit_parent_of_child_pid_exempts_its_tree() {
+        // Re-gate P3-1 on pw#8: a reused pid or a garbage record must never exempt an unrelated
+        // tree (systemd --user, say).
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("dockerd-rootless");
+        fs::create_dir_all(&state).unwrap();
+        // The impostor's tree holds a real listener, so a wrong exemption would show.
+        let listener = "import socket,time\ns=socket.socket()\ns.bind(('0.0.0.0',0))\ns.listen()\nprint('ready', flush=True)\ntime.sleep(60)";
+        let mut impostor = Command::new("/bin/bash")
+            .arg("-c")
+            .arg(r#"exec -a notrootlesskit /bin/bash -c 'sleep 60 & echo $! > "$0/child_pid"; python3 -c "$1" & wait' "$1" "$2""#)
+            .arg("bash")
+            .arg(&state)
+            .arg(listener)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(impostor.stdout.as_mut().unwrap()),
+            &mut ready,
+        )
+        .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        assert!(
+            !sockets_held_by(&[impostor.id()]).is_empty(),
+            "the impostor holds a listener"
+        );
+        assert!(
+            rootless_sockets(Some(&state)).is_empty(),
+            "a parent not named rootlesskit"
+        );
+        for garbage in ["abc", "", "4294967295", "1"] {
+            fs::write(state.join("child_pid"), garbage).unwrap();
+            assert!(
+                rootless_sockets(Some(&state)).is_empty(),
+                "child_pid {garbage:?}"
+            );
+        }
+        for pid in worker::descendants_of(&[impostor.id()]) {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+        impostor.kill().unwrap();
+        let _ = impostor.wait();
+    }
+
+    #[test]
+    fn sockets_of_the_rootless_daemon_are_found_by_holder() {
+        // A stand-in rootlesskit (its child named by child_pid) holding a published port.
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("dockerd-rootless");
+        fs::create_dir_all(&state).unwrap();
+        let listener = "import socket,time\ns=socket.socket()\ns.bind(('0.0.0.0',0))\ns.listen()\nprint('ready', flush=True)\ntime.sleep(60)";
+        let mut daemon = Command::new("/bin/bash")
+            .arg("-c")
+            .arg(r#"exec -a rootlesskit /bin/bash -c 'sleep 60 & echo $! > "$0/child_pid"; python3 -c "$1" & wait' "$1" "$2""#)
+            .arg("bash")
+            .arg(&state)
+            .arg(listener)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(daemon.stdout.as_mut().unwrap()),
+            &mut ready,
+        )
+        .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        // The listener is the stand-in's python3 child, a descendant of "rootlesskit".
+        let python = worker::descendants_of(&[daemon.id()])
+            .into_iter()
+            .find(|pid| {
+                fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c.starts_with(b"python3"))
+            })
+            .unwrap();
+        let socket: u64 = fs::read_dir(format!("/proc/{python}/fd"))
+            .unwrap()
+            .filter_map(|fd| {
+                fs::read_link(fd.ok()?.path())
+                    .ok()?
+                    .to_str()?
+                    .strip_prefix("socket:[")?
+                    .strip_suffix(']')?
+                    .parse()
+                    .ok()
+            })
+            .next()
+            .unwrap();
+        assert!(rootless_sockets(Some(&state)).contains(&socket));
+        // An unidentified daemon exempts nothing.
+        assert!(rootless_sockets(None).is_empty());
+        assert!(rootless_sockets(Some(&temp.path().join("absent"))).is_empty());
+        for pid in worker::descendants_of(&[daemon.id()]) {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+        daemon.kill().unwrap();
+        let _ = daemon.wait();
+    }
+
+    #[test]
+    fn loopback_check_refuses_every_unlisted_loopback_listener() {
+        let files = host(None);
+        assert_eq!(
+            refusal(&files, &[53]).as_deref(),
+            Some("loopback listener 127.0.0.1:2375 not allowlisted")
+        );
+        assert_eq!(
+            refusal(&files, &[22, 53, 2375]).as_deref(),
+            Some("loopback listener [::1]:631 not allowlisted")
+        );
+        // Established connections are not listeners; wildcard ones count (see the next test).
+        assert_eq!(refusal(&files, &[22, 53, 80, 631, 2375]), None);
+    }
+
+    #[test]
+    fn loopback_check_holds_even_when_docker_hides_host_loopback() {
+        // Follow-up 1 (#4204): jobs run natively, so a daemon started with --disable-host-loopback
+        // (mindy) leaves 127.0.0.1:2375 just as reachable; it returned early before.
+        for flags in [
+            "--disable-host-loopback",
+            "--disable-host-loopback=true",
+            "--port-driver=builtin",
+        ] {
+            assert_eq!(
+                refusal(&host(Some(flags)), &[53]).as_deref(),
+                Some("loopback listener 127.0.0.1:2375 not allowlisted"),
+                "{flags}"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_check_fails_closed_when_listeners_cannot_be_listed() {
         let mut files = host(None);
         files.remove(Path::new("/proc/net/tcp"));
         assert!(
@@ -3656,6 +3926,9 @@ mod tests {
                 .unwrap()
                 .contains("/proc/net/tcp")
         );
-        assert_eq!(refusal(&host(None), &[53, 631, 2375]), None);
+        // An IPv6-less host has no tcp6 table, which is no refusal.
+        let mut files = host(None);
+        files.remove(Path::new("/proc/net/tcp6"));
+        assert_eq!(refusal(&files, &[22, 53, 2375]), None);
     }
 }

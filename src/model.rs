@@ -323,6 +323,9 @@ pub struct Observed {
     pub host: Option<String>,
     /// sha256 of the coordinator's binary.
     pub engine: Option<String>,
+    /// How the coordinator checks loopback: "off" or "allow [ports]" (gate P3-1 on pw#8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loopback: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -404,6 +407,8 @@ pub struct ClaimRequest {
     pub host: Option<String>,
     #[serde(default)]
     pub engine: Option<String>,
+    #[serde(default)]
+    pub loopback: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
