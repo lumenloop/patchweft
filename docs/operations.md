@@ -107,7 +107,10 @@ fenced or undrained ones move to `retained/` and are deleted after
 `--retain-hours` (72). Artifacts it produced or downloaded stay in `cas/` up to
 `--cas-max-gb` (20), least recently used first; inputs of attempts not yet
 started are kept. Claims wait while less than `--min-free-gb` (20) is free after
-that reclaim. The local executor never deletes attempt directories. Logs of a
+that reclaim. A local attempt's directory in the store is its evidence (`output.log`,
+`cleanup.log`, `supervisor.log`, `artifacts/`, `artifacts.json`) and is kept; once its report
+is recorded and it has drained, its job trees (`work/`, `scratch/`, `home/`) are deleted, and
+`worker` sweeps any drained attempt that still has them when it starts. Logs of a
 remote attempt are available only after it completes.
 
 ## Failure and recovery

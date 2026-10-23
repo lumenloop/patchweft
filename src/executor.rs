@@ -199,10 +199,50 @@ impl Transport for LocalTransport {
             .join("artifacts")
             .join(relative))
     }
-    /// The attempt directory is the store's evidence.
-    fn retire(&self, _: &Path, _: &CompleteResponse) -> Result<()> {
+    /// The attempt directory holds the store's evidence; once the report is recorded and the
+    /// attempt drained, only the job's own trees go.
+    fn retire(&self, attempt: &Path, response: &CompleteResponse) -> Result<()> {
+        if response.status == "recorded" && response.drained {
+            discard_job_trees(attempt)?;
+        }
         Ok(())
     }
+}
+
+/// What a local job used besides its evidence (`output.log`, `cleanup.log`, `supervisor.log`,
+/// `artifacts/`, `artifacts.json`, which stay in the store): its checkout, `TMPDIR` and `HOME`.
+const JOB_TREES: [&str; 3] = ["work", "scratch", "home"];
+
+fn discard_job_trees(attempt: &Path) -> Result<()> {
+    for tree in JOB_TREES {
+        remove_tree(&attempt.join(tree))
+            .with_context(|| format!("{}", attempt.join(tree).display()))?;
+    }
+    Ok(())
+}
+
+/// Deletes the job trees of every drained local attempt that still has them: attempts that finished
+/// before attempts were retired, or whose retire failed. `worker` runs it once at start.
+pub fn sweep_job_trees(store: &Store) -> Result<Value> {
+    let ids: Vec<String> = {
+        let mut stmt = store.db.prepare(
+            "SELECT id FROM attempts WHERE drained=1 AND state NOT IN ('claimed','running')",
+        )?;
+        stmt.query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    let (mut swept, mut failed) = (0, Vec::new());
+    for id in ids {
+        let directory = store.root.join("attempts").join(&id);
+        if !JOB_TREES.iter().any(|tree| directory.join(tree).exists()) {
+            continue;
+        }
+        match discard_job_trees(&directory) {
+            Ok(()) => swept += 1,
+            Err(error) => failed.push(json!({"attempt":id,"error":format!("{error:#}")})),
+        }
+    }
+    Ok(json!({"attempts":swept,"failed":failed}))
 }
 
 pub struct Options {
@@ -1524,6 +1564,16 @@ pub fn local(store: &Store, options: Options, guards: Guards) -> Result<Value> {
         "drain attempts started by the previous binary before upgrading: {}",
         legacy.join(", ")
     );
+    // Off the claim path: a first sweep after an upgrade can delete hundreds of gigabytes.
+    let root = store.root.clone();
+    thread::spawn(move || {
+        let swept = Store::open(&root).and_then(|store| sweep_job_trees(&store));
+        match swept {
+            Ok(swept) => log(json!({"event":"job_trees_swept","executor":LOCAL,"result":swept})),
+            Err(error) => log(json!({"event":"job_trees_sweep_failed","executor":LOCAL,
+                                     "error":format!("{error:#}")})),
+        }
+    });
     run(LocalTransport::new(&store.root), options, guards)
 }
 
@@ -3204,6 +3254,123 @@ mod tests {
             fs::Permissions::from_mode(0o755),
         )
         .unwrap();
+    }
+
+    /// A local attempt as a finished job leaves it: job trees (one read-only) and the evidence.
+    fn finished_attempt(root: &Path, id: &str) -> PathBuf {
+        let directory = root.join("attempts").join(id);
+        for tree in ["work/node_modules/locked", "scratch", "home"] {
+            fs::create_dir_all(directory.join(tree)).unwrap();
+        }
+        fs::write(directory.join("work/node_modules/locked/file"), "x").unwrap();
+        fs::set_permissions(
+            directory.join("work/node_modules/locked"),
+            fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        fs::create_dir_all(directory.join("artifacts/dist")).unwrap();
+        for evidence in [
+            "output.log",
+            "supervisor.log",
+            "artifacts.json",
+            "artifacts/dist/a",
+        ] {
+            fs::write(directory.join(evidence), "evidence").unwrap();
+        }
+        directory
+    }
+
+    fn evidence_only(directory: &Path) -> bool {
+        ["work", "scratch", "home"]
+            .iter()
+            .all(|tree| !directory.join(tree).exists())
+            && [
+                "output.log",
+                "supervisor.log",
+                "artifacts.json",
+                "artifacts/dist/a",
+            ]
+            .iter()
+            .all(|evidence| directory.join(evidence).is_file())
+    }
+
+    #[test]
+    fn a_local_attempt_keeps_only_its_evidence_once_recorded_and_drained() {
+        // Storage (chief, #4204): every local attempt kept its whole checkout (813 GB on mauve).
+        let temp = tempfile::tempdir().unwrap();
+        let transport = LocalTransport::new(temp.path());
+        let acknowledged = |id: &str, status: &str, drained: bool| CompleteResponse {
+            attempt: id.into(),
+            status: status.into(),
+            state: Some("passed".into()),
+            drained,
+            replayed: false,
+            drain_recorded: drained,
+        };
+        let done = finished_attempt(temp.path(), "done");
+        transport
+            .retire(&done, &acknowledged("done", "recorded", true))
+            .unwrap();
+        assert!(evidence_only(&done));
+        // Cleanup may still need the checkout, and a fenced report was not recorded.
+        for (id, status, drained) in [("draining", "recorded", false), ("fenced", "fenced", true)] {
+            let directory = finished_attempt(temp.path(), id);
+            transport
+                .retire(&directory, &acknowledged(id, status, drained))
+                .unwrap();
+            assert!(
+                directory.join("work/node_modules/locked/file").exists(),
+                "{id}"
+            );
+            fs::set_permissions(
+                directory.join("work/node_modules/locked"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn the_worker_sweeps_job_trees_of_every_drained_attempt() {
+        // Attempts finished before this version, or whose retire failed, are swept at start.
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::init(temp.path(), 4, 4096).unwrap();
+        for (id, state, drained) in [
+            ("old", "passed", 1),
+            ("red", "failed", 1),
+            ("live", "running", 0),
+        ] {
+            store
+                .db
+                .execute(
+                    "INSERT INTO attempts(id,action,state,drained,body) VALUES (?,?,?,?,'{}')",
+                    rusqlite::params![id, "a", state, drained],
+                )
+                .unwrap();
+            finished_attempt(temp.path(), id);
+        }
+        finished_attempt(temp.path(), "unknown");
+        let swept = sweep_job_trees(&store).unwrap();
+        assert_eq!(swept, json!({"attempts":2,"failed":[]}));
+        for id in ["old", "red"] {
+            assert!(
+                evidence_only(&temp.path().join("attempts").join(id)),
+                "{id}"
+            );
+        }
+        // A running attempt and a directory the store does not know keep everything.
+        for id in ["live", "unknown"] {
+            let directory = temp.path().join("attempts").join(id);
+            assert!(
+                directory.join("work/node_modules/locked/file").exists(),
+                "{id}"
+            );
+            fs::set_permissions(
+                directory.join("work/node_modules/locked"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
     }
 
     #[test]
