@@ -40,3 +40,8 @@ tower = { version = "0.5", features = ["util"] }
 [profile.release]
 lto = "thin"
 strip = true
+
+# Every launch verifies the runner and tool bytes by SHA-256; unoptimized, hashing the debug
+# binary takes seconds per launch.
+[profile.dev.package.sha2]
+opt-level = 3

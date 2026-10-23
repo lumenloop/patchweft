@@ -13,10 +13,10 @@ work, or produce individually passing changes that fail together. Projects suppl
 their own commands and validation policy. There is no required language, model
 provider, repository layout, or hosted account.
 
-Patchweft is an MIT-licensed Rust service, CLI and MCP adapter. Version 0.1 runs
-on one Linux host for trusted collaborators. Remote agents can connect over an
-authenticated API; execution stays on that host. Its current boundaries are
-documented in [operations](docs/operations.md).
+Patchweft is an MIT-licensed Rust service, CLI and MCP adapter. Version 0.1 keeps
+its store on one Linux host for trusted collaborators. Remote agents can connect
+over an authenticated API, and executors on other Linux hosts can run its jobs.
+Its current boundaries are documented in [operations](docs/operations.md).
 
 ## How work moves
 

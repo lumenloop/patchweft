@@ -104,6 +104,10 @@ impl Lab {
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(AW);
         command.arg("--state").arg(&self.state).args(args);
+        // These jobs run no containers and this lab has no rootless daemon to inspect.
+        if args.first() == Some(&"worker") {
+            command.arg("--no-loopback-check");
+        }
         command
     }
     fn call(&self, args: &[&str]) -> Value {
@@ -1926,4 +1930,376 @@ fn legacy_rows_still_claim_status_promote_deliver() {
         fs::read_to_string(destination.join("dist/out")).unwrap(),
         "built\n"
     );
+}
+
+/// Polls until `done` holds, for at most a minute.
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !done() {
+        assert!(
+            start.elapsed().as_secs() < 60,
+            "timed out waiting for {what}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+impl Lab {
+    fn events_of(&self, kind: &str) -> Vec<Value> {
+        self.call(&["events"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == kind)
+            .cloned()
+            .collect()
+    }
+    fn row(&self, table: &str, id: &str) -> (String, bool) {
+        let column = if table == "attempts" { "drained" } else { "0" };
+        self.database()
+            .query_row(
+                &format!("SELECT state,{column} FROM {table} WHERE id=?"),
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+}
+
+#[test]
+fn second_coordinator_waits_as_standby() {
+    let lab = Lab::new();
+    let profile = lab.profile(json!([job(
+        "gate",
+        "touch \"$PATCHWEFT_STATE/started\"; \
+         while ! test -f \"$PATCHWEFT_STATE/release\"; do sleep 0.05; done",
+        json!({})
+    )]));
+    let candidate = lab.submit(&lab.base, &profile, "agent");
+    let mut first = lab
+        .command(&["worker"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("the first coordinator's job", || {
+        lab.state.join("started").exists()
+    });
+    let mut standby = lab
+        .command(&["worker", "--drain"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fs::write(lab.state.join("release"), "go").unwrap();
+    wait_until("the job to pass", || lab.state(&candidate) == "passed");
+    thread::sleep(Duration::from_millis(500));
+    // Nothing is left to drain, yet the standby waits while the first coordinator holds the lock.
+    assert!(standby.try_wait().unwrap().is_none());
+    first.kill().unwrap();
+    first.wait().unwrap();
+    let output = standby.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains(r#"{"executor":"local","waiting_for":"executor lock"}"#),
+        "{stderr}"
+    );
+    let result = parsed(output);
+    assert_eq!(result, json!({"executor":"local","launched":0}));
+    assert_eq!(lab.count("attempt.started"), 1);
+}
+
+#[test]
+fn worker_refuses_legacy_held_attempts() {
+    let lab = Lab::new();
+    let profile = lab.profile(json!([job("work", "true", json!({}))]));
+    let candidate = lab.submit(&lab.base, &profile, "agent");
+    let action = candidate["required"]["work"].as_str().unwrap();
+    // Held by the previous binary's worker: no executor and no lease.
+    let body = json!({"id":"legacy","action":action,"worker_pid":1,"worker_start":"1",
+        "supervisor_pid":null,"supervisor_start":null,"slots":1,"memory_mb":1024,"created":0.0,
+        "started":0.5,"ended":null,"exit_code":null,"result":null});
+    let database = lab.database();
+    database
+        .execute(
+            "INSERT INTO attempts VALUES ('legacy',?,'running',0,?)",
+            rusqlite::params![action, body.to_string()],
+        )
+        .unwrap();
+    database
+        .execute(
+            "UPDATE actions SET state='running',attempt='legacy' WHERE id=?",
+            [action],
+        )
+        .unwrap();
+    lab.refuses(
+        &["worker", "--drain"],
+        "drain attempts started by the previous binary before upgrading: legacy",
+    );
+    assert_eq!(lab.row("attempts", "legacy"), ("running".into(), false));
+    // Its supervisor is gone; once an operator confirms the drain, work resumes.
+    lab.call(&["recover", "--confirm-drained", "legacy"]);
+    lab.call(&["retry", candidate["id"].as_str().unwrap()]);
+    lab.drain();
+    assert_eq!(lab.state(&candidate), "passed");
+}
+
+#[test]
+fn cancel_records_stopping_before_the_executor_acts() {
+    let lab = Lab::new();
+    let profile = lab.profile(json!([job(
+        "slow",
+        "touch \"$PATCHWEFT_STATE/started\"; exec sleep 30",
+        json!({})
+    )]));
+    let action = lab.call(&[
+        "request",
+        "--revision",
+        &lab.base,
+        "--profile",
+        &profile,
+        "--job",
+        "slow",
+        "--owner",
+        "first",
+    ])["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut coordinator = lab
+        .command(&["worker", "--drain"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("the job", || lab.state.join("started").exists());
+    let started = &lab.events_of("attempt.started")[0];
+    let attempt = started["subject"].as_str().unwrap();
+    let supervisor = started["detail"]["pid"].as_i64().unwrap() as i32;
+    // Neither the coordinator nor the supervisor can act on the cancellation.
+    coordinator.kill().unwrap();
+    coordinator.wait().unwrap();
+    unsafe {
+        assert_eq!(libc::kill(supervisor, libc::SIGSTOP), 0);
+    }
+    lab.call(&["cancel", &action, "--owner", "first"]);
+    assert_eq!(lab.row("actions", &action).0, "stopping");
+    let stopping = lab.events_of("attempt.stopping");
+    assert_eq!(stopping.len(), 1);
+    assert_eq!(stopping[0]["subject"], attempt);
+    assert_eq!(
+        stopping[0]["detail"],
+        json!({"reason":"no-requesters","executor":"local"})
+    );
+    let control = lab.state.join("attempts").join(attempt).join("control");
+    assert!(!control.join("stop").exists());
+    unsafe {
+        assert_eq!(libc::kill(supervisor, libc::SIGCONT), 0);
+    }
+    // The next coordinator takes the attempt up and relays the recorded stop.
+    lab.drain();
+    assert_eq!(lab.row("attempts", attempt), ("canceled".into(), true));
+    assert_eq!(lab.row("actions", &action).0, "canceled");
+    assert_eq!(
+        fs::read_to_string(control.join("stop")).unwrap(),
+        r#"{"reason":"no-requesters"}"#
+    );
+    assert_eq!(lab.count("attempt.stopping"), 1);
+}
+
+#[test]
+fn timeout_stopping_is_recorded_through_renew() {
+    let lab = Lab::new();
+    let profile = lab.profile(json!([job(
+        "slow",
+        "exec sleep 30",
+        json!({"timeout_seconds":1})
+    )]));
+    let candidate = lab.submit(&lab.base, &profile, "agent");
+    lab.drain();
+    assert_eq!(lab.state(&candidate), "failed");
+    let stopping = lab.events_of("attempt.stopping");
+    assert_eq!(stopping.len(), 1);
+    assert_eq!(
+        stopping[0]["detail"],
+        json!({"reason":"timeout","executor":"local"})
+    );
+    let attempt = lab.body("attempts", stopping[0]["subject"].as_str().unwrap());
+    assert_eq!(attempt["stop"], "timeout");
+    assert_eq!(attempt["exit_code"], 124);
+    assert_eq!(attempt["result"]["reason"], "timeout");
+    assert_eq!(lab.call(&["repairs"]).as_array().unwrap().len(), 1);
+}
+
+/// A profile declaring `drift`, a tool file the test rewrites.
+fn drifting(lab: &Lab, jobs: Value) -> (String, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let tool = lab.state.join("drift");
+    fs::write(&tool, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    let profile = lab.register(
+        "drifting",
+        json!({"version":1,"name":"drifting","certifying":true,
+               "tools":{"sh":"/usr/bin/sh","drift":tool},"jobs":jobs}),
+    );
+    (profile, tool)
+}
+
+fn refused(lab: &Lab) -> Value {
+    lab.body("executors", "local")["observed"]["refused"].clone()
+}
+
+#[test]
+fn tool_drift_refuses_profile_without_attempts_or_repairs() {
+    let lab = Lab::new();
+    let (profile, tool) = drifting(&lab, json!([job("work", "true", json!({}))]));
+    let candidate = lab.submit(&lab.base, &profile, "agent");
+    fs::write(&tool, "#!/bin/sh\n# changed\n").unwrap();
+    lab.drain();
+    let action = candidate["required"]["work"].as_str().unwrap();
+    assert_eq!(lab.row("actions", action).0, "queued");
+    assert_eq!(lab.count("attempt.claimed"), 0);
+    assert!(lab.call(&["repairs"]).as_array().unwrap().is_empty());
+    let error = refused(&lab)[&profile].as_str().unwrap().to_owned();
+    assert!(error.contains("declared tool bytes changed"), "{error}");
+    let observed = lab.events_of("executor.observed");
+    assert_eq!(
+        observed.last().unwrap()["detail"]["refused"][&profile],
+        error
+    );
+}
+
+#[test]
+fn tool_drift_after_verification_requeues_without_repair() {
+    let lab = Lab::new();
+    let (profile, tool) = drifting(
+        &lab,
+        json!([
+            job(
+                "first",
+                "touch \"$PATCHWEFT_STATE/first-started\"; \
+                 while ! test -f \"$PATCHWEFT_STATE/release\"; do sleep 0.05; done",
+                json!({})
+            ),
+            job("second", "true", json!({"dependencies":["first"]}))
+        ]),
+    );
+    let candidate = lab.submit(&lab.base, &profile, "agent");
+    let coordinator = lab
+        .command(&["worker", "--drain"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The coordinator verified the profile before claiming `first`; the tool drifts afterwards.
+    wait_until("the first job", || lab.state.join("first-started").exists());
+    fs::write(&tool, "#!/bin/sh\n# changed\n").unwrap();
+    fs::write(lab.state.join("release"), "go").unwrap();
+    parsed(coordinator.wait_with_output().unwrap());
+    let second = candidate["required"]["second"].as_str().unwrap();
+    assert_eq!(
+        lab.row("actions", candidate["required"]["first"].as_str().unwrap())
+            .0,
+        "passed"
+    );
+    assert_eq!(lab.row("actions", second).0, "queued");
+    let launch = lab.events_of("attempt.launch_failed");
+    assert_eq!(launch.len(), 1);
+    assert_eq!(launch[0]["detail"]["reason"], "runtime-mismatch");
+    assert_eq!(launch[0]["detail"]["requeued"], true);
+    let attempt = launch[0]["subject"].as_str().unwrap();
+    assert_eq!(lab.body("attempts", attempt)["action"], second);
+    assert_eq!(lab.row("attempts", attempt), ("interrupted".into(), true));
+    assert_eq!(lab.count("attempt.started"), 1);
+    assert!(lab.call(&["repairs"]).as_array().unwrap().is_empty());
+    assert!(
+        refused(&lab)[&profile]
+            .as_str()
+            .unwrap()
+            .contains("declared tool bytes changed")
+    );
+}
+
+#[test]
+fn supervisor_killed_before_command_drains_without_operator() {
+    let lab = Lab::new();
+    let profile = lab.profile(json!([
+        job(
+            "build",
+            "mkdir dist; echo built > dist/out",
+            json!({"artifacts":["dist"],"reuse":"exact",
+                   "audit":"writes a constant; reads no inputs"})
+        ),
+        job(
+            "use",
+            "touch \"$PATCHWEFT_STATE/used\"",
+            json!({"dependencies":["build"]})
+        )
+    ]));
+    lab.call(&[
+        "request",
+        "--revision",
+        &lab.base,
+        "--profile",
+        &profile,
+        "--job",
+        "build",
+        "--owner",
+        "agent",
+    ]);
+    lab.drain();
+    let build = lab.events_of("attempt.started")[0]["subject"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // A FIFO in place of the artifact holds the next supervisor after registration, before its
+    // command: it blocks reading the dependency.
+    let artifact = lab
+        .state
+        .join("attempts")
+        .join(&build)
+        .join("artifacts/dist/out");
+    fs::remove_file(&artifact).unwrap();
+    let fifo = std::ffi::CString::new(artifact.to_str().unwrap()).unwrap();
+    unsafe {
+        assert_eq!(libc::mkfifo(fifo.as_ptr(), 0o644), 0);
+    }
+    let candidate = lab.submit(&lab.base, &profile, "agent");
+    let coordinator = lab
+        .command(&["worker", "--drain"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until("registration", || lab.count("attempt.started") == 2);
+    let started = lab.events_of("attempt.started")[1].clone();
+    let attempt = started["subject"].as_str().unwrap();
+    let control = lab.state.join("attempts").join(attempt).join("control");
+    thread::sleep(Duration::from_millis(300));
+    assert!(!control.join("command-started").exists());
+    // The held supervisor keeps the FIFO it opened; the next claim reads the real artifact.
+    fs::remove_file(&artifact).unwrap();
+    fs::write(&artifact, "built\n").unwrap();
+    unsafe {
+        assert_eq!(
+            libc::kill(
+                started["detail"]["pid"].as_i64().unwrap() as i32,
+                libc::SIGKILL
+            ),
+            0
+        );
+    }
+    parsed(coordinator.wait_with_output().unwrap());
+    // Its command never started, so the coordinator reports it drained: no operator needed,
+    // and the action requeues instead of reddening the candidate (gate P3-2).
+    assert_eq!(lab.row("attempts", attempt), ("interrupted".into(), true));
+    let lost = lab.events_of("attempt.interrupted");
+    assert_eq!(lost.len(), 1);
+    assert_eq!(
+        lost[0]["detail"],
+        json!({"drained":true,"operator_confirmed":false,"reason":"supervisor-lost",
+               "executor":"local","requeued":true})
+    );
+    assert_eq!(lab.state(&candidate), "passed");
+    assert!(lab.state.join("used").exists());
 }

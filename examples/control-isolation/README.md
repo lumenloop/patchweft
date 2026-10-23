@@ -20,7 +20,9 @@ phase observations are saved atomically. Status samples do not
 retry. The quiet job's gate stays closed until cancellation drains it.
 
 The probe uses two CPU affinities, two job slots, two coordinators and a
-120-second outer process deadline. Memory values are scheduling reservations.
+120-second outer process deadline. Both coordinators serve the one local
+executor, so the second waits as a standby until the first exits. Memory
+values are scheduling reservations.
 The ownership wrapper adopts and cleans up its own descendants, including
 detached executors. A successful run requires all 128 logical requests to share
 one noisy action, two total physical attempts, cancellation and complete drain,

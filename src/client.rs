@@ -1,10 +1,11 @@
 use crate::{
-    api::{Command, MAX_BUNDLE, Query, TRANSFER_TIMEOUT_SECONDS},
+    api::{self, Command, MAX_BUNDLE, MAX_HAVES, Query, TRANSFER_TIMEOUT_SECONDS},
     mcp::Backend,
     source,
 };
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::blocking::{Client, Response};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
     fs::{self, File},
@@ -13,6 +14,29 @@ use std::{
     path::Path,
     time::Duration,
 };
+
+/// The service answered with an error status. Callers that act on the status downcast to it.
+#[derive(Debug)]
+pub struct Refused {
+    pub status: u16,
+    /// The response's `error` object, or null when it sent none.
+    pub error: Value,
+}
+impl Refused {
+    pub fn code(&self) -> Option<&str> {
+        self.error["code"].as_str()
+    }
+}
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {}", self.status)?;
+        if !self.error.is_null() {
+            write!(f, ": {}", self.error)?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for Refused {}
 
 pub struct Remote {
     client: Client,
@@ -66,8 +90,14 @@ impl Remote {
     fn json_response(response: Response) -> Result<Value> {
         let status = response.status();
         let mut bytes = Vec::new();
-        response.take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
-        ensure!(bytes.len() <= 8 * 1024 * 1024, "response exceeds 8 MiB");
+        response
+            .take(api::MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 <= api::MAX_RESPONSE_BYTES,
+            "response exceeds {} bytes",
+            api::MAX_RESPONSE_BYTES
+        );
         let value: Value = serde_json::from_slice(&bytes).context("response was not JSON")?;
         if !status.is_success() && value.get("error").is_none() {
             bail!("HTTP {status}");
@@ -110,15 +140,8 @@ impl Remote {
             "bundle exceeds 1 GiB"
         );
         let sha256 = crate::file_hash(bundle)?;
-        let value = Self::json_response(
-            self.client
-                .put(format!("{}/v1/blobs/{sha256}", self.endpoint))
-                .timeout(Duration::from_secs(TRANSFER_TIMEOUT_SECONDS))
-                .bearer_auth(&self.credential)
-                .body(File::open(bundle)?)
-                .send()?,
-        )?;
-        ensure!(value.get("error").is_none(), "upload refused: {value}");
+        self.upload_blob(bundle, &sha256)
+            .context("upload refused")?;
         self.command_value(
             key,
             &Command::Publish {
@@ -129,7 +152,53 @@ impl Remote {
             },
         )
     }
-    fn download(
+    /// An error status as [`Refused`], with the `error` object the service sent.
+    fn refusal(response: Response) -> anyhow::Error {
+        let status = response.status().as_u16();
+        let error = Self::json_response(response)
+            .ok()
+            .and_then(|value| value.get("error").cloned())
+            .unwrap_or(Value::Null);
+        Refused { status, error }.into()
+    }
+    fn checked(response: Response) -> Result<Value> {
+        if response.status().is_success() {
+            Self::json_response(response)
+        } else {
+            Err(Self::refusal(response))
+        }
+    }
+    /// PUT `/v1/blobs/SHA256` from a file whose digest the caller computed.
+    pub fn upload_blob(&self, path: &Path, sha256: &str) -> Result<Value> {
+        Self::checked(
+            self.client
+                .put(format!("{}/v1/blobs/{sha256}", self.endpoint))
+                .timeout(Duration::from_secs(TRANSFER_TIMEOUT_SECONDS))
+                .bearer_auth(&self.credential)
+                .body(File::open(path)?)
+                .send()?,
+        )
+    }
+    /// POST `/v1/executor/{route}`: one executor call and its result.
+    pub fn executor<T: DeserializeOwned>(
+        &self,
+        route: &str,
+        body: &impl Serialize,
+        timeout: Option<Duration>,
+    ) -> Result<T> {
+        let mut request = self
+            .client
+            .post(format!("{}/v1/executor/{route}", self.endpoint))
+            .bearer_auth(&self.credential)
+            .json(body);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let value = Self::checked(request.send()?)?;
+        serde_json::from_value(value["result"].clone())
+            .with_context(|| format!("unexpected /v1/executor/{route} result"))
+    }
+    pub(crate) fn download(
         &self,
         path: &str,
         destination: &Path,
@@ -145,11 +214,9 @@ impl Remote {
             .timeout(Duration::from_secs(TRANSFER_TIMEOUT_SECONDS))
             .bearer_auth(&self.credential)
             .send()?;
-        ensure!(
-            response.status().is_success(),
-            "download refused with HTTP {}",
-            response.status()
-        );
+        if !response.status().is_success() {
+            return Err(Self::refusal(response).context("download refused"));
+        }
         let digest = response
             .headers()
             .get("x-content-sha256")
@@ -170,13 +237,29 @@ impl Remote {
         Ok(actual)
     }
     pub fn bundle(&self, revision: &str, destination: &Path) -> Result<Value> {
+        self.bundle_since(revision, &[], destination)
+    }
+    /// A bundle of the revision without the history of `haves`, commits the caller holds. It
+    /// verifies only in a repository holding them, unless the service had to send everything.
+    pub fn bundle_since(
+        &self,
+        revision: &str,
+        haves: &[String],
+        destination: &Path,
+    ) -> Result<Value> {
         ensure!(crate::api::digest(revision, 64), "invalid revision ID");
-        let sha256 = self.download(
-            &format!("/v1/revisions/{revision}/bundle"),
-            destination,
-            None,
-            MAX_BUNDLE as u64,
-        )?;
+        ensure!(
+            haves.len() <= MAX_HAVES
+                && haves
+                    .iter()
+                    .all(|h| crate::api::digest(h, 40) || crate::api::digest(h, 64)),
+            "at most {MAX_HAVES} haves, each a full commit ID"
+        );
+        let mut path = format!("/v1/revisions/{revision}/bundle");
+        if !haves.is_empty() {
+            path = format!("{path}?have={}", haves.join(","));
+        }
+        let sha256 = self.download(&path, destination, None, MAX_BUNDLE as u64)?;
         Ok(json!({"revision":revision,"destination":destination,"sha256":sha256}))
     }
     pub fn deliver(&self, action: &str, destination: &Path) -> Result<Value> {

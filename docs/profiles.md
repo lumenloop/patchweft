@@ -7,6 +7,12 @@ tools, runner binary and platform. Changed tools or a new runner require a new
 registration. Use the returned profile ID in requests. The profile ID is the
 handle for permissions and certification policy.
 
+Every executing host must hold the identical runner and declared tools at the
+same paths on the same platform. An executor whose tools, runner or platform
+differ refuses the profile: its queued work stays queued instead of failing, and
+`patchweft executors` lists the refusal. A drift found after an action was
+claimed requeues it without a repair.
+
 Each job also has a job identity, its recipe. A recipe hashes what the job's
 process can observe from the profile: job name, command and cleanup argv, every
 declared tool's path and bytes, the profile environment overlaid with the job
@@ -169,7 +175,9 @@ those remain part of the project's policy.
 
 Each job can specify `slots`, `memory_mb` and `timeout_seconds`. These default
 to 1 slot, 1024 MiB reserved and 1800 seconds. Reservations are admission units,
-not hard CPU/RSS limits. Declare a bounded `cleanup` argv for external resources
+not hard CPU/RSS limits. Each artifact file and each log may hold at most 1 GiB,
+and an attempt's artifacts and logs together at most 4 GiB; exceeding either
+fails the attempt on every host. Declare a bounded `cleanup` argv for external resources
 such as project-owned containers. Uncertain cleanup retains capacity for an operator.
 
 `memory_mb`, and `slots` when `export_slots` is false, form a per-action
@@ -185,14 +193,18 @@ its identity. Set `"export_slots": false` when the job does not read that
 variable; slots then only control admission. Check the job's scripts and tools
 for `PATCHWEFT_SLOTS` before setting it.
 
-The timeout budget starts before source and dependency preparation. The worker
-checks it during command supervision; preparation is not independently
-interrupted by this timer. Allow for preparation when choosing the budget.
+The timeout budget starts before source and dependency preparation. The
+supervisor checks it during command supervision; preparation is not independently
+interrupted by this timer. A remote executor's downloads before launch are not
+charged to it. Allow for preparation when choosing the budget.
 Cleanup runs afterward, so the job timeout is not a hard bound on the complete
 attempt lifecycle.
 
 Jobs receive `PATCHWEFT_STATE`, `PATCHWEFT_ATTEMPT`, `PATCHWEFT_REVISION`,
 `PATCHWEFT_SLOTS` (unless `export_slots` is false) and `PATCHWEFT_REPORT`.
+`PATCHWEFT_STATE` is the store's directory on the API host and the executor's
+`--work` directory elsewhere; `$PATCHWEFT_STATE/attempts/$PATCHWEFT_ATTEMPT` is the
+attempt directory on both.
 Cleanup receives the state and attempt identifiers plus `PATCHWEFT_WORKSPACE`,
 the absolute job checkout path. Cleanup
 starts from the protected attempt directory so a job changing its checkout's
@@ -203,8 +215,12 @@ permission boundary.
 Attempt evidence records source preparation time, dependency verification and
 copy time, actual dependency bytes copied, command time and artifact-capture
 time. It also records the executing profile, the job identity and action key,
-the applied budget, the hostname, and `timer_seconds`: the timeout clock when
-supervision ended, after detached descendants exited. Copy time excludes archive
+the applied budget, the hostname, the `executor`, and `timer_seconds`: the
+timeout clock when supervision ended, after detached descendants exited.
+`preparation.transfer_seconds` and `transfer_bytes` record what the executor
+downloaded for the attempt before launch; they are 0 on the API host and when
+the source and dependencies were already on the executing host. The executor and
+host are observations, not part of job identity. Copy time excludes archive
 extraction performed by job scripts. These
 measurements describe observed work; a shared request alone does not establish
 CPU or elapsed time saved.

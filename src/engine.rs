@@ -1,5 +1,5 @@
 use crate::{
-    file_hash, identity,
+    authority, file_hash, identity,
     model::*,
     now, source,
     store::{Store, event, record},
@@ -178,12 +178,17 @@ pub fn profile_id(
 }
 
 pub fn verify_runtime(profile: &RegisteredProfile) -> Result<()> {
+    verify_runtime_for(profile, &file_hash(&std::env::current_exe()?)?)
+}
+
+/// `engine` is the sha256 of the runner binary that will execute the profile's jobs.
+pub fn verify_runtime_for(profile: &RegisteredProfile, engine: &str) -> Result<()> {
     ensure!(
         tool_identity(&profile.definition)? == profile.tools,
         "declared tool bytes changed; register a new profile"
     );
     ensure!(
-        file_hash(&std::env::current_exe()?)? == profile.engine,
+        engine == profile.engine,
         "runner binary changed; register a new profile"
     );
     ensure!(
@@ -932,6 +937,11 @@ pub fn retry_owned(
             "UPDATE actions SET state='queued',attempt=NULL,body=? WHERE id=?",
             params![serde_json::to_string(&action)?, id],
         )?;
+        // An operator's retry restarts the not-started requeue budget (gate P3-D).
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS requeues (action TEXT PRIMARY KEY, count INTEGER NOT NULL)",
+        )?;
+        transaction.execute("DELETE FROM requeues WHERE action=?", [id])?;
         transaction.execute(
             "UPDATE interests SET active=1 WHERE action=? AND context=? AND (? IS NULL OR owner=?)",
             params![id, candidate_id, owner, owner],
@@ -973,6 +983,20 @@ pub fn cancel(store: &mut Store, action: &str, owner: &str) -> Result<Value> {
         action,
         &json!({"owner":owner,"remaining":active}),
     )?;
+    let running: Option<String> = transaction
+        .query_row(
+            "SELECT attempt FROM actions WHERE id=? AND state='running'",
+            [action],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    // Recorded with the detach, so no new requester joins work that is being stopped.
+    if active == 0
+        && let Some(attempt) = running
+    {
+        authority::stopping(&transaction, action, &attempt, None)?;
+    }
     transaction.commit()?;
     Ok(json!({"action":action,"active_interests":active}))
 }

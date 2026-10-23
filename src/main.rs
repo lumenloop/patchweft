@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
-use patchweft::{api, client, engine, http, mcp, source, store::Store, worker};
+use patchweft::{
+    api, authority, client, engine, executor, http, mcp, source, store::Store, worker,
+};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -9,6 +11,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+const GIB: u64 = 1024 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -140,11 +144,77 @@ enum Operation {
         #[arg(long)]
         retain_from: Option<String>,
     },
-    /// Run a local coordinator; --drain exits when all currently runnable work is finished.
+    /// Run the local executor's coordinator; --drain exits when all currently runnable work is
+    /// finished. A second coordinator waits as a standby.
     Worker {
         #[arg(long)]
         drain: bool,
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..))]
+        poll_ms: u64,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+        heartbeat_seconds: u64,
+        /// Claims wait while less is free under the state directory.
+        #[arg(long, default_value_t = 0)]
+        min_free_gb: u64,
+        /// Host loopback ports job containers may reach when the rootless Docker daemon exposes
+        /// host loopback; any other loopback listener refuses all work. Checked by default
+        /// (MUST-FIX 8), so it cannot regress silently.
+        #[arg(long, value_delimiter = ',')]
+        loopback_allow: Vec<u16>,
+        /// Skip the loopback check: only for hosts that run no job containers.
+        #[arg(long)]
+        no_loopback_check: bool,
     },
+    /// Run a remote executor's coordinator against an API; --drain exits when all currently
+    /// runnable work is finished. A second coordinator for the same work directory waits as a
+    /// standby.
+    Executor {
+        #[command(flatten)]
+        connection: Connection,
+        /// `PATCHWEFT_STATE` for jobs: attempts, source mirrors, the artifact cache.
+        #[arg(long)]
+        work: PathBuf,
+        #[arg(long)]
+        drain: bool,
+        #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u64).range(1..))]
+        poll_ms: u64,
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
+        heartbeat_seconds: u64,
+        /// Claims wait while less is free under the work directory, after reclaiming space.
+        #[arg(long, default_value_t = 20)]
+        min_free_gb: u64,
+        #[arg(long, default_value_t = 20)]
+        cas_max_gb: u64,
+        /// Fenced or undrained attempt directories are kept this long.
+        #[arg(long, default_value_t = 72)]
+        retain_hours: u64,
+        /// Host loopback ports job containers may reach when the rootless Docker daemon exposes
+        /// host loopback; any other loopback listener refuses all work.
+        #[arg(long, value_delimiter = ',')]
+        loopback_allow: Vec<u16>,
+    },
+    /// Register or reconfigure an executor. `local` sets the store's own budget; a remote
+    /// executor runs only the jobs placed on it with --allow-job.
+    ExecutorSet {
+        id: String,
+        #[arg(long)]
+        slots: Option<u32>,
+        #[arg(long)]
+        memory_mb: Option<u32>,
+        #[arg(long)]
+        lease_seconds: Option<u64>,
+        /// Replaces the jobs this executor may run.
+        #[arg(long)]
+        allow_job: Vec<String>,
+        /// Replaces the jobs this executor never runs; a denial wins over an allowance.
+        #[arg(long)]
+        deny_job: Vec<String>,
+        /// Reset placement before applying --allow-job and --deny-job.
+        #[arg(long)]
+        clear_placement: bool,
+    },
+    /// Show executors: budgets, held attempts, placement and their coordinators' reports.
+    Executors,
     /// Inspect exact source identities, action states and unmet prerequisites.
     Status { candidate: Option<String> },
     /// Wait for one candidate; a timeout or failed/blocked candidate returns a failing exit code.
@@ -193,7 +263,8 @@ enum Operation {
         #[arg(long)]
         candidate: String,
     },
-    /// Recover dead coordinators. Supervisor loss retains capacity until an operator confirms drain.
+    /// Reconcile the local executor while no worker runs. Supervisor loss retains capacity until
+    /// an operator confirms drain.
     Recover {
         #[arg(long)]
         confirm_drained: Option<String>,
@@ -220,8 +291,9 @@ enum Operation {
         #[arg(value_parser=["projects","revisions","workspaces","profiles"])]
         kind: String,
     },
-    #[command(name = "_execute", hide = true)]
-    Execute { attempt: String },
+    /// Supervise one claimed attempt from its control files; never opens the store.
+    #[command(name = "_supervise", hide = true)]
+    Supervise { root: PathBuf, attempt: String },
 }
 
 #[derive(Args)]
@@ -351,6 +423,34 @@ fn run(cli: Cli) -> Result<Value> {
             connection,
             operation,
         } => return remote(connection, operation),
+        Operation::Supervise { root, attempt } => return worker::supervise(root, attempt),
+        Operation::Executor {
+            connection,
+            work,
+            drain,
+            poll_ms,
+            heartbeat_seconds,
+            min_free_gb,
+            cas_max_gb,
+            retain_hours,
+            loopback_allow,
+        } => {
+            return executor::remote(
+                || connection.open(),
+                work,
+                executor::Options {
+                    drain: *drain,
+                    poll: Duration::from_millis(*poll_ms),
+                    heartbeat: Duration::from_secs(*heartbeat_seconds),
+                },
+                executor::Bounds {
+                    min_free: min_free_gb * GIB,
+                    cas_max: cas_max_gb * GIB,
+                    retain: Duration::from_secs(retain_hours * 3600),
+                },
+                loopback_allow.iter().copied().collect(),
+            );
+        }
         Operation::Mcp { .. } => unreachable!("stdio is handled before JSON output"),
         _ => {}
     }
@@ -361,9 +461,11 @@ fn run(cli: Cli) -> Result<Value> {
     let mut store = Store::open(&cli.state)?;
     Ok(match cli.command {
         Operation::Init { .. } => unreachable!(),
-        Operation::Serve { .. } | Operation::Remote { .. } | Operation::Mcp { .. } => {
-            unreachable!()
-        }
+        Operation::Serve { .. }
+        | Operation::Remote { .. }
+        | Operation::Mcp { .. }
+        | Operation::Executor { .. }
+        | Operation::Supervise { .. } => unreachable!(),
         Operation::Grant {
             policy,
             credential_file,
@@ -422,7 +524,47 @@ fn run(cli: Cli) -> Result<Value> {
             requires,
             retain_from.as_deref(),
         )?)?,
-        Operation::Worker { drain } => worker::run(&mut store, drain)?,
+        Operation::Worker {
+            drain,
+            poll_ms,
+            heartbeat_seconds,
+            min_free_gb,
+            loopback_allow,
+            no_loopback_check,
+        } => executor::local(
+            &store,
+            executor::Options {
+                drain,
+                poll: Duration::from_millis(poll_ms),
+                heartbeat: Duration::from_secs(heartbeat_seconds),
+            },
+            executor::Guards {
+                min_free: min_free_gb * GIB,
+                loopback: (!no_loopback_check).then(|| loopback_allow.into_iter().collect()),
+                ..executor::Guards::default()
+            },
+        )?,
+        Operation::ExecutorSet {
+            id,
+            slots,
+            memory_mb,
+            lease_seconds,
+            allow_job,
+            deny_job,
+            clear_placement,
+        } => authority::configure(
+            &mut store,
+            &id,
+            &authority::ConfigureRequest {
+                slots,
+                memory_mb,
+                lease_seconds,
+                allow: allow_job,
+                deny: deny_job,
+                clear_placement,
+            },
+        )?,
+        Operation::Executors => authority::list(&store)?,
         Operation::Status { candidate } => match candidate {
             Some(candidate) => engine::candidate_status(&store, &candidate)?,
             None => engine::status(&store)?,
@@ -465,7 +607,7 @@ fn run(cli: Cli) -> Result<Value> {
             engine::resolve_repair(&mut store, &repair, &candidate)?
         }
         Operation::Recover { confirm_drained } => {
-            worker::recover(&mut store, confirm_drained.as_deref())?
+            executor::recover(&mut store, confirm_drained.as_deref())?
         }
         Operation::Events { after } => serde_json::to_value(store.events(after)?)?,
         Operation::Logs { attempt } => {
@@ -499,7 +641,6 @@ fn run(cli: Cli) -> Result<Value> {
                 .collect::<Result<Vec<_>>>()?;
             json!(values)
         }
-        Operation::Execute { attempt } => worker::execute(&mut store, &attempt)?,
     })
 }
 

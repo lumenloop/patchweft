@@ -1,4 +1,9 @@
-use crate::api::{Api, ApiError, Command, MAX_BUNDLE, Query, TRANSFER_TIMEOUT_SECONDS};
+use crate::{
+    api::{self, Api, ApiError, Command, MAX_BUNDLE, Query, TRANSFER_TIMEOUT_SECONDS},
+    authority,
+    model::{ClaimRequest, CompleteRequest, HelloRequest, RenewRequest},
+    store::Store,
+};
 use anyhow::{Result, ensure};
 use axum::{
     Extension, Json, Router,
@@ -16,15 +21,18 @@ use axum::{
     routing::{get, post, put},
 };
 use http_body_util::BodyExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
-    sync::{Arc, Mutex, Weak},
-    time::Duration,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     io::AsyncReadExt,
@@ -215,9 +223,11 @@ async fn boundary(State(service): State<Service>, mut request: Request, next: Ne
     } else {
         None
     };
+    // A completion hashes and moves every upload it names.
     let transfer_request = request.uri().path().starts_with("/v1/blobs/")
         || (request.uri().path().starts_with("/v1/revisions/")
-            && request.uri().path().ends_with("/bundle"));
+            && request.uri().path().ends_with("/bundle"))
+        || request.uri().path() == "/v1/executor/complete";
     let deadline = if transfer_request {
         TRANSFER_TIMEOUT_SECONDS
     } else {
@@ -241,6 +251,13 @@ pub fn router(service: Service) -> Router {
     Router::new()
         .route("/v1/commands", post(commands))
         .route("/v1/query", post(queries))
+        .route("/v1/executor/profiles", post(executor_profiles))
+        .route("/v1/executor/claim", post(executor_claim))
+        .route("/v1/executor/renew", post(executor_renew))
+        .route(
+            "/v1/executor/complete",
+            post(executor_complete).layer(DefaultBodyLimit::max(api::MAX_COMPLETE_BODY)),
+        )
         .route("/v1/events", get(events))
         .route("/v1/blobs/{sha256}", put(upload))
         .route("/v1/revisions/{revision}/bundle", get(bundle))
@@ -356,6 +373,80 @@ async fn queries(
         Ok(value) => Json(json!({"api_version":"1","result":value})).into_response(),
         Err(e) => e.into_response(),
     }
+}
+
+/// The executor routes: one JSON request, one result. Heartbeats and profile descriptions use
+/// the control reserve, so saturated work never lets an executor's leases lapse.
+async fn executor_call<T: Send + 'static, R: Serialize + Send + 'static>(
+    service: Service,
+    admission: Arc<Admission>,
+    headers: HeaderMap,
+    body: std::result::Result<Json<T>, JsonRejection>,
+    control: bool,
+    call: fn(&Api, &str, &T) -> std::result::Result<R, ApiError>,
+) -> Response {
+    let result = async {
+        let request = parse_json(body)?;
+        let token = token(&headers)?;
+        let api = service.api.clone();
+        admitted(&service, admission, control, move || {
+            call(&api, &token, &request)
+        })
+        .await
+    }
+    .await;
+    match result {
+        Ok(value) => Json(json!({"api_version":"1","result":value})).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+async fn executor_profiles(
+    State(service): State<Service>,
+    Extension(admission): Extension<Arc<Admission>>,
+    headers: HeaderMap,
+    body: std::result::Result<Json<HelloRequest>, JsonRejection>,
+) -> Response {
+    executor_call(service, admission, headers, body, true, Api::executor_hello).await
+}
+async fn executor_claim(
+    State(service): State<Service>,
+    Extension(admission): Extension<Arc<Admission>>,
+    headers: HeaderMap,
+    body: std::result::Result<Json<ClaimRequest>, JsonRejection>,
+) -> Response {
+    executor_call(
+        service,
+        admission,
+        headers,
+        body,
+        false,
+        Api::executor_claim,
+    )
+    .await
+}
+async fn executor_renew(
+    State(service): State<Service>,
+    Extension(admission): Extension<Arc<Admission>>,
+    headers: HeaderMap,
+    body: std::result::Result<Json<RenewRequest>, JsonRejection>,
+) -> Response {
+    executor_call(service, admission, headers, body, true, Api::executor_renew).await
+}
+async fn executor_complete(
+    State(service): State<Service>,
+    Extension(admission): Extension<Arc<Admission>>,
+    headers: HeaderMap,
+    body: std::result::Result<Json<CompleteRequest>, JsonRejection>,
+) -> Response {
+    executor_call(
+        service,
+        admission,
+        headers,
+        body,
+        false,
+        Api::executor_complete,
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -568,13 +659,30 @@ async fn stream_file(
     )
         .into_response()
 }
+#[derive(Deserialize)]
+struct BundleParameters {
+    /// Comma-separated commits the caller already holds.
+    have: Option<String>,
+}
 async fn bundle(
     State(service): State<Service>,
     Extension(admission): Extension<Arc<Admission>>,
     headers: HeaderMap,
     Path(revision): Path<String>,
+    parameters: std::result::Result<UrlQuery<BundleParameters>, QueryRejection>,
 ) -> Response {
     let result = async {
+        let UrlQuery(parameters) = parameters.map_err(|e| {
+            ApiError::new(
+                e.status().as_u16(),
+                "invalid_query",
+                "Invalid bundle query parameters.",
+            )
+        })?;
+        let haves: Vec<String> = parameters
+            .have
+            .map(|haves| haves.split(',').map(str::to_owned).collect())
+            .unwrap_or_default();
         let permit = service
             .transfers
             .clone()
@@ -584,7 +692,7 @@ async fn bundle(
         let api = service.api.clone();
         let (temp, file, sha256, permit) =
             admitted(&service, admission.clone(), false, move || {
-                let (temp, path) = api.source_bundle(&token, &revision)?;
+                let (temp, path) = api.source_bundle(&token, &revision, &haves)?;
                 let sha256 = crate::file_hash(&path)
                     .map_err(|_| ApiError::new(500, "internal", "Bundle could not be hashed."))?;
                 let file = std::fs::File::open(path)
@@ -666,6 +774,28 @@ fn mcp_control(message: &Value) -> bool {
                 )))
 }
 
+const PURGE_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Lease expiry (MUST-FIX 2) and upload hygiene (MUST-FIX 3) run only in the API process: a
+/// worker's view of time must never expire another host's work.
+fn maintain(mut store: Store, started: f64, stop: &AtomicBool) {
+    let mut purged: Option<Instant> = None;
+    while !stop.load(Ordering::Relaxed) {
+        if let Err(error) = authority::expire(&mut store, crate::now(), started) {
+            eprintln!("Patchweft lease expiry failed: {error:#}");
+        }
+        if purged.is_none_or(|last| last.elapsed() >= PURGE_INTERVAL) {
+            match api::purge(&store.root, SystemTime::now()) {
+                Ok(0) => {}
+                Ok(removed) => eprintln!("{}", json!({"event":"uploads_purged","removed":removed})),
+                Err(error) => eprintln!("Patchweft upload purge failed: {error:#}"),
+            }
+            purged = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
 pub fn serve(
     root: &FsPath,
     listen: SocketAddr,
@@ -684,6 +814,7 @@ pub fn serve(
     );
     ensure!(!origins.contains("*"), "origins must be explicit");
     let api = Arc::new(Api::open(root)?);
+    let maintenance = Store::open(root)?;
     let listener = std::net::TcpListener::bind(listen)?;
     // Tokio requires nonblocking sockets; otherwise a later accept can stall shutdown.
     listener.set_nonblocking(true)?;
@@ -693,7 +824,14 @@ pub fn serve(
         .max_blocking_threads(64)
         .enable_all()
         .build()?;
-    runtime.block_on(async move {
+    let stop = Arc::new(AtomicBool::new(false));
+    let maintainer = {
+        let (stop, started) = (stop.clone(), api.started);
+        std::thread::Builder::new()
+            .name("maintenance".into())
+            .spawn(move || maintain(maintenance, started, &stop))?
+    };
+    let served = runtime.block_on(async move {
         let app = router(Service::new(api, origins));
         let handle = axum_server::Handle::new();
         let stop = handle.clone();
@@ -735,7 +873,10 @@ pub fn serve(
                 .await?;
         }
         Ok::<_, anyhow::Error>(json!({"stopped":true}))
-    })
+    });
+    stop.store(true, Ordering::Relaxed);
+    let _ = maintainer.join();
+    served
 }
 
 #[cfg(test)]
@@ -864,6 +1005,89 @@ mod tests {
         }
         let response = fixture_request(&service, FIXTURE_TOKEN, "/mcp", json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"patchweft_command","arguments":{"idempotency_key":"mcp-mutation","command":mutation}}})).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn renew_and_profiles_use_the_control_reserve() {
+        const EXECUTOR: &str = "public-executor-admission-fixture";
+        let (temp, service) = service_fixture();
+        let mut store = crate::store::Store::open(temp.path()).unwrap();
+        let policy = json!({"id":"mindy","projects":[],"profiles":[],
+            "roles":["read","execute"],"max_pending":1});
+        store
+            .db
+            .execute(
+                "INSERT INTO api_principals VALUES ('mindy',?)",
+                [policy.to_string()],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO api_credentials VALUES (?,'mindy')",
+                [crate::hash(EXECUTOR.as_bytes())],
+            )
+            .unwrap();
+        crate::authority::configure(
+            &mut store,
+            "mindy",
+            &crate::authority::ConfigureRequest {
+                slots: Some(1),
+                memory_mb: Some(1024),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let complete = json!({"attempt":"absent","lease":"l","outcome":"lost","exit_code":125,
+            "evidence":{},"drained":false});
+        let status = |path: &'static str, body: Value| {
+            let service = service.clone();
+            async move {
+                fixture_request(&service, EXECUTOR, path, body)
+                    .await
+                    .status()
+            }
+        };
+        let control = || async {
+            assert_eq!(
+                status("/v1/executor/profiles", json!({})).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                status("/v1/executor/renew", json!({"leases":[]})).await,
+                StatusCode::OK
+            );
+        };
+        // Heartbeats keep leases alive while claims and reports wait for ordinary capacity.
+        let ordinary = service.work.clone().acquire_many_owned(24).await.unwrap();
+        for (path, body) in [
+            ("/v1/executor/claim", json!({"claim_key":"k"})),
+            ("/v1/executor/complete", complete.clone()),
+        ] {
+            assert_eq!(
+                status(path, body).await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}"
+            );
+        }
+        control().await;
+        drop(ordinary);
+        // The same holds when only this executor's own work budget is spent.
+        let principal = service
+            .principals
+            .get("mindy".into(), PrincipalBudget::new)
+            .unwrap();
+        let held = principal.work.clone().acquire_many_owned(2).await.unwrap();
+        assert_eq!(
+            status("/v1/executor/claim", json!({"claim_key":"k"})).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        control().await;
+        drop(held);
+        assert_eq!(
+            status("/v1/executor/complete", complete).await,
+            StatusCode::CONFLICT
+        );
     }
 
     #[tokio::test]

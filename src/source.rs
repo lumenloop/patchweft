@@ -219,8 +219,20 @@ pub fn import(
 
 pub fn checkout(store: &Store, revision: &str, destination: &Path) -> Result<()> {
     let row = store.revision(revision)?;
+    checkout_from(&repository(store, &row.project), &row.commit, destination)
+}
+
+/// Checks `commit` out of whichever repository holds it: the store's, or an executor's mirror.
+pub fn checkout_from(repository: &Path, commit: &str, destination: &Path) -> Result<()> {
     ensure!(!destination.exists(), "checkout destination exists");
-    let repo = repository(store, &row.project);
+    // git runs in the destination's parent, where a relative path would mean something else.
+    ensure!(
+        repository.is_absolute() && destination.is_absolute(),
+        "checkout paths must be absolute"
+    );
+    let parent = destination
+        .parent()
+        .context("checkout destination parent")?;
     let args = [
         "-c",
         "protocol.file.allow=always",
@@ -230,17 +242,14 @@ pub fn checkout(store: &Store, revision: &str, destination: &Path) -> Result<()>
         "--no-checkout",
     ];
     checked(
-        git_command(&store.root)
+        git_command(parent)
             .args(args)
-            .arg(repo)
+            .arg(repository)
             .arg(destination)
             .output()?,
         "clone",
     )?;
-    git(
-        destination,
-        &["checkout", "--quiet", "--detach", &row.commit],
-    )?;
+    git(destination, &["checkout", "--quiet", "--detach", commit])?;
     Ok(())
 }
 

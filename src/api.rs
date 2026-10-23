@@ -1,7 +1,10 @@
 //! Versioned, authenticated application boundary shared by HTTP and MCP.
 //! Local administrative CLI commands retain their existing Unix-account authority.
 use crate::{
-    engine, hash, identity, now, source,
+    authority::{self, AuthorityError, LOCAL, Outputs, Scope},
+    engine, hash, identity,
+    model::*,
+    now, source,
     store::{Store, event},
     unique,
 };
@@ -10,16 +13,17 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::OpenOptionsExt,
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant, SystemTime},
 };
 
 const SCHEMA: &str = "
@@ -177,6 +181,8 @@ pub struct ApiError {
     pub status: u16,
     pub code: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Value>,
 }
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -190,6 +196,7 @@ impl ApiError {
             status,
             code: code.into(),
             message: message.into(),
+            detail: None,
         }
     }
     pub(crate) fn internal(error: impl std::fmt::Display) -> Self {
@@ -208,6 +215,42 @@ impl ApiError {
     }
 }
 type ApiResult<T> = std::result::Result<T, ApiError>;
+
+impl From<AuthorityError> for ApiError {
+    fn from(error: AuthorityError) -> Self {
+        match error {
+            AuthorityError::Invalid(message) => Self::new(400, "invalid", &message),
+            AuthorityError::Forbidden => Self::forbidden(),
+            AuthorityError::Unregistered => Self::new(
+                403,
+                "executor_unregistered",
+                "No executor is registered for this principal.",
+            ),
+            AuthorityError::Fenced => Self::new(
+                409,
+                "attempt_fenced",
+                "This executor no longer holds the attempt under this lease.",
+            ),
+            AuthorityError::CompletionConflict => Self::new(
+                409,
+                "completion_conflict",
+                "The attempt was already completed by a different report.",
+            ),
+            AuthorityError::MissingBlobs(missing) => Self {
+                detail: Some(json!({"missing":missing})),
+                ..Self::new(
+                    422,
+                    "missing_blob",
+                    "Upload the missing blobs, then report again.",
+                )
+            },
+            AuthorityError::InvalidEvidence(message) => {
+                Self::new(422, "invalid_evidence", &message)
+            }
+            AuthorityError::Internal(error) => Self::internal(format!("{error:#}")),
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct Metrics {
@@ -235,10 +278,13 @@ pub struct Api {
     pub root: PathBuf,
     writer: Mutex<Store>,
     pub metrics: Metrics,
+    /// When this process opened the store: every lease gets one full term after it.
+    pub started: f64,
 }
 
 pub fn prepare(store: &Store) -> Result<()> {
     store.db.execute_batch(SCHEMA)?;
+    crate::authority::prepare(&store.db)?;
     store.db.execute(
         "INSERT OR IGNORE INTO api_settings VALUES ('version','1')",
         [],
@@ -266,12 +312,22 @@ fn validate_policy(store: &Store, principal: &Principal) -> Result<()> {
     );
     ensure!(
         !principal.roles.is_empty()
-            && principal
-                .roles
-                .iter()
-                .all(|r| ["read", "write", "review", "promote", "operator"].contains(&r.as_str())),
+            && principal.roles.iter().all(|r| {
+                ["read", "write", "review", "promote", "operator", "execute"].contains(&r.as_str())
+            }),
         "invalid roles"
     );
+    if principal.roles.contains("execute") {
+        // An executor fetches the sources and artifacts its claims name (A6).
+        ensure!(
+            principal.roles.contains("read"),
+            "the execute role requires the read role"
+        );
+        ensure!(
+            principal.id != LOCAL,
+            "`local` is the store's own executor; choose another principal name"
+        );
+    }
     for project in &principal.projects {
         ensure!(
             store
@@ -433,6 +489,29 @@ fn role(principal: &Principal, name: &str) -> ApiResult<()> {
     } else {
         Err(ApiError::forbidden())
     }
+}
+/// Authors upload publication bundles; executors upload their attempts' logs and artifacts.
+fn uploader(principal: &Principal) -> ApiResult<()> {
+    role(principal, "write").or_else(|_| role(principal, "execute"))
+}
+/// An executor principal is the executor of the same id, limited to its current grant (A6).
+fn executor(store: &Store, token: &str) -> ApiResult<(Principal, Scope)> {
+    let principal = auth(store, token)?;
+    role(&principal, "execute")?;
+    if principal.id == LOCAL {
+        return Err(ApiError::forbidden());
+    }
+    if authority::load(&store.db, &principal.id)
+        .map_err(ApiError::internal)?
+        .is_none()
+    {
+        return Err(AuthorityError::Unregistered.into());
+    }
+    let scope = Scope {
+        projects: Some(principal.projects.clone()),
+        profiles: Some(principal.profiles.clone()),
+    };
+    Ok((principal, scope))
 }
 fn project(principal: &Principal, id: &str) -> ApiResult<()> {
     if principal.projects.contains(id) {
@@ -602,6 +681,10 @@ fn authorize(store: &Store, principal: &Principal, command: &Command) -> ApiResu
 fn owner(principal: &Principal) -> String {
     format!("api:{}", principal.id)
 }
+/// Idempotency and claim keys.
+pub fn visible_key(key: &str) -> bool {
+    !key.is_empty() && key.len() <= 128 && key.bytes().all(|c| c.is_ascii_graphic())
+}
 pub fn digest(text: &str, length: usize) -> bool {
     text.len() == length
         && text
@@ -617,6 +700,7 @@ impl Api {
             root: store.root.clone(),
             writer: Mutex::new(store),
             metrics: Metrics::default(),
+            started: now(),
         })
     }
     pub fn authenticate(&self, token: &str) -> ApiResult<Principal> {
@@ -624,7 +708,7 @@ impl Api {
     }
 
     pub fn command(&self, token: &str, key: &str, command: &Command) -> ApiResult<Value> {
-        if key.is_empty() || key.len() > 128 || !key.bytes().all(|c| c.is_ascii_graphic()) {
+        if !visible_key(key) {
             return Err(ApiError::new(
                 400,
                 "invalid_key",
@@ -1217,12 +1301,26 @@ fn upload_path(store: &Store, principal: &str, sha256: &str) -> PathBuf {
 }
 pub const MAX_BUNDLE: usize = 1024 * 1024 * 1024;
 pub const MAX_RETAINED_UPLOADS: u64 = 4 * MAX_BUNDLE as u64;
+/// Per artifact or log file, so a result recorded on one host is deliverable from every host.
+pub const MAX_ARTIFACT_BYTES: u64 = MAX_BUNDLE as u64;
+/// Per attempt: artifacts and logs together.
+pub const MAX_ATTEMPT_OUTPUT_BYTES: u64 = MAX_RETAINED_UPLOADS;
+/// A result's artifact manifest, serialized; every host enforces it at capture, so a result that
+/// passes locally is deliverable from a remote executor too (review P2-3).
+pub const MAX_MANIFEST_BYTES: u64 = 12 * 1024 * 1024;
+/// The one limit on JSON either side reads (gate P2-1): `executor/complete` requests, which carry
+/// a manifest twice, and responses such as claims, which inline their dependencies' manifests.
+pub const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_COMPLETE_BODY: usize = MAX_RESPONSE_BYTES as usize;
+/// Dependency manifests a claim may inline: the response budget less one manifest of headroom for
+/// the profile, action and revision it also carries.
+pub const MAX_CLAIM_MANIFESTS: u64 = MAX_RESPONSE_BYTES - MAX_MANIFEST_BYTES;
 pub const TRANSFER_TIMEOUT_SECONDS: u64 = 600;
 impl Api {
     pub fn begin_upload(&self, token: &str, sha256: &str) -> ApiResult<tempfile::NamedTempFile> {
         let store = Store::open(&self.root).map_err(ApiError::internal)?;
         let principal = auth(&store, token)?;
-        role(&principal, "write")?;
+        uploader(&principal)?;
         if !digest(sha256, 64) {
             return Err(ApiError::new(422, "digest_mismatch", "Invalid SHA-256."));
         }
@@ -1263,7 +1361,7 @@ impl Api {
         // Recheck authorization after receiving and hashing the complete stream.
         let store = Store::open(&self.root).map_err(ApiError::internal)?;
         let principal = auth(&store, token)?;
-        role(&principal, "write")?;
+        uploader(&principal)?;
         let path = upload_path(&store, &principal.id, sha256);
         fs::create_dir_all(path.parent().expect("upload parent")).map_err(ApiError::internal)?;
         // Serialize quota accounting with publication and other uploads.
@@ -1291,27 +1389,45 @@ impl Api {
         Ok(json!({"sha256":sha256,"bytes":bytes}))
     }
 
+    /// The revision's history, without what `haves` (commits the caller holds) already reach.
     pub fn source_bundle(
         &self,
         token: &str,
         revision: &str,
+        haves: &[String],
     ) -> ApiResult<(tempfile::TempDir, PathBuf)> {
         let store = Store::open(&self.root).map_err(ApiError::internal)?;
         let principal = auth(&store, token)?;
         role(&principal, "read")?;
+        if haves.len() > MAX_HAVES || !haves.iter().all(|h| digest(h, 40) || digest(h, 64)) {
+            return Err(ApiError::new(
+                400,
+                "invalid",
+                "At most 32 haves, each a full lowercase commit ID.",
+            ));
+        }
         let p = revision_project(&store, &principal, revision)?;
+        let repo = source::repository(&store, &p);
+        let haves = commits(&repo, haves).map_err(ApiError::internal)?;
         let temp = tempfile::tempdir_in(&self.root).map_err(ApiError::internal)?;
         let path = temp.path().join("source.bundle");
-        source::checked(
-            source::git_command(&source::repository(&store, &p))
-                .args(["bundle", "create"])
+        let create = |haves: &[String]| {
+            let mut git = source::git_command(&repo);
+            git.args(["bundle", "create"])
                 .arg(&path)
-                .arg(format!("refs/patchweft/revisions/{revision}"))
-                .output()
-                .map_err(ApiError::internal)?,
-            "create bundle",
-        )
-        .map_err(ApiError::internal)?;
+                .arg(format!("refs/patchweft/revisions/{revision}"));
+            if !haves.is_empty() {
+                git.arg("--not").args(haves);
+            }
+            git.output()
+        };
+        let mut output = create(&haves).map_err(ApiError::internal)?;
+        if !output.status.success() && !haves.is_empty() {
+            // git refuses an empty bundle: the haves already reach the revision.
+            let _ = fs::remove_file(&path);
+            output = create(&[]).map_err(ApiError::internal)?;
+        }
+        source::checked(output, "create bundle").map_err(ApiError::internal)?;
         if path.metadata().map_err(ApiError::internal)?.len() > MAX_BUNDLE as u64 {
             return Err(ApiError::new(
                 413,
@@ -1320,6 +1436,90 @@ impl Api {
             ));
         }
         Ok((temp, path))
+    }
+
+    pub fn executor_hello(&self, token: &str, request: &HelloRequest) -> ApiResult<Hello> {
+        let store = Store::open(&self.root).map_err(ApiError::internal)?;
+        let (principal, scope) = executor(&store, token)?;
+        Ok(authority::hello(
+            &store.db,
+            &principal.id,
+            &scope,
+            &request.ids,
+        )?)
+    }
+
+    pub fn executor_claim(&self, token: &str, request: &ClaimRequest) -> ApiResult<ClaimResponse> {
+        if !visible_key(&request.claim_key) {
+            return Err(ApiError::new(
+                400,
+                "invalid_key",
+                "A 1–128 byte visible-ASCII claim key is required.",
+            ));
+        }
+        let mut store = Store::open(&self.root).map_err(ApiError::internal)?;
+        let (principal, scope) = executor(&store, token)?;
+        Ok(authority::claim_for(
+            &mut store,
+            &principal.id,
+            &scope,
+            request,
+        )?)
+    }
+
+    pub fn executor_renew(&self, token: &str, request: &RenewRequest) -> ApiResult<RenewResponse> {
+        let mut store = Store::open(&self.root).map_err(ApiError::internal)?;
+        let (principal, scope) = executor(&store, token)?;
+        Ok(authority::renew(
+            &mut store,
+            &principal.id,
+            &scope,
+            request,
+        )?)
+    }
+
+    /// Stages the report's uploads, then lets the authority record it. A report of another
+    /// holder's attempt, or a replay of the recorded one, never touches the uploads.
+    pub fn executor_complete(
+        &self,
+        token: &str,
+        request: &CompleteRequest,
+    ) -> ApiResult<CompleteResponse> {
+        let mut store = Store::open(&self.root).map_err(ApiError::internal)?;
+        let (principal, scope) = executor(&store, token)?;
+        let body: Option<String> = store
+            .db
+            .query_row(
+                "SELECT body FROM attempts WHERE id=?",
+                [&request.attempt],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(ApiError::internal)?;
+        let attempt = body
+            .map(|body| serde_json::from_str::<Attempt>(&body))
+            .transpose()
+            .map_err(ApiError::internal)?
+            .filter(|attempt| {
+                attempt.executor.as_deref().unwrap_or(LOCAL) == principal.id
+                    && attempt.lease.as_deref() == Some(request.lease.as_str())
+            });
+        let Some(attempt) = attempt else {
+            return Err(AuthorityError::Fenced.into());
+        };
+        // A recorded completion never changes, so the authority answers it from the store.
+        let (outputs, used) = if attempt.completion.is_some() {
+            (Outputs::InPlace, vec![])
+        } else {
+            let (staging, used) = stage(&store, &principal.id, request)?;
+            (Outputs::Staged(staging), used)
+        };
+        let result = authority::complete(&mut store, &principal.id, &scope, request, outputs);
+        // Staged reports consume their uploads whatever the authority decided: the quota frees.
+        for sha256 in used {
+            let _ = fs::remove_file(upload_path(&store, &principal.id, &sha256));
+        }
+        Ok(result?)
     }
 
     pub fn artifact(&self, token: &str, action: &str, sha256: &str) -> ApiResult<File> {
@@ -1366,6 +1566,211 @@ impl Api {
         file.seek(SeekFrom::Start(0)).map_err(ApiError::internal)?;
         Ok(file)
     }
+}
+
+pub const MAX_HAVES: usize = 32;
+
+/// The haves that name commits of the repository; anything else is ignored.
+fn commits(repo: &Path, haves: &[String]) -> Result<Vec<String>> {
+    if haves.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut child = source::git_command(repo)
+        .args(["cat-file", "--batch-check=%(objecttype)"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // At most 32 short lines: they fit the pipe before git answers.
+    child
+        .stdin
+        .take()
+        .context("git stdin")?
+        .write_all(format!("{}\n", haves.join("\n")).as_bytes())?;
+    let kinds = source::checked(child.wait_with_output()?, "check haves")?;
+    Ok(haves
+        .iter()
+        .zip(kinds.lines())
+        .filter(|(_, kind)| *kind == "commit")
+        .map(|(have, _)| have.clone())
+        .collect())
+}
+
+fn invalid_evidence(message: String) -> ApiError {
+    AuthorityError::InvalidEvidence(message).into()
+}
+
+/// Moves a report's verified uploads out of the principal's upload area into
+/// `.incoming-<unique>/{output.log,cleanup.log,artifacts/<path>,artifacts.json}`. Nothing moves
+/// unless every blob is present with its declared length and digest.
+fn stage(
+    store: &Store,
+    principal: &str,
+    request: &CompleteRequest,
+) -> ApiResult<(PathBuf, Vec<String>)> {
+    let blobs: Vec<BlobRef> = request
+        .artifacts
+        .values()
+        .map(|entry| BlobRef {
+            sha256: entry.sha256.clone(),
+            bytes: entry.bytes,
+        })
+        .collect();
+    // Each staged file and the blob it is made from.
+    let mut targets: Vec<(PathBuf, &BlobRef, Option<u32>)> = vec![];
+    let logs = [
+        ("output.log", &request.log),
+        ("cleanup.log", &request.cleanup_log),
+    ];
+    for (name, blob) in logs {
+        if let Some(blob) = blob {
+            targets.push((PathBuf::from(name), blob, None));
+        }
+    }
+    for ((path, entry), blob) in request.artifacts.iter().zip(&blobs) {
+        let relative =
+            source::relative_path(path).map_err(|e| invalid_evidence(format!("{e:#}")))?;
+        if entry.mode > 0o777 {
+            return Err(invalid_evidence(format!(
+                "Artifact {path} has mode {:o}.",
+                entry.mode
+            )));
+        }
+        // A file cannot also be the directory of another artifact.
+        if relative.ancestors().skip(1).any(|parent| {
+            parent
+                .to_str()
+                .is_some_and(|p| request.artifacts.contains_key(p))
+        }) {
+            return Err(invalid_evidence(format!(
+                "Artifact {path} lies inside another artifact."
+            )));
+        }
+        targets.push((
+            Path::new("artifacts").join(relative),
+            blob,
+            Some(entry.mode),
+        ));
+    }
+    let mut lengths = BTreeMap::new();
+    for (_, blob, _) in &targets {
+        if !digest(&blob.sha256, 64) {
+            return Err(ApiError::new(400, "invalid", "Invalid SHA-256."));
+        }
+        if *lengths.entry(blob.sha256.as_str()).or_insert(blob.bytes) != blob.bytes {
+            return Err(invalid_evidence(format!(
+                "Blob {} is reported with two lengths.",
+                blob.sha256
+            )));
+        }
+    }
+    let mut missing = vec![];
+    for (sha256, bytes) in &lengths {
+        let upload = upload_path(store, principal, sha256);
+        let actual = match crate::file_hash(&upload) {
+            Ok(actual) => actual,
+            Err(_) if !upload.exists() => {
+                missing.push(sha256.to_string());
+                continue;
+            }
+            Err(error) => return Err(ApiError::internal(error)),
+        };
+        if actual != *sha256 {
+            // Damaged at rest: a fresh upload under the same name replaces it.
+            let _ = fs::remove_file(&upload);
+            missing.push(sha256.to_string());
+        } else if fs::metadata(&upload).map_err(ApiError::internal)?.len() != *bytes {
+            return Err(invalid_evidence(format!(
+                "Blob {sha256} does not have {bytes} bytes."
+            )));
+        }
+    }
+    if !missing.is_empty() {
+        return Err(AuthorityError::MissingBlobs(missing).into());
+    }
+    let staging = store.root.join(format!(".incoming-{}", unique()));
+    fs::create_dir(&staging).map_err(ApiError::internal)?;
+    let moved = (|| -> ApiResult<()> {
+        let mut placed: BTreeMap<&str, PathBuf> = BTreeMap::new();
+        for (relative, blob, mode) in &targets {
+            let target = staging.join(relative);
+            fs::create_dir_all(target.parent().expect("staged parent"))
+                .map_err(ApiError::internal)?;
+            if let Some(first) = placed.get(blob.sha256.as_str()) {
+                // One digest named by several paths: each gets its own copy.
+                fs::copy(first, &target).map_err(ApiError::internal)?;
+            } else {
+                // A link, not a move: a concurrent report of the same digest still finds the
+                // upload; the names are consumed once this report is recorded (gate P3-4).
+                match fs::hard_link(upload_path(store, principal, &blob.sha256), &target) {
+                    Ok(()) => {}
+                    // Consumed by a concurrent report since it was checked.
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        return Err(AuthorityError::MissingBlobs(vec![blob.sha256.clone()]).into());
+                    }
+                    Err(error) => return Err(ApiError::internal(error)),
+                }
+                placed.insert(&blob.sha256, target.clone());
+            }
+            if let Some(mode) = mode {
+                fs::set_permissions(&target, fs::Permissions::from_mode(mode & 0o777 & !0o222))
+                    .map_err(ApiError::internal)?;
+            }
+        }
+        fs::write(
+            staging.join("artifacts.json"),
+            serde_json::to_vec_pretty(&request.artifacts).map_err(ApiError::internal)?,
+        )
+        .map_err(ApiError::internal)
+    })();
+    if let Err(error) = moved {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    Ok((
+        staging,
+        lengths.keys().map(|sha256| sha256.to_string()).collect(),
+    ))
+}
+
+const UPLOAD_RETENTION: Duration = Duration::from_secs(24 * 3600);
+const STAGING_RETENTION: Duration = Duration::from_secs(3600);
+
+/// Removes uploads nobody consumed within a day and staging directories older than an hour
+/// (MUST-FIX 3). `serve` runs this every ten minutes. Returns how many entries were removed.
+pub fn purge(root: &Path, now: SystemTime) -> Result<usize> {
+    let older = |path: &Path, age: Duration| {
+        fs::symlink_metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| now.duration_since(modified).is_ok_and(|d| d > age))
+    };
+    let mut removed = 0;
+    let areas = match fs::read_dir(root.join("uploads")) {
+        Ok(areas) => areas.collect::<std::io::Result<Vec<_>>>()?,
+        Err(error) if error.kind() == ErrorKind::NotFound => vec![],
+        Err(error) => return Err(error.into()),
+    };
+    for area in areas.into_iter().filter(|a| a.path().is_dir()) {
+        for entry in fs::read_dir(area.path())? {
+            let path = entry?.path();
+            if older(&path, UPLOAD_RETENTION) && fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".incoming-")
+            && older(&entry.path(), STAGING_RETENTION)
+            && fs::remove_dir_all(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 fn artifact_manifest(store: &Store, action: &str) -> ApiResult<Value> {
