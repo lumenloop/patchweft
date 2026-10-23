@@ -2279,9 +2279,9 @@ pub fn loopback_refusal(
     allow: &BTreeSet<u16>,
     exempt: &dyn Fn(&BTreeSet<u64>) -> BTreeSet<u64>,
 ) -> Option<String> {
-    if wsl_mirrored(read) {
+    if wsl(read) {
         return Some(
-            "WSL mirrored networking: Windows listeners are reachable at 127.0.0.1 and cannot be listed"
+            "WSL: Windows listeners can answer at 127.0.0.1 without being listed; run executors in a Linux VM"
                 .into(),
         );
     }
@@ -2309,16 +2309,16 @@ pub fn loopback_refusal(
         })
 }
 
-/// Whether this is WSL with mirrored networking (re-gate P2 on pw#8): the Windows host's listeners
-/// then answer at 127.0.0.1 without appearing in /proc/net/tcp, so no listing is complete.
-/// Mirrored mode shows as the `loopback0` interface.
-fn wsl_mirrored(read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) -> bool {
-    let wsl = read(Path::new("/proc/sys/kernel/osrelease")).is_ok_and(|release| {
+/// Whether this is a WSL kernel (re-gate P2 on pw#8): under mirrored networking the Windows host's
+/// listeners answer at 127.0.0.1 without appearing in /proc/net/tcp, so no listing is complete. The
+/// mode can't be ruled out from inside (an interface can be renamed, /sys masked, WSL1 has no
+/// `loopback0`), so any WSL kernel refuses: `microsoft` in the release, or the interop entry.
+fn wsl(read: &dyn Fn(&Path) -> io::Result<Vec<u8>>) -> bool {
+    read(Path::new("/proc/sys/kernel/osrelease")).is_ok_and(|release| {
         String::from_utf8_lossy(&release)
             .to_lowercase()
             .contains("microsoft")
-    });
-    wsl && read(Path::new("/sys/class/net/loopback0/type")).is_ok()
+    }) || read(Path::new("/proc/sys/fs/binfmt_misc/WSLInterop")).is_ok()
 }
 
 /// An address listening on every interface: 0.0.0.0, ::, or ::ffff:0.0.0.0.
@@ -3416,29 +3416,39 @@ mod tests {
     }
 
     #[test]
-    fn wsl_mirrored_networking_refuses_because_windows_listeners_cannot_be_listed() {
-        // Re-gate P2 on pw#8 (robin): Windows' SMB, RDP and others answer at 127.0.0.1 but are
-        // not in /proc/net/tcp, so the table is incomplete by construction.
+    fn any_wsl_kernel_refuses_because_windows_listeners_cannot_be_listed() {
+        // Re-gate P2 on pw#8 (robin): under mirrored networking Windows' SMB, RDP and others answer at
+        // 127.0.0.1 but are not in /proc/net/tcp. pw#8's PASS P3-1: requiring `loopback0` failed open
+        // on a renamed interface, a masked /sys or WSL1, so any WSL kernel refuses.
+        const WSL: &str = "WSL: Windows listeners can answer at 127.0.0.1 without being listed; run executors in a Linux VM";
         let mut files = host(None);
-        let wsl = b"6.18.54.1-microsoft-standard-WSL2\n".to_vec();
-        files.insert("/proc/sys/kernel/osrelease".into(), wsl.clone());
-        assert_eq!(
-            refusal(&files, &[22, 53, 80, 631, 2375]),
-            None,
-            "WSL with NAT networking"
-        );
-        files.insert("/sys/class/net/loopback0/type".into(), b"772\n".to_vec());
+        let release = b"6.18.54.1-microsoft-standard-WSL2\n".to_vec();
+        files.insert("/proc/sys/kernel/osrelease".into(), release);
         assert_eq!(
             refusal(&files, &[22, 53, 80, 631, 2375]).as_deref(),
-            Some(
-                "WSL mirrored networking: Windows listeners are reachable at 127.0.0.1 and cannot be listed"
-            )
+            Some(WSL),
+            "WSL with NAT networking and no loopback0"
         );
-        // loopback0 alone, outside WSL, is not mirrored networking.
+        // A custom WSL kernel without `microsoft` in its release still exposes the interop entry.
+        files.insert(
+            "/proc/sys/kernel/osrelease".into(),
+            b"6.6.87-custom\n".to_vec(),
+        );
+        files.insert(
+            "/proc/sys/fs/binfmt_misc/WSLInterop".into(),
+            b"enabled\n".to_vec(),
+        );
+        assert_eq!(
+            refusal(&files, &[22, 53, 80, 631, 2375]).as_deref(),
+            Some(WSL)
+        );
+        // loopback0 alone, outside WSL, is not WSL.
+        files.remove(Path::new("/proc/sys/fs/binfmt_misc/WSLInterop"));
         files.insert(
             "/proc/sys/kernel/osrelease".into(),
             b"6.8.0-136-generic\n".to_vec(),
         );
+        files.insert("/sys/class/net/loopback0/type".into(), b"772\n".to_vec());
         assert_eq!(refusal(&files, &[22, 53, 80, 631, 2375]), None);
     }
 
