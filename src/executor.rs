@@ -332,6 +332,8 @@ pub struct Guards {
     /// A remote work directory's cache and retained attempts, reclaimed below the floor.
     pub disk: Option<Arc<Disk>>,
     pub free_space: FreeSpace,
+    /// The live supervisors last walked and the socket inodes their trees held (option B).
+    pub owned_listeners: Arc<Mutex<(Vec<SupervisorIdentity>, BTreeSet<u64>)>>,
 }
 
 impl Default for Guards {
@@ -341,15 +343,28 @@ impl Default for Guards {
             loopback: None,
             disk: None,
             free_space: Arc::new(|path| fs2::available_space(path)),
+            owned_listeners: Arc::default(),
         }
     }
 }
 
 impl Guards {
-    fn loopback_refusal(&self) -> Option<String> {
+    /// `supervisors`: the live supervisors of this executor's attempts. A listener their trees hold
+    /// is the job's own, not a host service (option B), and so are the rootless daemon's ports.
+    fn loopback_refusal(
+        &self,
+        supervisors: &dyn Fn() -> Vec<SupervisorIdentity>,
+    ) -> Option<String> {
         let allow = self.loopback.as_ref()?;
-        loopback_refusal(&|path| fs::read(path), allow, &|_| {
-            rootless_sockets(rootless_state().as_deref())
+        loopback_refusal(&|path| fs::read(path), allow, &|unlisted| {
+            let mut exempt = rootless_sockets(rootless_state().as_deref());
+            exempt.extend(owned_cached(
+                &self.owned_listeners,
+                unlisted,
+                &supervisors(),
+                &sockets_held_by,
+            ));
+            exempt
         })
     }
 
@@ -844,7 +859,8 @@ impl<T: Transport> Coordinator<T> {
         let low = floor > 0 && free.is_none_or(|bytes| bytes < floor);
         let stuck = self.guards.disk.as_ref().map_or(0, |disk| disk.stuck());
         let trees_stuck = self.lock().trees_stuck;
-        let reason = self.guards.loopback_refusal().or_else(|| {
+        let supervisors = || live_supervisors(self.transport.root(), self.transport.control());
+        let reason = self.guards.loopback_refusal(&supervisors).or_else(|| {
             low.then(|| {
                 let mut reason = format!("free space below the {} MiB floor", floor / MIB);
                 if stuck > 0 {
@@ -1593,7 +1609,9 @@ pub fn run<T: Transport + 'static>(
     fs::create_dir_all(transport.control().join("ledger"))?;
     let engine = file_hash(&std::env::current_exe()?)?;
     // MUST-FIX 8: nothing registers while job containers could reach an unlisted listener.
-    if let Some(reason) = guards.loopback_refusal() {
+    if let Some(reason) =
+        guards.loopback_refusal(&|| live_supervisors(transport.root(), transport.control()))
+    {
         let request = ClaimRequest {
             claim_key: unique(),
             refused: BTreeMap::from([(REFUSE_ALL.to_owned(), reason.clone())]),
@@ -2511,6 +2529,63 @@ fn rootless_sockets(state: Option<&Path>) -> BTreeSet<u64> {
     }
 }
 
+/// The live supervisors this executor's ledger names (`control/ledger/<attempt>.json`, then
+/// `root/attempts/<attempt>/control/supervisor.json`: pid and start time, so a reused pid is none).
+fn live_supervisors(root: &Path, control: &Path) -> Vec<SupervisorIdentity> {
+    let mut live = Vec::new();
+    for entry in fs::read_dir(control.join("ledger"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Some(attempt) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let identity = root
+            .join("attempts")
+            .join(attempt)
+            .join("control/supervisor.json");
+        if let Some(supervisor) = fs::read(identity)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<SupervisorIdentity>(&bytes).ok())
+            .filter(|s| worker::alive(s.pid, &s.start))
+        {
+            live.push(supervisor);
+        }
+    }
+    live.sort_by(|a, b| (a.pid, &a.start).cmp(&(b.pid, &b.start)));
+    live
+}
+
+/// Socket inodes the trees of `supervisors` hold, walked again whenever the live supervisors
+/// change (a socket is no longer its attempt's once its supervisor is gone, though an orphan keeps
+/// it open: gate P2-1 on pw#9) or a listener not found owned before appears. Every job process
+/// descends from its supervisor, a subreaper.
+fn owned_cached(
+    cache: &Mutex<(Vec<SupervisorIdentity>, BTreeSet<u64>)>,
+    unlisted: &BTreeSet<u64>,
+    supervisors: &[SupervisorIdentity],
+    held: &dyn Fn(&[u32]) -> BTreeSet<u64>,
+) -> BTreeSet<u64> {
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.0 != supervisors || !unlisted.is_subset(&cache.1) {
+        let pids: Vec<u32> = supervisors.iter().map(|s| s.pid).collect();
+        let owned = if pids.is_empty() {
+            BTreeSet::new()
+        } else {
+            held(&pids)
+        };
+        *cache = (supervisors.to_vec(), owned);
+    }
+    cache.1.clone()
+}
+
 /// Socket inodes open in `roots` or any of their descendants.
 fn sockets_held_by(roots: &[u32]) -> BTreeSet<u64> {
     let mut held = BTreeSet::new();
@@ -3265,6 +3340,7 @@ mod tests {
             loopback: None,
             disk: Some(disk),
             free_space,
+            ..Guards::default()
         });
         // Eviction frees 20 bytes of the 25 needed: claims wait.
         assert_eq!(coordinator.claim().unwrap(), Claimed::Idle);
@@ -3729,6 +3805,182 @@ mod tests {
         );
     }
 
+    /// A process listening on 127.0.0.1 (python3), and the inode of its socket.
+    fn listening_child(parent_script: &str) -> (std::process::Child, u64) {
+        let listener = "import socket,time\ns=socket.socket()\ns.bind(('127.0.0.1',0))\ns.listen()\nprint('ready', flush=True)\ntime.sleep(60)";
+        let mut child = Command::new("/bin/bash")
+            .arg("-c")
+            .arg(parent_script)
+            .arg("bash")
+            .arg(listener)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            // Inherited stdio can be a socket; only the listener may be one.
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.as_mut().unwrap()),
+            &mut ready,
+        )
+        .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let socket = std::iter::once(child.id())
+            .chain(worker::descendants_of(&[child.id()]))
+            .flat_map(|pid| {
+                fs::read_dir(format!("/proc/{pid}/fd"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+            })
+            .find_map(|fd| {
+                fs::read_link(fd.path())
+                    .ok()?
+                    .to_str()?
+                    .strip_prefix("socket:[")?
+                    .strip_suffix(']')?
+                    .parse()
+                    .ok()
+            })
+            .unwrap();
+        (child, socket)
+    }
+
+    fn stop(mut child: std::process::Child) {
+        for pid in worker::descendants_of(&[child.id()]) {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Records `pid` as the live supervisor of `attempt` (ledger entry plus supervisor.json).
+    fn supervising(root: &Path, control: &Path, attempt: &str, pid: u32) {
+        fs::create_dir_all(control.join("ledger")).unwrap();
+        fs::write(control.join("ledger").join(format!("{attempt}.json")), "{}").unwrap();
+        let directory = root.join("attempts").join(attempt).join("control");
+        fs::create_dir_all(&directory).unwrap();
+        let start = worker::process_start(pid).unwrap();
+        fs::write(
+            directory.join("supervisor.json"),
+            json!({"pid":pid,"start":start}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn only_descendants_of_live_supervisors_own_their_listeners() {
+        // Option B, gate P2-2 on pw#9: a real tree. The supervisor's child holds a listener (owned);
+        // a listener outside the tree, in the supervisor's parent, is not.
+        let temp = tempfile::tempdir().unwrap();
+        let (root, control) = (temp.path().join("root"), temp.path().join("control"));
+        let (supervisor, inside) = listening_child(r#"python3 -c "$1" & wait"#);
+        supervising(&root, &control, "a1", supervisor.id());
+        let live = live_supervisors(&root, &control);
+        assert_eq!(
+            live.iter().map(|s| s.pid).collect::<Vec<_>>(),
+            [supervisor.id()]
+        );
+        assert!(sockets_held_by(&[supervisor.id()]).contains(&inside));
+        let (outsider, outside) = listening_child(r#"exec python3 -c "$1""#);
+        assert!(!sockets_held_by(&[supervisor.id()]).contains(&outside));
+        // A reused pid (another start time) supervises nothing.
+        fs::write(
+            root.join("attempts/a1/control/supervisor.json"),
+            json!({"pid":supervisor.id(),"start":"0"}).to_string(),
+        )
+        .unwrap();
+        assert!(live_supervisors(&root, &control).is_empty());
+        stop(supervisor);
+        stop(outsider);
+    }
+
+    #[test]
+    fn the_claim_loop_exempts_the_listeners_of_its_live_supervisors() {
+        // pw#9's PASS P3-1: declining() must hand the check this executor's live supervisors. Given
+        // none, mauve would refuse every claim while a Vitest shard's server listens. Real /proc,
+        // allowing every listener on this host except the probe's own.
+        let temp = tempfile::tempdir().unwrap();
+        let fake = fake(temp.path());
+        let (root, control) = (fake.root.clone(), fake.control.clone());
+        let coordinator = coordinator(fake);
+        let (supervisor, socket) = listening_child(r#"python3 -c "$1" & wait"#);
+        let others = || -> BTreeSet<u16> {
+            reachable_listeners(&|path| fs::read(path))
+                .unwrap()
+                .into_iter()
+                .filter(|(_, inode)| *inode != socket)
+                .map(|(listener, _)| listener.port())
+                .collect()
+        };
+        let coordinator = coordinator.guarded(Guards {
+            loopback: Some(others()),
+            ..Guards::default()
+        });
+        let refused = coordinator.declining(None);
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|reason| reason.ends_with(" not allowlisted")),
+            "an unrecorded process's listener is a host service: {refused:?}"
+        );
+        supervising(&root, &control, "a1", supervisor.id());
+        let coordinator = coordinator.guarded(Guards {
+            loopback: Some(others()),
+            ..Guards::default()
+        });
+        assert_eq!(coordinator.declining(None), None);
+        stop(supervisor);
+    }
+
+    #[test]
+    fn owned_listeners_are_walked_again_when_the_supervisors_change() {
+        // Gate P2-1 on pw#9: a socket is not its attempt's once its supervisor is gone (an orphan
+        // keeps it open), so the cache is keyed on the live supervisors, and a new listener is
+        // looked up too.
+        let cache = Mutex::new((Vec::new(), BTreeSet::new()));
+        let walks = std::cell::Cell::new(0);
+        let one = vec![SupervisorIdentity {
+            pid: 10,
+            start: "a".into(),
+        }];
+        let held = |roots: &[u32]| {
+            walks.set(walks.get() + 1);
+            if roots.is_empty() {
+                BTreeSet::new()
+            } else {
+                BTreeSet::from([7])
+            }
+        };
+        assert_eq!(
+            owned_cached(&cache, &BTreeSet::from([7]), &one, &held),
+            BTreeSet::from([7])
+        );
+        assert_eq!(
+            owned_cached(&cache, &BTreeSet::from([7]), &one, &held),
+            BTreeSet::from([7])
+        );
+        assert_eq!(walks.get(), 1);
+        // The supervisor died: its orphan's socket is owned no longer (no supervisor, no walk).
+        assert_eq!(
+            owned_cached(&cache, &BTreeSet::from([7]), &[], &held),
+            BTreeSet::new()
+        );
+        assert_eq!(walks.get(), 1);
+        // The same supervisors again are walked again, and an unknown listener beside them too.
+        assert_eq!(
+            owned_cached(&cache, &BTreeSet::from([7]), &one, &held),
+            BTreeSet::from([7])
+        );
+        assert_eq!(walks.get(), 2);
+        assert_eq!(
+            owned_cached(&cache, &BTreeSet::from([7, 9]), &one, &held),
+            BTreeSet::from([7])
+        );
+        assert_eq!(walks.get(), 3);
+    }
+
     #[test]
     fn any_wsl_kernel_refuses_because_windows_listeners_cannot_be_listed() {
         // Re-gate P2 on pw#8 (robin): under mirrored networking Windows' SMB, RDP and others answer at
@@ -3844,7 +4096,10 @@ mod tests {
             .arg("bash")
             .arg(&state)
             .arg(listener)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
+            // Inherited stdio can be a socket; only the listener may be one.
+            .stderr(Stdio::null())
             .spawn()
             .unwrap();
         let mut ready = String::new();
