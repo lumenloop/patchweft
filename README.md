@@ -37,7 +37,8 @@ flowchart LR
   timeout share one execution, even across profiles that differ only in memory
   reservations (and in slots, for jobs that do not export them).
   Preparation artifacts feed separate downstream workspaces. Completed-result reuse
-  requires an explicit policy and input audit.
+  requires an explicit policy and input audit, and crosses profiles: a new profile
+  does not force fresh runs ([how to force one](docs/profiles.md#choose-a-reuse-policy)).
 - **Check the combination.** A candidate names one revision, one execution profile
   and any real prerequisites. Passing changes still need validation when composed.
 - **Keep unrelated work moving.** Failed candidates create repair records. Retry
