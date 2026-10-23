@@ -75,7 +75,10 @@ Before registering and before every claim, a coordinator checks the host's loopb
 natively, so they reach every loopback listener directly, whatever a Docker daemon exposes to
 containers. Every TCP listener on `127.0.0.0/8` or `::1` must be in
 `--loopback-allow PORT[,PORT…]`; otherwise the executor refuses all work and its record shows
-`refused: {"*": "loopback listener … not allowlisted"}`. Both `executor` and `worker` check by
+`refused: {"*": "loopback listener … not allowlisted"}`. A listener held by one of the
+executor's own attempts (a process descending from a live supervisor in its ledger) is the
+job's own, not a host service, and does not refuse; such listeners are remembered while they
+live, so the lookup runs only when a new unlisted listener appears. Both `executor` and `worker` check by
 default; `worker --no-loopback-check` skips it, only for a host whose every loopback service may be
 reached by jobs. The check covers TCP listeners bound to loopback. A listener on a wildcard address
 (`0.0.0.0`, `::`) is reachable on the host's own addresses whatever this check says, so it is
