@@ -277,6 +277,20 @@ pub struct ExecutorRecord {
     pub created: f64,
     #[serde(default)]
     pub observed: Observed,
+    /// The train-first hold this executor is keeping, if any: shown so a hold is never mistaken
+    /// for draining for the head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holding: Option<Holding>,
+}
+
+/// Capacity an executor keeps for prioritized jobs waiting on a running dependency.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Holding {
+    /// The highest priority among the jobs held for.
+    pub priority: i64,
+    pub slots: u32,
+    pub memory_mb: u32,
 }
 
 /// Operator configuration read only when claiming; never part of action identity.

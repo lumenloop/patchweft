@@ -117,6 +117,7 @@ pub fn default_record(id: &str) -> ExecutorRecord {
         placement: Placement::default(),
         created: now(),
         observed: Observed::default(),
+        holding: None,
     }
 }
 
@@ -190,6 +191,8 @@ pub fn fits(held: Reservation, wanted: Reservation, capacity: Reservation) -> bo
 
 pub struct Choice {
     pub owner: String,
+    /// The owner's scheduling priority.
+    pub priority: i64,
     pub action: Action,
     pub reservation: Reservation,
     pub timeout_seconds: u64,
@@ -199,6 +202,13 @@ pub struct Selection {
     pub choice: Option<Choice>,
     /// Profiles of admissible work the executor has not verified (at most 32).
     pub unverified: Vec<String>,
+    /// Capacity held for prioritized work this executor could run once a running dependency
+    /// passes (the train-first hold): what it needs, per priority.
+    pub hold: BTreeMap<i64, Reservation>,
+    /// What the running dependencies being waited on hold here, with the highest priority of the
+    /// held jobs waiting on each: it frees before they start, so it is not counted beside the hold
+    /// as well (gate P3-3), and only for heads below that priority (re-gate P3-1).
+    pub freed: Vec<(i64, Reservation)>,
 }
 
 /// The head of one executor's queue: work it may run and could ever fit, ordered by owner
@@ -223,13 +233,18 @@ pub fn select(
     let mut profiles = BTreeMap::new();
     let mut unverified = Vec::new();
     let mut choices = Vec::new();
+    let mut hold: BTreeMap<i64, Reservation> = BTreeMap::new();
+    let mut waited_on = BTreeMap::new();
     for action in queued {
         if !scope.allows_profile(&action.profile)
             || refused.contains(&action.profile)
             || refused.contains(REFUSE_ALL)
             || !record.placement.permits(&action.job)
-            || !engine::eligible(db, &action)?
         {
+            continue;
+        }
+        let eligible = engine::eligible(db, &action)?;
+        if !eligible && !engine::eligible_soon(db, &action)? {
             continue;
         }
         if scope.projects.is_some() && !scope.allows_project(&project(db, &action.revision)?) {
@@ -238,6 +253,59 @@ pub fn select(
         let (reservation, timeout_seconds) = budget(db, &mut profiles, &action)?;
         // Work this executor can never fit must not idle it behind the head.
         if reservation.slots > capacity.slots || reservation.memory_mb > capacity.memory_mb {
+            continue;
+        }
+        if !eligible {
+            // The train-first hold (chief, #4204): a prioritized owner's job waiting only on a
+            // running dependency keeps the capacity it will need from lower-priority owners.
+            let mut stmt =
+                db.prepare("SELECT DISTINCT owner FROM interests WHERE action=? AND active=1")?;
+            let priority = stmt
+                .query_map([&action.id], |r| r.get::<_, String>(0))?
+                .map(|owner| Ok(priorities.get(&owner?).copied().unwrap_or(0)))
+                .collect::<Result<Vec<i64>>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+            if priority > 0 {
+                let demand = hold.entry(priority).or_insert(Reservation {
+                    slots: 0,
+                    memory_mb: 0,
+                });
+                demand.slots = demand.slots.saturating_add(reservation.slots);
+                demand.memory_mb = demand.memory_mb.saturating_add(reservation.memory_mb);
+                for dependency in &action.dependencies {
+                    let attempt: Option<String> = db
+                        .query_row(
+                            "SELECT attempt FROM actions WHERE id=? AND state='running'",
+                            [dependency],
+                            |r| r.get(0),
+                        )
+                        .optional()?
+                        .flatten();
+                    let running: Option<(String, String)> = match attempt {
+                        Some(attempt) => db
+                            .query_row(
+                                &format!(
+                                    "SELECT id, body FROM attempts WHERE id=? AND drained=0 AND {EXECUTOR}=?"
+                                ),
+                                [&attempt, &record.id],
+                                |r| Ok((r.get(0)?, r.get(1)?)),
+                            )
+                            .optional()?,
+                        None => None,
+                    };
+                    if let Some((attempt, body)) = running {
+                        let held: Attempt = serde_json::from_str(&body)?;
+                        let entry = waited_on.entry(attempt).or_insert((
+                            priority,
+                            held.slots,
+                            held.memory_mb,
+                        ));
+                        entry.0 = entry.0.max(priority);
+                    }
+                }
+            }
             continue;
         }
         // A claim inlines its dependencies' manifests: one a remote executor could not read is
@@ -264,6 +332,7 @@ pub fn select(
             let priority = priorities.get(&owner).copied().unwrap_or(0);
             let choice = Choice {
                 owner,
+                priority,
                 action: action.clone(),
                 reservation,
                 timeout_seconds,
@@ -283,7 +352,16 @@ pub fn select(
         .next()
         .filter(|(_, _, trusted, _)| *trusted)
         .map(|(.., choice)| choice);
-    Ok(Selection { choice, unverified })
+    let freed = waited_on
+        .into_values()
+        .map(|(priority, slots, memory_mb)| (priority, Reservation { slots, memory_mb }))
+        .collect();
+    Ok(Selection {
+        choice,
+        unverified,
+        hold,
+        freed,
+    })
 }
 
 /// The serialized size of an attempt's artifact manifest, as a claim inlines it. Recorded once
@@ -428,10 +506,86 @@ pub fn claim_for(
     }
     let capacity = capacity(&transaction, &record)?;
     let refused = request.refused.keys().cloned().collect();
-    let Selection { choice, unverified } =
-        select(&transaction, &record, scope, &verified, &refused, capacity)?;
+    let Selection {
+        choice,
+        unverified,
+        hold,
+        freed,
+    } = select(&transaction, &record, scope, &verified, &refused, capacity)?;
+    let held = held(&transaction, executor)?;
+    // A head is admitted only beside the demand of the higher priorities waiting (gate P3-1): a
+    // train never holds back its own jobs, and a lower train waits only for the higher ones.
+    let holding = |priority: i64| {
+        let demand = hold.range(priority + 1..).fold(
+            Reservation {
+                slots: 0,
+                memory_mb: 0,
+            },
+            |sum, (_, need)| Reservation {
+                slots: sum.slots.saturating_add(need.slots),
+                memory_mb: sum.memory_mb.saturating_add(need.memory_mb),
+            },
+        );
+        (demand.slots > 0 || demand.memory_mb > 0).then_some(demand)
+    };
+    let beside_hold = |choice: &Choice| {
+        holding(choice.priority).is_none_or(|demand| {
+            // Only dependencies higher priorities wait on free room for this head.
+            let freed = freed
+                .iter()
+                .filter(|(priority, _)| *priority > choice.priority)
+                .fold(
+                    Reservation {
+                        slots: 0,
+                        memory_mb: 0,
+                    },
+                    |sum, (_, need)| Reservation {
+                        slots: sum.slots.saturating_add(need.slots),
+                        memory_mb: sum.memory_mb.saturating_add(need.memory_mb),
+                    },
+                );
+            fits(
+                Reservation {
+                    slots: held
+                        .slots
+                        .saturating_sub(freed.slots)
+                        .saturating_add(demand.slots),
+                    memory_mb: held
+                        .memory_mb
+                        .saturating_sub(freed.memory_mb)
+                        .saturating_add(demand.memory_mb),
+                },
+                choice.reservation,
+                capacity,
+            )
+        })
+    };
+    let blocked = choice.as_ref().filter(|choice| !beside_hold(choice));
+    let now_holding = blocked.and_then(|choice| {
+        let demand = holding(choice.priority)?;
+        Some(Holding {
+            priority: hold.keys().next_back().copied().unwrap_or(choice.priority),
+            slots: demand.slots,
+            memory_mb: demand.memory_mb,
+        })
+    });
+    if record.holding != now_holding {
+        let kind = if now_holding.is_some() {
+            "executor.held"
+        } else {
+            "executor.hold_released"
+        };
+        event(
+            &transaction,
+            kind,
+            executor,
+            &json!({"executor":executor,"holding":now_holding.or(record.holding)}),
+        )?;
+        record.holding = now_holding;
+        save(&transaction, &record)?;
+    }
     let choice = match choice {
-        Some(choice) if fits(held(&transaction, executor)?, choice.reservation, capacity) => choice,
+        Some(choice) if fits(held, choice.reservation, capacity) && beside_hold(&choice) => choice,
         // Drain for the head: later small actions cannot starve its reservation.
         _ => {
             transaction.commit()?;
@@ -1624,6 +1778,7 @@ mod tests {
                 engine: Some("e".repeat(64)),
                 loopback: None,
             },
+            holding: None,
         };
         let text = serde_json::to_string(&full).unwrap();
         assert_eq!(serde_json::from_str::<ExecutorRecord>(&text).unwrap(), full);
@@ -1677,6 +1832,7 @@ mod tests {
         created: f64,
         /// None writes a legacy action whose reservation and timeout come from its profile.
         reservation: Option<(u32, u32)>,
+        dependencies: &'a [&'a str],
     }
 
     impl Default for Queue<'_> {
@@ -1689,6 +1845,7 @@ mod tests {
                 owner: "lane",
                 created: 1.0,
                 reservation: Some((1, 512)),
+                dependencies: &[],
             }
         }
     }
@@ -1700,7 +1857,7 @@ mod tests {
             revision: q.revision.into(),
             profile: q.profile.into(),
             job: q.job.into(),
-            dependencies: vec![],
+            dependencies: q.dependencies.iter().map(|d| d.to_string()).collect(),
             created: q.created,
             identity: q.reservation.map(|_| ActionIdentity {
                 version: JOB_RECIPE.into(),
@@ -2401,6 +2558,393 @@ mod tests {
                 "train", "bob-1", "carol", "alice-1", "lane", "bob-2", "alice-2"
             ]
         );
+    }
+
+    /// A train (priority 1) whose shard waits on its prepare, beside a lane's eligible job, on
+    /// mindy (8 slots, 8192 MiB). `prepare` is the prepare action's state.
+    fn train_beside_lane(
+        prepare: &str,
+        shard: (u32, u32),
+        lane: (u32, u32),
+    ) -> (tempfile::TempDir, Store) {
+        let (root, store) = lab();
+        register(&store.db, "mindy", 8, 8192);
+        let base = Queue::default();
+        queue(
+            &store.db,
+            Queue {
+                id: "prepare",
+                owner: "train",
+                job: "prepare",
+                ..base
+            },
+        );
+        store
+            .db
+            .execute("UPDATE actions SET state=? WHERE id='prepare'", [prepare])
+            .unwrap();
+        queue(
+            &store.db,
+            Queue {
+                id: "shard",
+                owner: "train",
+                job: "vitest",
+                created: 2.0,
+                reservation: Some(shard),
+                dependencies: &["prepare"],
+                ..base
+            },
+        );
+        queue(
+            &store.db,
+            Queue {
+                id: "lane",
+                owner: "lane",
+                created: 3.0,
+                reservation: Some(lane),
+                ..base
+            },
+        );
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        (root, store)
+    }
+
+    fn mindy_claims(store: &mut Store, key: &str) -> Option<String> {
+        let response = claim_for(store, "mindy", &Scope::all(), &ask(key, &["f-1"])).unwrap();
+        claimed(&response).map(str::to_owned)
+    }
+
+    #[test]
+    fn a_train_waiting_on_its_running_prepare_holds_the_capacity_its_shard_needs() {
+        // Train 10b (#4204): a lane's shards took mindy three minutes before the train's prepare
+        // finished, and the train's shards waited 34 minutes behind them.
+        let (_root, mut store) = train_beside_lane("running", (6, 6144), (4, 4096));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        // Once prepare passes, the shard is the head and nothing is held.
+        store
+            .db
+            .execute("UPDATE actions SET state='passed' WHERE id='prepare'", [])
+            .unwrap();
+        let record = load(&store.db, "mindy").unwrap().unwrap();
+        let capacity = capacity(&store.db, &record).unwrap();
+        let verified = BTreeSet::from(["f-1".to_owned()]);
+        let selection = select(
+            &store.db,
+            &record,
+            &Scope::all(),
+            &verified,
+            &BTreeSet::new(),
+            capacity,
+        )
+        .unwrap();
+        assert_eq!(selection.choice.unwrap().action.id, "shard");
+        assert!(selection.hold.is_empty());
+    }
+
+    #[test]
+    fn the_hold_leaves_room_the_train_will_not_need() {
+        let (_root, mut store) = train_beside_lane("running", (6, 6144), (2, 1024));
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("lane"));
+    }
+
+    #[test]
+    fn no_hold_for_a_dependency_not_yet_running_or_one_that_failed() {
+        // Holding for a whole chain would idle the executor for longer than one dependency runs.
+        for prepare in ["queued", "failed"] {
+            let (_root, mut store) = train_beside_lane(prepare, (6, 6144), (4, 4096));
+            // mindy may not run the train's prepare itself, which would otherwise be its head.
+            let mut record = load(&store.db, "mindy").unwrap().unwrap();
+            record.placement.deny = BTreeSet::from(["prepare".to_owned()]);
+            save(&store.db, &record).unwrap();
+            assert_eq!(
+                mindy_claims(&mut store, "k1").as_deref(),
+                Some("lane"),
+                "{prepare}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_hold_for_work_this_executor_may_not_run_or_for_an_owner_without_priority() {
+        let (_root, mut store) = train_beside_lane("running", (6, 6144), (4, 4096));
+        let mut record = load(&store.db, "mindy").unwrap().unwrap();
+        record.placement.deny = BTreeSet::from(["vitest".to_owned()]);
+        save(&store.db, &record).unwrap();
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("lane"));
+        let (_root, mut store) = train_beside_lane("running", (6, 6144), (4, 4096));
+        crate::worker::set_priority(&store, "train", 0).unwrap();
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("lane"));
+    }
+
+    /// Gate FIX on pw#10: the hold's size and its release, pinned. mindy is 8 slots, 8192 MiB.
+    fn hold_lab() -> (tempfile::TempDir, Store) {
+        let (root, store) = lab();
+        register(&store.db, "mindy", 8, 8192);
+        (root, store)
+    }
+
+    /// An action of `owner` in `state`, waiting on `dependencies`, reserving `need`.
+    fn job_of(
+        store: &Store,
+        id: &str,
+        owner: &str,
+        state: &str,
+        need: (u32, u32),
+        dependencies: &[&str],
+    ) {
+        queue(
+            &store.db,
+            Queue {
+                id,
+                owner,
+                job: id,
+                reservation: Some(need),
+                dependencies,
+                created: 2.0,
+                ..Queue::default()
+            },
+        );
+        store
+            .db
+            .execute("UPDATE actions SET state=? WHERE id=?", [state, id])
+            .unwrap();
+    }
+
+    #[test]
+    fn the_hold_is_sized_by_memory_and_by_slots_and_counts_every_waiting_job() {
+        // B/C: memory was 10b's binding constraint; A: two shards wait, as in the incident.
+        for (shards, lane) in [
+            (vec![(1, 6144)], (1, 4096)),
+            (vec![(6, 512)], (4, 512)),
+            (vec![(3, 1024), (3, 1024)], (3, 1024)),
+        ] {
+            let (_root, mut store) = hold_lab();
+            job_of(&store, "prepare", "train", "running", (1, 1), &[]);
+            for (index, shard) in shards.iter().enumerate() {
+                job_of(
+                    &store,
+                    &format!("shard-{index}"),
+                    "train",
+                    "queued",
+                    *shard,
+                    &["prepare"],
+                );
+            }
+            job_of(&store, "lane", "lane", "queued", lane, &[]);
+            crate::worker::set_priority(&store, "train", 1).unwrap();
+            assert_eq!(
+                mindy_claims(&mut store, "k1"),
+                None,
+                "{shards:?} beside {lane:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hold_counts_running_work_but_not_the_dependency_it_waits_on() {
+        // Each case binds one dimension alone, so slots and memory are each pinned (mindy 8/8192).
+        // D: work already running on the host leaves less room beside the hold.
+        for (shard, other, lane) in [
+            ((4, 512), (3, 512), (2, 512)),
+            ((1, 4096), (1, 3072), (1, 2048)),
+        ] {
+            let (_root, mut store) = hold_lab();
+            job_of(&store, "prepare", "train", "running", (1, 1), &[]);
+            job_of(&store, "shard", "train", "queued", shard, &["prepare"]);
+            job_of(&store, "lane", "lane", "queued", lane, &[]);
+            hold(&store.db, "other", Some("mindy"), other.0, other.1);
+            crate::worker::set_priority(&store, "train", 1).unwrap();
+            assert_eq!(
+                mindy_claims(&mut store, "k1"),
+                None,
+                "{shard:?} {other:?} {lane:?}"
+            );
+        }
+        // P3-3: the running prepare's own reservation frees before its shard starts, so it is not
+        // counted beside the hold as well.
+        for (prepare, shard, lane) in [
+            ((4, 1024), (4, 1024), (2, 1024)),
+            ((1, 4096), (1, 4096), (1, 2048)),
+        ] {
+            let (_root, mut store) = hold_lab();
+            job_of(&store, "prepare", "train", "running", prepare, &[]);
+            job_of(&store, "shard", "train", "queued", shard, &["prepare"]);
+            job_of(&store, "lane", "lane", "queued", lane, &[]);
+            store
+                .db
+                .execute(
+                    "INSERT INTO attempts VALUES ('prep-a','prepare','running',0,?)",
+                    [
+                        json!({"id":"prep-a","action":"prepare","worker_pid":1,"worker_start":"1",
+                            "supervisor_pid":null,"supervisor_start":null,"slots":prepare.0,
+                            "memory_mb":prepare.1,"created":0.0,"started":null,"ended":null,
+                            "exit_code":null,"result":null,"executor":"mindy"})
+                        .to_string(),
+                    ],
+                )
+                .unwrap();
+            store
+                .db
+                .execute("UPDATE actions SET attempt='prep-a' WHERE id='prepare'", [])
+                .unwrap();
+            crate::worker::set_priority(&store, "train", 1).unwrap();
+            assert_eq!(
+                mindy_claims(&mut store, "k1").as_deref(),
+                Some("lane"),
+                "{prepare:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hold_ends_when_its_dependency_stops_or_nobody_wants_the_job() {
+        // F: lease expiry interrupts, a stop cancels; G: an unwanted job holds nothing.
+        for state in ["interrupted", "stopping", "canceled"] {
+            let (_root, mut store) = train_beside_lane(state, (6, 6144), (4, 4096));
+            let mut record = load(&store.db, "mindy").unwrap().unwrap();
+            record.placement.deny = BTreeSet::from(["prepare".to_owned()]);
+            save(&store.db, &record).unwrap();
+            assert_eq!(
+                mindy_claims(&mut store, "k1").as_deref(),
+                Some("lane"),
+                "{state}"
+            );
+        }
+        let (_root, mut store) = train_beside_lane("running", (6, 6144), (4, 4096));
+        crate::engine::cancel(&mut store, "shard", "train").unwrap();
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("lane"));
+    }
+
+    #[test]
+    fn no_hold_for_a_job_whose_candidate_still_waits_on_a_prerequisite() {
+        // G: the shard is queued and its prepare runs, but its only requester is a candidate whose
+        // prerequisite has not passed, so it would not run once prepare passes either.
+        let (_root, mut store) = train_beside_lane("running", (6, 6144), (4, 4096));
+        let candidate = |id: &str, required: Value, prerequisites: Value| {
+            json!({"id":id,"revision":"r-a","profile":"f-1","required":required,
+                   "prerequisites":prerequisites,"owner":"train","created":1.0})
+            .to_string()
+        };
+        store
+            .db
+            .execute(
+                "INSERT INTO candidates VALUES ('pre',?),('wants',?)",
+                [
+                    candidate("pre", json!({"prepare":"prepare"}), json!([])),
+                    candidate("wants", json!({"vitest":"shard"}), json!(["pre"])),
+                ],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE interests SET context='wants' WHERE action='shard'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("lane"));
+    }
+
+    #[test]
+    fn a_train_is_never_held_back_by_its_own_hold_and_priorities_hold_only_above_themselves() {
+        // E: the train's own eligible lint is admitted beside its waiting shard.
+        let (_root, mut store) = hold_lab();
+        job_of(&store, "prepare", "train", "running", (1, 1), &[]);
+        job_of(&store, "shard", "train", "queued", (6, 1024), &["prepare"]);
+        job_of(&store, "lint", "train", "queued", (4, 1024), &[]);
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("lint"));
+        // H, P3-1: train A (2) and train B (1) both wait; B's lint fits beside A's demand alone, the
+        // lane fits beside neither.
+        let (_root, mut store) = hold_lab();
+        job_of(&store, "prepare", "a", "running", (1, 1), &[]);
+        job_of(&store, "a-shard", "a", "queued", (4, 4096), &["prepare"]);
+        job_of(&store, "b-shard", "b", "queued", (4, 4096), &["prepare"]);
+        job_of(&store, "b-lint", "b", "queued", (1, 512), &[]);
+        job_of(&store, "lane", "lane", "queued", (1, 512), &[]);
+        crate::worker::set_priority(&store, "a", 2).unwrap();
+        crate::worker::set_priority(&store, "b", 1).unwrap();
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("b-lint"));
+        assert_eq!(mindy_claims(&mut store, "k2"), None);
+    }
+
+    /// A running attempt of `action` on mindy, so it counts in `held` and as a dependency waited on.
+    fn running_on_mindy(store: &Store, action: &str, need: (u32, u32)) {
+        let id = format!("{action}-a");
+        store
+            .db
+            .execute(
+                "INSERT INTO attempts VALUES (?,?,'running',0,?)",
+                rusqlite::params![
+                    id,
+                    action,
+                    json!({"id":id,"action":action,"worker_pid":1,"worker_start":"1","supervisor_pid":null,
+                           "supervisor_start":null,"slots":need.0,"memory_mb":need.1,"created":0.0,
+                           "started":null,"ended":null,"exit_code":null,"result":null,"executor":"mindy"})
+                    .to_string()
+                ],
+            )
+            .unwrap();
+        store
+            .db
+            .execute("UPDATE actions SET attempt=? WHERE id=?", [&id, action])
+            .unwrap();
+    }
+
+    #[test]
+    fn a_lower_train_never_counts_its_own_dependency_as_freed_for_a_higher_train() {
+        // Re-gate P3-1 on pw#10: train A (2) waits on a prepare elsewhere; train B (1) runs its
+        // prepare on mindy. B's lint must not take A's room because B's prepare will free.
+        let (_root, mut store) = hold_lab();
+        job_of(&store, "prepare-a", "a", "running", (1, 1), &[]);
+        job_of(&store, "a-shard", "a", "queued", (4, 1024), &["prepare-a"]);
+        job_of(&store, "prepare-b", "b", "running", (4, 1024), &[]);
+        running_on_mindy(&store, "prepare-b", (4, 1024));
+        job_of(&store, "b-shard", "b", "queued", (4, 1024), &["prepare-b"]);
+        job_of(&store, "b-lint", "b", "queued", (4, 1024), &[]);
+        crate::worker::set_priority(&store, "a", 2).unwrap();
+        crate::worker::set_priority(&store, "b", 1).unwrap();
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+    }
+
+    #[test]
+    fn a_dependency_two_held_jobs_wait_on_frees_its_capacity_once() {
+        // Re-gate P3-2 on pw#10: held 7 (prepare 4 + other 3) - freed 4 + demand 5 + lane 1 = 9 > 8.
+        let (_root, mut store) = hold_lab();
+        job_of(&store, "prepare", "train", "running", (4, 256), &[]);
+        running_on_mindy(&store, "prepare", (4, 256));
+        hold(&store.db, "other", Some("mindy"), 3, 256);
+        job_of(&store, "shard-1", "train", "queued", (3, 256), &["prepare"]);
+        job_of(&store, "shard-2", "train", "queued", (2, 256), &["prepare"]);
+        job_of(&store, "lane", "lane", "queued", (1, 256), &[]);
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+    }
+
+    #[test]
+    fn a_hold_is_visible_on_the_executor_record_and_in_events() {
+        // P3-4: a hold no longer looks like an executor draining for its head.
+        let (_root, mut store) = train_beside_lane("running", (6, 6144), (4, 4096));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        let record = load(&store.db, "mindy").unwrap().unwrap();
+        assert_eq!(
+            record.holding,
+            Some(Holding {
+                priority: 1,
+                slots: 6,
+                memory_mb: 6144
+            })
+        );
+        assert_eq!(events(&store.db, "executor.held").len(), 1);
+        assert_eq!(mindy_claims(&mut store, "k2"), None);
+        assert_eq!(events(&store.db, "executor.held").len(), 1, "deduplicated");
+        store
+            .db
+            .execute("UPDATE actions SET state='failed' WHERE id='prepare'", [])
+            .unwrap();
+        assert_eq!(mindy_claims(&mut store, "k3").as_deref(), Some("lane"));
+        assert_eq!(load(&store.db, "mindy").unwrap().unwrap().holding, None);
+        assert_eq!(events(&store.db, "executor.hold_released").len(), 1);
     }
 
     fn queued(db: &Connection, id: &str, created: f64) {
