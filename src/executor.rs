@@ -35,8 +35,9 @@ use std::{
 
 /// Refused profiles are judged again after this long: their tools may have been repaired.
 const REVERIFY: Duration = Duration::from_secs(600);
-/// Transient failures while fetching an attempt's inputs are tried this often in all.
-const MATERIALIZE_TRIES: u32 = 5;
+/// Transient failures while fetching an attempt's inputs are retried this long, as a serve restart
+/// or full transfer permits are; giving up only requeues the action (review P2-1).
+const MATERIALIZE_PATIENCE: Duration = Duration::from_secs(300);
 const PUBLISH_RETRY: Duration = Duration::from_secs(1);
 const PUBLISH_RETRY_MAX: Duration = Duration::from_secs(60);
 /// An upload quota still full after this long makes a report undeliverable (MUST-FIX 3).
@@ -796,15 +797,25 @@ impl<T: Transport> Coordinator<T> {
             return Err(not_started("runtime-mismatch", error));
         }
         let fetching = Instant::now();
+        // Giving up requeues the action; refusing the profile here until it is judged again keeps
+        // this host from reclaiming it in a loop while other executors can take it.
+        let give_up = |reason: &str, error: String| {
+            self.refuse(
+                &mut self.lock(),
+                &claim.profile.id,
+                format!("{reason}: {error}"),
+            );
+            not_started(reason, error)
+        };
         let repository = self
             .retrying(|| self.transport.source(&claim.revision))
-            .map_err(|error| not_started("materialize-failed", error))?;
+            .map_err(|error| give_up("materialize-failed", error))?;
         let mut dependencies = Vec::new();
         for dependency in &claim.dependencies {
             for (name, entry) in &dependency.artifacts {
                 let path = self
                     .retrying(|| self.transport.dependency(dependency, name, entry))
-                    .map_err(|error| not_started("materialize-failed", error))?;
+                    .map_err(|error| give_up("materialize-failed", error))?;
                 dependencies.push(DependencyFile {
                     action: dependency.action.clone(),
                     attempt: dependency.attempt.clone(),
@@ -845,7 +856,7 @@ impl<T: Transport> Coordinator<T> {
         }
         let child = self
             .spawn(attempt)
-            .map_err(|error| not_started("launch-failed", format!("{error:#}")))?;
+            .map_err(|error| give_up("launch-failed", format!("{error:#}")))?;
         let pid = child.id();
         // A supervisor that already exited is reported lost by the next poll.
         let supervisor = worker::process_start(pid).map(|start| SupervisorIdentity { pid, start });
@@ -894,16 +905,17 @@ impl<T: Transport> Coordinator<T> {
         mut operation: impl FnMut() -> Result<V, TransportError>,
     ) -> Result<V, String> {
         let mut delay = PUBLISH_RETRY;
-        let mut tries = 1;
+        let started = Instant::now();
         loop {
             match operation() {
                 Ok(value) => return Ok(value),
-                Err(TransportError::Transient(error)) if tries < MATERIALIZE_TRIES => {
+                Err(TransportError::Transient(error))
+                    if started.elapsed() < MATERIALIZE_PATIENCE =>
+                {
                     log(json!({"event":"materialize_retry","executor":self.executor,
                                "error":format!("{error:#}")}));
                     thread::sleep(delay);
-                    delay *= 2;
-                    tries += 1;
+                    delay = (delay * 2).min(PUBLISH_RETRY_MAX);
                 }
                 Err(error) => return Err(format!("{error:#}")),
             }
@@ -954,6 +966,15 @@ impl<T: Transport> Coordinator<T> {
             state.last_renewal = sent;
             state.partitioned = false;
             if let Some(lease_seconds) = lease_seconds {
+                // The server's lease is the one it expires by, so it is adopted even when shorter
+                // than three heartbeats; `partition` keeps a positive deadline (review P3-5).
+                if self.options.heartbeat * 3 > Duration::from_secs(lease_seconds)
+                    && state.lease_seconds != lease_seconds
+                {
+                    log(json!({"event":"lease_short","executor":self.executor,
+                               "lease_seconds":lease_seconds,
+                               "heartbeat_seconds":self.options.heartbeat.as_secs_f64()}));
+                }
                 state.lease_seconds = lease_seconds;
             }
         }
@@ -978,6 +999,11 @@ impl<T: Transport> Coordinator<T> {
             self.stop(attempt, "fenced");
             return;
         }
+        // A stop is written before registration, so a supervisor never sees itself registered for
+        // an action already recorded stopping (review P3-4).
+        if let Some(reason) = &status.stop {
+            self.stop(attempt, reason);
+        }
         {
             let mut state = self.lock();
             let Some(entry) = state.ledger.get_mut(attempt) else {
@@ -987,16 +1013,17 @@ impl<T: Transport> Coordinator<T> {
                 entry.stopping_relayed = true;
             }
             let control = self.control(attempt);
-            if status.registered && !entry.registered && control.join("claim.json").exists() {
+            if status.registered
+                && status.stop.is_none()
+                && !entry.registered
+                && control.join("claim.json").exists()
+            {
                 match write_atomically(&control.join("registered"), b"") {
                     Ok(()) => entry.registered = true,
                     Err(error) => log(json!({"event":"registration_unrecorded",
                         "executor":self.executor,"attempt":attempt,"error":format!("{error:#}")})),
                 }
             }
-        }
-        if let Some(reason) = status.stop {
-            self.stop(attempt, &reason);
         }
     }
 
@@ -1075,7 +1102,9 @@ impl<T: Transport> Coordinator<T> {
         let attempts: Vec<String> = {
             let mut state = self.lock();
             let lease = Duration::from_secs(state.lease_seconds);
-            let margin = (self.options.heartbeat * 2).max(lease / 5);
+            // At most half the lease, so a lease shortened below three heartbeats while running
+            // still leaves renewals time to land instead of stopping every job at once.
+            let margin = (self.options.heartbeat * 2).max(lease / 5).min(lease / 2);
             if now <= state.last_renewal + lease.saturating_sub(margin) {
                 return;
             }
@@ -1720,8 +1749,14 @@ impl HttpTransport {
             let lock = self.disk.lock(sha256);
             let _held = locked(&lock);
             if fs::metadata(&path).is_ok_and(|metadata| metadata.len() == entry.bytes) {
-                self.disk.touch(sha256);
-                return Ok(path);
+                // A corrupt cache entry is evicted and fetched again rather than failing every
+                // consumer on this host with a repair (review P3-8).
+                if file_hash(&path).is_ok_and(|hash| &hash == sha256) {
+                    self.disk.touch(sha256);
+                    return Ok(path);
+                }
+                log(json!({"event":"cache_corrupt","sha256":sha256}));
+                let _ = fs::remove_file(&path);
             }
             let temp = self.work.join("tmp").join(unique());
             let download = || -> Result<()> {
@@ -1869,7 +1904,13 @@ impl Transport for HttpTransport {
     /// directory is kept for inspection until the retention passes.
     fn retire(&self, attempt: &Path, response: &CompleteResponse) -> Result<()> {
         if response.status == "recorded" && response.drained {
-            return remove_tree(attempt);
+            match remove_tree(attempt) {
+                Ok(()) => return Ok(()),
+                // Undeletable now (subordinate-uid files): retain it, so the time-based purge
+                // retries it instead of leaving an orphan nothing sweeps (review P2-2).
+                Err(error) => log(json!({"event":"retire_failed","attempt":response.attempt,
+                                         "error":format!("{error:#}")})),
+            }
         }
         let target = self
             .work
@@ -1952,6 +1993,11 @@ impl Disk {
         let _held = locked(&lock);
         let target = self.cas().join(sha256);
         if !target.exists() {
+            // Only content that is what its name says enters the cache (review P3-8).
+            ensure!(
+                file_hash(path)? == sha256,
+                "artifact content does not match its digest"
+            );
             fs::hard_link(path, &target)?;
             fs::set_permissions(&target, fs::Permissions::from_mode(0o444))?;
         }
@@ -2042,16 +2088,34 @@ impl Disk {
             Err(error) => return Err(error.into()),
         };
         let mut purged = Vec::new();
+        // One undeletable entry (a job wrote files as a subordinate uid) must not stop the rest,
+        // the executor's start or the cache eviction behind it (review P2-2): log it and go on.
         for entry in entries {
-            let entry = entry?;
-            let modified = entry.metadata()?.modified()?;
-            if now.duration_since(modified).unwrap_or_default() <= self.retain {
-                continue;
-            }
-            remove_tree(&entry.path())?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    log(json!({"event":"retained_unreadable","error":error.to_string()}));
+                    continue;
+                }
+            };
             let name = entry.file_name().to_string_lossy().into_owned();
-            log(json!({"event":"retained_purged","attempt":name}));
-            purged.push(name);
+            let expired = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|modified| now.duration_since(modified).unwrap_or_default() > self.retain);
+            match expired.map_err(anyhow::Error::from) {
+                Ok(false) => continue,
+                Ok(true) => match remove_tree(&entry.path()) {
+                    Ok(()) => {
+                        log(json!({"event":"retained_purged","attempt":name}));
+                        purged.push(name);
+                    }
+                    Err(error) => log(json!({"event":"retained_purge_failed","attempt":name,
+                                             "error":format!("{error:#}")})),
+                },
+                Err(error) => log(json!({"event":"retained_purge_failed","attempt":name,
+                                         "error":format!("{error:#}")})),
+            }
         }
         purged.sort();
         Ok(purged)
@@ -2062,19 +2126,31 @@ impl Disk {
     fn start(&self, now: SystemTime) -> Result<()> {
         for entry in fs::read_dir(self.work.join("tmp"))? {
             let path = entry?.path();
-            if fs::symlink_metadata(&path)?.is_dir() {
-                remove_tree(&path)?;
-            } else {
-                fs::remove_file(&path)?;
+            let removed = fs::symlink_metadata(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|m| {
+                    if m.is_dir() {
+                        remove_tree(&path)
+                    } else {
+                        Ok(fs::remove_file(&path)?)
+                    }
+                });
+            if let Err(error) = removed {
+                log(json!({"event":"tmp_cleanup_failed","path":path,"error":format!("{error:#}")}));
             }
         }
-        self.purge_retained(now)?;
+        if let Err(error) = self.purge_retained(now) {
+            log(json!({"event":"retained_purge_failed","error":format!("{error:#}")}));
+        }
         Ok(())
     }
 
     /// Reclaims space for the floor: expired retained attempts, then cache entries.
     fn reclaim(&self, floor: u64, free: &dyn Fn() -> u64, now: SystemTime) -> Result<()> {
-        self.purge_retained(now)?;
+        // Eviction runs even when purging could not finish (review P2-2).
+        if let Err(error) = self.purge_retained(now) {
+            log(json!({"event":"retained_purge_failed","error":format!("{error:#}")}));
+        }
         self.evict(Some((floor, free)))
     }
 }

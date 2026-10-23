@@ -18,6 +18,9 @@ use std::{
 
 pub const LOCAL: &str = "local";
 pub const DEFAULT_LEASE_SECONDS: u64 = 300;
+/// The local executor's supervisors outlive a stopped worker, so its lease covers a worker
+/// restart or maintenance window; a remote one keeps the default (review P3-6).
+pub const LOCAL_LEASE_SECONDS: u64 = 3600;
 /// A `refused` key with which an executor declines every profile, saying why (MUST-FIX 8).
 pub const REFUSE_ALL: &str = "*";
 const MAX_UNVERIFIED: usize = 32;
@@ -104,7 +107,11 @@ pub fn default_record(id: &str) -> ExecutorRecord {
         id: id.into(),
         slots: None,
         memory_mb: None,
-        lease_seconds: DEFAULT_LEASE_SECONDS,
+        lease_seconds: if id == LOCAL {
+            LOCAL_LEASE_SECONDS
+        } else {
+            DEFAULT_LEASE_SECONDS
+        },
         placement: Placement::default(),
         created: now(),
         observed: Observed::default(),
@@ -703,21 +710,27 @@ pub fn renew(
             "At most {MAX_LEASES} leases are renewed at once."
         )));
     }
-    if let Some(reason) = request
-        .leases
-        .iter()
-        .filter_map(|entry| entry.stopping.as_deref())
-        .find(|reason| !SUPERVISOR_STOPS.contains(reason))
-    {
-        return Err(AuthorityError::Invalid(format!(
-            "Unknown supervisor stop: {reason}."
-        )));
-    }
     let transaction = store.transaction()?;
     let mut record = load(&transaction, executor)?.ok_or(AuthorityError::Unregistered)?;
     seen(&transaction, &mut record)?;
     let mut leases = Vec::new();
     for entry in &request.leases {
+        // A job can write its own control files: an unknown stop fences that lease alone, and
+        // the rest of the host's batch renews (review P3-7).
+        if entry
+            .stopping
+            .as_deref()
+            .is_some_and(|reason| !SUPERVISOR_STOPS.contains(&reason))
+        {
+            leases.push(LeaseStatus {
+                attempt: entry.attempt.clone(),
+                status: "fenced".into(),
+                stop: None,
+                registered: false,
+                lease_expires: None,
+            });
+            continue;
+        }
         leases.push(renew_lease(&transaction, &record, scope, entry)?);
     }
     transaction.commit()?;
@@ -1030,6 +1043,10 @@ pub fn record_result(
                 Some("no-requesters") => ("canceled", "canceled"),
                 // Tool drift on one host says nothing about the revision: the action waits.
                 Some("runtime-mismatch") => ("interrupted", "queued"),
+                // Nothing of the attempt ran, so an infrastructure failure (materialize, launch,
+                // registration, a lost coordinator) says nothing about the revision either: the
+                // action waits for another claim. Undrained resources keep it held until confirmed.
+                _ if request.drained => ("interrupted", "queued"),
                 _ => ("interrupted", "interrupted"),
             };
             let detail = json!({"reason":reason,"error":evidence["error"],
@@ -1416,7 +1433,7 @@ mod tests {
             (local.id.as_str(), local.slots, local.memory_mb),
             (LOCAL, None, None)
         );
-        assert_eq!(local.lease_seconds, DEFAULT_LEASE_SECONDS);
+        assert_eq!(local.lease_seconds, LOCAL_LEASE_SECONDS);
         assert_eq!(local.placement, Placement::default());
         assert_eq!(local.observed, Observed::default());
         let mindy = ExecutorRecord {
@@ -2459,7 +2476,15 @@ mod tests {
                 leases: vec![forged],
             },
         );
-        assert!(matches!(refused, Err(AuthorityError::Invalid(_))));
+        // An unknown supervisor stop fences that lease alone and records nothing (review P3-7).
+        let refused = refused.unwrap();
+        assert_eq!(
+            (
+                refused.leases[0].status.as_str(),
+                refused.leases[0].stop.as_deref()
+            ),
+            ("fenced", None)
+        );
         assert_eq!(state(&store.db, "second"), "running");
         let status = heartbeat(&mut store, "mindy", &Scope::all(), vec![lease(&second)]);
         assert_eq!(status[0].stop.as_deref(), Some("no-requesters"));
@@ -2620,6 +2645,32 @@ mod tests {
         };
         let status = heartbeat(&mut store, LOCAL, &Scope::all(), vec![legacy]);
         assert_eq!(status[0].status, "fenced");
+    }
+
+    #[test]
+    fn unknown_stop_fences_only_its_own_lease() {
+        // A job can write its own control files; one bad value must not stall the host (P3-7).
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        queued(&store.db, "first", 1.0);
+        queued(&store.db, "second", 2.0);
+        let (first, second) = (grant(&mut store, "k1"), grant(&mut store, "k2"));
+        let bogus = LeaseReport {
+            stopping: Some("bogus".into()),
+            ..lease(&first)
+        };
+        let status = heartbeat(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            vec![bogus, lease(&second)],
+        );
+        let by_attempt: BTreeMap<_, _> = status
+            .iter()
+            .map(|s| (s.attempt.clone(), s.status.clone()))
+            .collect();
+        assert_eq!(by_attempt[&first.attempt.id], "fenced");
+        assert_eq!(by_attempt[&second.attempt.id], "ok");
     }
 
     #[test]
@@ -3121,6 +3172,14 @@ mod tests {
                 "interrupted",
             ),
             (
+                NotStarted,
+                Some("materialize-failed"),
+                125,
+                error("mirror"),
+                false,
+                "interrupted",
+            ),
+            (
                 Lost,
                 None,
                 125,
@@ -3165,7 +3224,17 @@ mod tests {
                 (attempt_state.into(), drained),
                 "{id}"
             );
-            assert_eq!(state(&store.db, &id), attempt_state, "{id}");
+            // A drained attempt that never started requeues its action (review P2-1).
+            let requeued = outcome == NotStarted && reason != Some("no-requesters") && drained;
+            let action_state = if requeued { "queued" } else { attempt_state };
+            assert_eq!(state(&store.db, &id), action_state, "{id}");
+            if requeued {
+                // Out of the way of the next case's claim.
+                store
+                    .db
+                    .execute("UPDATE actions SET state='canceled' WHERE id=?", [&id])
+                    .unwrap();
+            }
             // Only a failure says something about the revision.
             let repaired = i64::from(attempt_state == "failed");
             assert_eq!(repairs(&store.db, &id), repaired, "{id}");
@@ -3195,7 +3264,7 @@ mod tests {
                 ),
                 NotStarted => (
                     "attempt.launch_failed",
-                    json!({"reason":reason,"error":evidence["error"],"requeued":false}),
+                    json!({"reason":reason,"error":evidence["error"],"requeued":requeued}),
                 ),
                 Lost => (
                     "attempt.interrupted",

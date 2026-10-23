@@ -81,10 +81,14 @@ refuses all work and its record shows `refused: {"*": "loopback listener … not
 allowlisted"}`. `executor` always checks. `worker` checks only when given
 `--loopback-allow`, with or without ports.
 
-Attempts hold leases: 300 seconds by default (`executor-set --lease-seconds`),
+Attempts hold leases: 300 seconds by default for a remote executor and 3600 seconds
+for `local`, whose supervisors keep running while its worker is stopped
+(`executor-set --lease-seconds`). Stopping the local worker for longer than its
+lease expires its running jobs, so drain it first for longer maintenance.
 renewed every second by `worker` and every ten seconds by `executor`. A coordinator
 that cannot renew stops its jobs once the lease minus `max(2 × heartbeat,
-lease / 5)` has passed since its last renewal, before the API could expire it.
+lease / 5)`, at most half the lease, has passed since its last renewal, before the
+API could expire it.
 Only `serve` expires leases, and not within one lease of its own start. An
 expired attempt is interrupted and stays undrained: its capacity is held until its
 coordinator reports the drain or an operator confirms it. A coordinator whose

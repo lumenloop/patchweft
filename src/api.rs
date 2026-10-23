@@ -1225,6 +1225,11 @@ pub const MAX_RETAINED_UPLOADS: u64 = 4 * MAX_BUNDLE as u64;
 pub const MAX_ARTIFACT_BYTES: u64 = MAX_BUNDLE as u64;
 /// Per attempt: artifacts and logs together.
 pub const MAX_ATTEMPT_OUTPUT_BYTES: u64 = MAX_RETAINED_UPLOADS;
+/// A result's artifact manifest, serialized; every host enforces it at capture, so a result that
+/// passes locally is deliverable from a remote executor too (review P2-3).
+pub const MAX_MANIFEST_BYTES: u64 = 12 * 1024 * 1024;
+/// `executor/complete` carries the manifest twice (evidence and uploads) plus log references.
+pub const MAX_COMPLETE_BODY: usize = 32 * 1024 * 1024;
 pub const TRANSFER_TIMEOUT_SECONDS: u64 = 600;
 impl Api {
     pub fn begin_upload(&self, token: &str, sha256: &str) -> ApiResult<tempfile::NamedTempFile> {

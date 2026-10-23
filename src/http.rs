@@ -254,7 +254,10 @@ pub fn router(service: Service) -> Router {
         .route("/v1/executor/profiles", post(executor_profiles))
         .route("/v1/executor/claim", post(executor_claim))
         .route("/v1/executor/renew", post(executor_renew))
-        .route("/v1/executor/complete", post(executor_complete))
+        .route(
+            "/v1/executor/complete",
+            post(executor_complete).layer(DefaultBodyLimit::max(api::MAX_COMPLETE_BODY)),
+        )
         .route("/v1/events", get(events))
         .route("/v1/blobs/{sha256}", put(upload))
         .route("/v1/revisions/{revision}/bundle", get(bundle))

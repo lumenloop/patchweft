@@ -344,17 +344,31 @@ impl std::fmt::Display for RuntimeMismatch {
 }
 impl std::error::Error for RuntimeMismatch {}
 
+/// A stop that arrived after registration but before the command ran (review P3-4): nothing of
+/// the job ran, so the attempt ends not started.
+#[derive(Debug)]
+struct StoppedBeforeCommand(String);
+
+impl std::fmt::Display for StoppedBeforeCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stopped before the command ran: {}", self.0)
+    }
+}
+impl std::error::Error for StoppedBeforeCommand {}
+
 /// Output a result may carry, per file (artifacts and logs) and per attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Limits {
     file: u64,
     attempt: u64,
+    manifest: u64,
 }
 
 /// Every host enforces the same limits, so a result recorded on one is deliverable from all.
 const LIMITS: Limits = Limits {
     file: api::MAX_ARTIFACT_BYTES,
     attempt: api::MAX_ATTEMPT_OUTPUT_BYTES,
+    manifest: api::MAX_MANIFEST_BYTES,
 };
 
 /// The attempt's logs so far, each within the per-file limit; returns their total size.
@@ -453,6 +467,15 @@ fn execute_command(
         .stderr(log);
     if job.export_slots {
         command.env("PATCHWEFT_SLOTS", job.slots.to_string());
+    }
+    // Preparing can take seconds; a stop recorded meanwhile wins before anything of the job runs.
+    let pending = if STOP.load(Ordering::SeqCst) {
+        Some("supervisor-stop".to_owned())
+    } else {
+        control.requested()?
+    };
+    if let Some(reason) = pending {
+        return Err(StoppedBeforeCommand(reason).into());
     }
     let command_started = Instant::now();
     let timer_seconds;
@@ -642,6 +665,14 @@ fn conclude(
             Some("runtime-mismatch".into()),
             125,
             failure(claim, job, Some(format!("{error:#}"))),
+        ),
+        Err(error) if error.is::<StoppedBeforeCommand>() => (
+            Outcome::NotStarted,
+            error
+                .downcast_ref::<StoppedBeforeCommand>()
+                .map(|stop| stop.0.clone()),
+            125,
+            failure(claim, job, None),
         ),
         Err(error) => (
             Outcome::Completed,
@@ -959,6 +990,13 @@ fn capture_artifacts(
             &mut total,
         )?;
     }
+    let size = serde_json::to_vec(&manifest)?.len() as u64;
+    ensure!(
+        size <= limits.manifest,
+        "artifact manifest of {} files exceeds {} bytes",
+        manifest.len(),
+        limits.manifest
+    );
     fs::write(
         directory.join("artifacts.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -1076,16 +1114,27 @@ mod tests {
     #[test]
     fn capture_enforces_artifact_and_attempt_limits() {
         let build = job(json!({"name":"build","command":["sh"],"artifacts":["dist"]}));
-        let capture = |file, attempt| {
+        let capture_with = |file, attempt, manifest| {
             let temp = finished();
             capture_artifacts(
                 &build,
                 &temp.path().join("work"),
                 temp.path(),
-                Limits { file, attempt },
+                Limits {
+                    file,
+                    attempt,
+                    manifest,
+                },
             )
             .map_err(|error| format!("{error:#}"))
         };
+        let capture = |file, attempt| capture_with(file, attempt, u64::MAX);
+        // The manifest is bounded too, on every host (review P2-3).
+        let error = capture_with(12, 24, 10).unwrap_err();
+        assert!(
+            error.contains("artifact manifest of 2 files exceeds 10 bytes"),
+            "{error}"
+        );
         let error = capture(11, 100).unwrap_err();
         assert!(error.contains("dist/b exceeds 11 bytes"), "{error}");
         let error = capture(3, 100).unwrap_err();
@@ -1104,6 +1153,7 @@ mod tests {
         let limits = Limits {
             file: 12,
             attempt: 24,
+            manifest: u64::MAX,
         };
         let artifacts =
             capture_artifacts(&build, &temp.path().join("work"), temp.path(), limits).unwrap();
@@ -1127,7 +1177,8 @@ mod tests {
             LIMITS,
             Limits {
                 file: api::MAX_ARTIFACT_BYTES,
-                attempt: api::MAX_ATTEMPT_OUTPUT_BYTES
+                attempt: api::MAX_ATTEMPT_OUTPUT_BYTES,
+                manifest: api::MAX_MANIFEST_BYTES,
             }
         );
     }
