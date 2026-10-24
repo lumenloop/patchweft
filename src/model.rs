@@ -214,8 +214,8 @@ pub struct Action {
     pub reservation: Option<Reservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<Origin>,
-    /// sha256 of a declared job's input identity, exported as `PATCHWEFT_INPUTS`. Absent on the
-    /// fail-safe path and for every other policy.
+    /// A declared job's passed key, exported as `PATCHWEFT_INPUTS`. Absent when it has none (the
+    /// fail-safe path, or a dependency without one) and for every other policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_inputs: Option<String>,
     /// The base commit a declared job's `base_paths` were keyed at, exported as `PATCHWEFT_BASE`.

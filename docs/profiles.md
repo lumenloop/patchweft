@@ -169,9 +169,12 @@ submit from the revision under test:
 The declared identity covers the job's entry without `why`, `common`, and the
 path, mode and object ID of every input and base file. A declared job reuses an
 earlier `passed` action with the same recipe, evidence class, timeout and
-declared identity from any revision of the project. Its dependency actions are
-not compared: the recipe already hashes the dependencies' recipes. Only a
-`passed` action is reused this way. Queued and running work is still shared under
+declared identity, and whose dependencies' passed keys are the same, from any
+revision of the project. A dependency's output is an input of its dependents, so
+each job's passed key folds in every dependency's passed key, and a job with a
+dependency that has none (commit-keyed or on the fail-safe path) has none itself.
+Its dependency actions are not compared: a dependency rerun on equal inputs keeps
+its passed key. Only a `passed` action is reused this way. Queued and running work is still shared under
 the commit and dependency actions exactly as under `inflight`, so outstanding
 work never joins across revisions. A failed, interrupted, canceled or stopping
 action is never reused.
@@ -179,8 +182,10 @@ action is never reused.
 A reused job is listed in the candidate's `reused` with the action and the
 candidate and revision it ran for, and emits `action.reused`. `status` shows the
 job as `passed` with its `reused` entry, and the frontier certificate marks the
-receipt `reused`. Declared jobs receive `PATCHWEFT_INPUTS`, the SHA-256 of their
-declared identity.
+receipt `reused`. A declared job with a passed key receives it as
+`PATCHWEFT_INPUTS`, and with `base_paths` the base it was keyed at as
+`PATCHWEFT_BASE`: the same inputs and dependencies give the same value, so a job
+can derive run identities (seeds, run ids) from it.
 
 Before registering a profile with `declared` jobs, every executor must run a
 binary that knows the policy, and the jobs themselves must not pass vacuously: a
@@ -193,12 +198,14 @@ and its dependency actions with no completed reuse:
 
 - its entry is absent or `whole_tree` (the value is the reason);
 - it has `base_paths` but no base;
+- one of its dependencies has no passed key (commit-keyed, or itself on this list);
 - a symlink or submodule is among its matched files;
 - the declarations file is missing or invalid. That applies to every declared
   job, is recorded as an `inputs.invalid` event with the reason, and never fails
   the submit.
 
-The file is invalid when it has another schema or an unknown field, when a
+The file is invalid when it has another schema, an unknown field or a duplicate
+key at any level, when a
 pattern is outside the dialect, when a `common`, `paths`, `keep` or `base_paths`
 pattern matches no tracked file (`base_paths` at the base), when an entry has
 neither or both of `paths` and `whole_tree`, or when a `why` is missing or under
@@ -283,7 +290,8 @@ attempt lifecycle.
 
 Jobs receive `PATCHWEFT_STATE`, `PATCHWEFT_ATTEMPT`, `PATCHWEFT_REVISION`,
 `PATCHWEFT_SLOTS` (unless `export_slots` is false), `PATCHWEFT_REPORT` and, for
-declared jobs off the fail-safe path, `PATCHWEFT_INPUTS`.
+declared jobs with a passed key, `PATCHWEFT_INPUTS` (and `PATCHWEFT_BASE` with
+`base_paths`).
 `PATCHWEFT_STATE` is the store's directory on the API host and the executor's
 `--work` directory elsewhere; `$PATCHWEFT_STATE/attempts/$PATCHWEFT_ATTEMPT` is the
 attempt directory on both.

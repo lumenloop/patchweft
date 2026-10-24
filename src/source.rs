@@ -24,6 +24,8 @@ pub fn git_command(repo: &Path) -> Command {
         .env("LANG", "C.UTF-8")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        // /etc/gitattributes would change checkout bytes outside every declared input (pw#11 gate P3).
+        .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .args([
             "-c",

@@ -651,7 +651,6 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
         &dependencies,
     )?;
     // Only a declared job off the fail-safe path, with every dependency keyed too, has a passed key.
-    let declared = request.declared.identity(name).cloned();
     let passed = request.passed.get(name).cloned().flatten();
     let (owner, context, profile) = (request.owner, request.context, request.profile);
     // Before the generic lookup, so an unrelated queued row cannot capture the job and break the chain.
@@ -805,7 +804,8 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
                 owner: owner.into(),
                 context: context.into(),
             }),
-            declared_inputs: declared.as_ref().map(identity).transpose()?,
+            // The passed key, so runs whose dependencies differ never share a value (pw#11 gate P2).
+            declared_inputs: passed.clone(),
             declared_base: request.declared.base(name).map(Into::into),
         };
         transaction.execute(
@@ -2288,9 +2288,8 @@ mod declared_tests {
             let inputs = declared.identity(job).unwrap();
             assert_eq!(inputs["declared"]["schema"], SCHEMA);
             assert_eq!(
-                action.declared_inputs,
-                Some(identity(inputs).unwrap()),
-                "{job}"
+                action.declared_inputs, passed[job],
+                "{job}: PATCHWEFT_INPUTS is the passed key"
             );
             assert_eq!(
                 passed_key_of(&lab.store.db, &action.id).unwrap(),
@@ -2584,6 +2583,14 @@ mod declared_tests {
         let generated = lab.commit(&[("gen.txt", Some("fail"))]);
         let c = lab.submit(&generated, &profile);
         assert!(!c.reused.contains_key("prep"));
+        // check's own inputs are unchanged but prep's are not: its PATCHWEFT_INPUTS differs too (pw#11 gate P2).
+        let inputs = |id: &str| {
+            record::<Action>(&lab.store.db, "actions", id)
+                .unwrap()
+                .declared_inputs
+        };
+        assert_ne!(inputs(&c.required["check"]), inputs(&a.required["check"]));
+        assert!(inputs(&c.required["check"]).is_some());
         assert!(
             !c.reused.contains_key("check"),
             "prep's inputs changed, so check's passed key changed"
@@ -2602,6 +2609,11 @@ mod declared_tests {
         assert!(
             !e.reused.contains_key("check"),
             "a commit-keyed dependency gives its dependents no passed key"
+        );
+        let check: Action = record(&lab.store.db, "actions", &e.required["check"]).unwrap();
+        assert_eq!(
+            check.declared_inputs, None,
+            "no passed key, no PATCHWEFT_INPUTS"
         );
     }
 }
