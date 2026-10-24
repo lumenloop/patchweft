@@ -2303,3 +2303,194 @@ fn supervisor_killed_before_command_drains_without_operator() {
     assert_eq!(lab.state(&candidate), "passed");
     assert!(lab.state.join("used").exists());
 }
+
+const INPUTS_FILE: &str = "patchweft-inputs.json";
+const DECLARED_AUDIT: &str = "patchweft-inputs.json names every file the job reads";
+/// `check` reads provider.mjs (and the common consumer.mjs); `gate` also reads README, which
+/// it does not declare, so an outside change can flip it.
+const DECLARATIONS: &str = r#"{"schema":"patchweft.inputs/1","common":["consumer.mjs"],
+ "jobs":{"prep":{"paths":["*.mjs"],"why":"prep builds dist from the modules"},
+         "check":{"paths":["provider.mjs"],"why":"check reads provider.mjs and consumer.mjs"},
+         "gate":{"paths":["*.mjs"],"why":"gate's declared reads are the modules"},
+         "census":{"whole_tree":"lists the whole tree"}}}"#;
+const RECORD: &str = "mkdir -p out; env > out/env";
+
+fn declared_profile(lab: &Lab) -> String {
+    let declared = |name: &str, script: &str, extra: Value| {
+        let mut job = job(name, script, extra);
+        job["reuse"] = json!("declared");
+        job["audit"] = json!(DECLARED_AUDIT);
+        job
+    };
+    lab.register(
+        "declared",
+        json!({"version":1,"name":"declared","certifying":true,"tools":{"sh":"/usr/bin/sh"},
+        "inputs_file":INPUTS_FILE,"jobs":[
+            declared("prep", BUILD, json!({"artifacts":["dist"]})),
+            declared("check", &format!("test -s dist/out && {RECORD}"),
+                     json!({"dependencies":["prep"],"artifacts":["out"]})),
+            declared("gate", "! grep -q fail README", json!({})),
+            declared("census", RECORD, json!({"artifacts":["out"]})),
+            job("plain", RECORD, json!({"artifacts":["out"]})),
+        ]}),
+    )
+}
+
+fn delivered_env(lab: &Lab, action: &Value, name: &str) -> String {
+    let destination = lab.state.join(format!("env-{name}"));
+    lab.call(&[
+        "deliver",
+        action.as_str().unwrap(),
+        "--destination",
+        destination.to_str().unwrap(),
+    ]);
+    fs::read_to_string(destination.join("out/env")).unwrap()
+}
+
+#[test]
+fn a_declared_pass_is_reused_until_a_declared_input_changes() {
+    let lab = Lab::new();
+    let profile = declared_profile(&lab);
+    let (declared, _) = lab.edit(&lab.base, "author", INPUTS_FILE, DECLARATIONS);
+    let (first, _) = lab.edit(&declared, "author", "README", "fail\n");
+    let a = lab.submit(&first, &profile, "agent");
+    lab.drain();
+    assert_eq!(lab.state(&a), "failed");
+    let status = lab.call(&["status", a["id"].as_str().unwrap()]);
+    assert_eq!(status["jobs"]["check"]["state"], "passed");
+    assert_eq!(status["jobs"]["gate"]["state"], "failed");
+
+    // Only README changes: outside `check`'s inputs, and outside `gate`'s declared ones.
+    let (second, _) = lab.edit(&first, "author", "README", "pass\n");
+    let b = lab.submit(&second, &profile, "agent");
+    assert_eq!(b["required"]["check"], a["required"]["check"]);
+    // prep is declared too, so check's passed key (which folds in prep's) holds.
+    assert_eq!(names(&b["reused"]), ["check", "prep"]);
+    assert_eq!(b["reused"]["check"]["from_candidate"], a["id"]);
+    assert_eq!(b["reused"]["check"]["from_revision"], json!(first));
+    let checks: i64 = lab
+        .database()
+        .query_row(
+            "SELECT COUNT(*) FROM actions WHERE json_extract(body,'$.job')='check'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(checks, 1, "no new action for a reused job");
+    let reused = lab.events_of("action.reused");
+    assert_eq!(reused.len(), 2);
+    let reused: Vec<_> = reused
+        .iter()
+        .filter(|e| e["subject"] == a["required"]["check"])
+        .collect();
+    assert_eq!(reused.len(), 1);
+    assert_eq!(reused[0]["detail"]["candidate"], b["id"]);
+    // A failed declared action is never reused, even with the same declared inputs.
+    assert_ne!(b["required"]["gate"], a["required"]["gate"]);
+    for job in ["census", "plain"] {
+        assert_ne!(b["required"][job], a["required"][job], "{job}");
+    }
+    let status = lab.call(&["status", b["id"].as_str().unwrap()]);
+    assert_eq!(status["reused"], json!(["check", "prep"]));
+    assert_eq!(status["jobs"]["check"]["state"], "passed");
+    assert_eq!(status["jobs"]["check"]["reused"], b["reused"]["check"]);
+    lab.drain();
+    assert_eq!(lab.state(&b), "passed");
+    // b reuses prep and check, so it starts gate, census and plain only.
+    assert_eq!(lab.count("attempt.started"), 5 + 3);
+
+    // The reused pass consumed A's `prep`; promote accepts it by its passed key.
+    lab.call(&["review", &second, "--reviewer", "reviewer"]);
+    let certificate = lab.call(&["promote", b["id"].as_str().unwrap()]);
+    assert_eq!(certificate["receipts"]["check"]["route"], "reused");
+    assert_eq!(
+        certificate["receipts"]["check"]["reused"],
+        b["reused"]["check"]
+    );
+    assert_eq!(certificate["receipts"]["gate"]["route"], "own");
+
+    let (third, _) = lab.edit(
+        &second,
+        "author",
+        "provider.mjs",
+        "export const offset = 1;\n",
+    );
+    let c = lab.submit(&third, &profile, "agent");
+    assert!(c.get("reused").is_none(), "{c}");
+    assert_ne!(c["required"]["check"], a["required"]["check"]);
+    lab.drain();
+    assert_eq!(lab.state(&c), "passed");
+
+    // PATCHWEFT_INPUTS reaches declared jobs off the fail-safe path only.
+    let check = &a["required"]["check"];
+    let inputs = lab.body("actions", check.as_str().unwrap())["declared_inputs"].clone();
+    assert_eq!(inputs.as_str().unwrap().len(), 64);
+    let environment = delivered_env(&lab, check, "check");
+    assert!(
+        environment.contains(&format!("PATCHWEFT_INPUTS={}\n", inputs.as_str().unwrap())),
+        "{environment}"
+    );
+    assert_ne!(
+        lab.body("actions", c["required"]["check"].as_str().unwrap())["declared_inputs"],
+        inputs
+    );
+    for job in ["census", "plain"] {
+        let environment = delivered_env(&lab, &a["required"][job], job);
+        assert!(environment.contains("PATCHWEFT_REVISION="), "{job}");
+        assert!(!environment.contains("PATCHWEFT_INPUTS"), "{job}");
+    }
+}
+
+#[test]
+fn absent_or_invalid_declarations_behave_like_inflight() {
+    let lab = Lab::new();
+    let profile = declared_profile(&lab);
+    let project = lab.call(&["list", "projects"])[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let invalid = DECLARATIONS.replace("\"why\"", "\"reason\"");
+    let mut base = lab.base.clone();
+    for (round, text) in [None, Some(invalid.as_str())].into_iter().enumerate() {
+        if let Some(text) = text {
+            base = lab.edit(&base, "author", INPUTS_FILE, text).0;
+        }
+        let first = lab.submit(&base, &profile, "agent");
+        let event = lab.events_of("inputs.invalid").pop().unwrap();
+        assert_eq!(event["detail"]["candidate"], first["id"]);
+        let commit = lab.body("revisions", &base)["commit"].clone();
+        for job in ["check", "gate"] {
+            let action = lab.body("actions", first["required"][job].as_str().unwrap());
+            let today = patchweft::engine::action_key(
+                &project,
+                action["identity"]["recipe"].as_str().unwrap(),
+                "certifying",
+                1800,
+                &json!({"commit":commit}),
+                &serde_json::from_value::<Vec<String>>(action["dependencies"].clone()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(action["key"], today, "{job}");
+            assert!(action.get("declared_inputs").is_none(), "{job}");
+        }
+        lab.drain();
+        assert_eq!(
+            lab.call(&["status", first["id"].as_str().unwrap()])["jobs"]["check"]["state"],
+            "passed"
+        );
+        let (next, _) = lab.edit(&base, "author", "README", &format!("round {round}\n"));
+        let second = lab.submit(&next, &profile, "agent");
+        assert!(second.get("reused").is_none(), "{second}");
+        assert_ne!(second["required"]["check"], first["required"]["check"]);
+        let environment = {
+            lab.drain();
+            delivered_env(
+                &lab,
+                &second["required"]["check"],
+                &format!("round-{round}"),
+            )
+        };
+        assert!(!environment.contains("PATCHWEFT_INPUTS"));
+    }
+    assert_eq!(lab.count("action.reused"), 0);
+}

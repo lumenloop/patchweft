@@ -217,6 +217,36 @@ pub fn capacity(db: &Connection) -> Result<(u32, u32)> {
     Ok((get("slots")?, get("memory_mb")?))
 }
 
+/// Passed keys of declared jobs' actions. Additive and idempotent; the store schema itself is
+/// unchanged.
+pub fn prepare_passed_keys(db: &Connection) -> Result<()> {
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS passed_keys (action TEXT PRIMARY KEY, key TEXT NOT NULL);
+         CREATE INDEX IF NOT EXISTS passed_key ON passed_keys(key);",
+    )?;
+    Ok(())
+}
+
+/// The passed key recorded for an action; None for every action outside a declared job's
+/// declared path, and in a store that has none.
+pub fn passed_key_of(db: &Connection, action: &str) -> Result<Option<String>> {
+    let prepared: bool = db.query_row(
+        "SELECT COUNT(*)>0 FROM sqlite_master WHERE type='table' AND name='passed_keys'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !prepared {
+        return Ok(None);
+    }
+    Ok(db
+        .query_row(
+            "SELECT key FROM passed_keys WHERE action=?",
+            [action],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 // The table identifiers below are internal constants, never accepted from a caller.
 pub fn record<T: DeserializeOwned>(db: &Connection, table: &str, id: &str) -> Result<T> {
     let body: Option<String> = db

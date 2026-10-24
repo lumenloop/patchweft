@@ -1,4 +1,5 @@
 pub mod authority;
+pub mod declared;
 pub mod engine;
 pub mod executor;
 pub mod model;

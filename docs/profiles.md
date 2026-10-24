@@ -17,7 +17,8 @@ Each job also has a job identity, its recipe. A recipe hashes what the job's
 process can observe from the profile: job name, command and cleanup argv, every
 declared tool's path and bytes, the profile environment overlaid with the job
 environment, report contract, artifacts, reuse policy, input list, exported
-`slots`, the recipes of its dependencies, runner binary and platform. It leaves
+`slots`, the profile's `inputs_file` when set, the recipes of its dependencies,
+runner binary and platform. It leaves
 out `memory_mb`, `timeout_seconds`, `slots` with `export_slots: false`, `audit`,
 and the profile's name, version and `certifying` flag; `certifying` decides the
 evidence class instead. Sharing, completed reuse
@@ -109,6 +110,7 @@ NEW_DIRECTORY` and use the verified artifact.
 | `never` | Each request creates an independent action. |
 | `exact` | Completed results may be reused for the same complete source commit, job identity, timeout and dependency actions. Requires an audit. |
 | `files` | Materializes only explicitly listed regular source files; supports completed reuse across revisions with identical inputs. Requires an audit and no job dependencies. |
+| `declared` | Keyed on the files the revision's declarations file says the job reads; reuses an earlier pass with the same declared inputs across revisions. Requires an audit and the profile's `inputs_file`. An undeclared job behaves as `inflight`. See [declared inputs](#declared-inputs). |
 
 Use `inputs` only with `files`, and include every source input, such as both the
 lockfile and preparation script. A files-only job has no implicit full checkout.
@@ -117,7 +119,7 @@ timeout. An existing audit therefore also covers other profiles with an
 identical job identity; audit wording is not part of identity.
 
 Registering a new profile no longer forces fresh runs: a job whose identity is
-unchanged reuses across profiles under `exact` or `files`. Identity covers the
+unchanged reuses across profiles under `exact`, `files` or `declared`. Identity covers the
 recipe's declared tools, environment and command, not the host. After a host
 change the recipe cannot see, such as a system compiler upgrade, a corepack
 update or an image pulled by a moving tag, force a fresh observation
@@ -128,6 +130,95 @@ The `audit` field records why completed reuse is sound. The engine checks that
 an audit exists, not whether its reasoning is true. Native execution still sees
 host libraries and can use the network. Hashing a compiler launcher does not hash
 the compiler and all its libraries. Reusing the same result is not a fresh test.
+
+## Declared inputs
+
+A `declared` job is keyed on the files the project says it reads instead of the
+whole commit. The profile's `inputs_file` names the declarations file, a path in
+the source such as `scripts/ci/patchweft-inputs.json`. Patchweft reads it at
+submit from the revision under test:
+
+```json
+{"schema": "patchweft.inputs/1",
+ "common": ["package.json", "**/package.json", "pnpm-lock.yaml"],
+ "jobs": {
+  "lint": {"paths": ["**"], "exclude": ["docs/**", "**/*.md"], "why": "measured reads …"},
+  "vitest-*": {"paths": ["**"], "exclude": ["docs/**"], "keep": ["docs/x.md"], "why": "…"},
+  "test-proofs": {"paths": ["scripts/**"], "base_paths": ["packages/db/migrations/**"], "why": "…"},
+  "census": {"whole_tree": "lists the whole tree"}}}
+```
+
+- A job's inputs are `common`, plus its `paths` less `exclude`, plus `keep`,
+  matched against the revision's tracked files, plus every tracked
+  `.gitattributes` on an input's ancestor path (checkout applies their line
+  endings and filters). `exclude` never removes a `common` file. The job's own
+  entry and `common` are part of its identity; the rest of the declarations file
+  is not, so rewording a `why` or another job's entry reruns nothing.
+- `base_paths` are matched against the base: the commit a `Patchweft-Base:`
+  trailer in the commit message names. With no trailer, or one that names no
+  commit, there is no base and a job with `base_paths` keeps the commit key. The
+  job receives the base it was keyed at as `PATCHWEFT_BASE`.
+- A key names a job exactly or a family `prefix*`. An exact name wins, then the
+  longest family. A key that names no job of the profile is ignored and recorded
+  as an `inputs.unmatched` event.
+- Patterns are anchored at the repository root and case-sensitive. `*` matches
+  within one path segment, leading dots included; `?` matches one character;
+  `**`, only as a whole segment, matches any number of segments. Braces,
+  brackets, backslashes, a leading `!` or `/` and empty segments are refused.
+
+The declared identity covers the job's entry without `why`, `common`, and the
+path, mode and object ID of every input and base file. A declared job reuses an
+earlier `passed` action with the same recipe, evidence class, timeout and
+declared identity, and whose dependencies' passed keys are the same, from any
+revision of the project. A dependency's output is an input of its dependents, so
+each job's passed key folds in every dependency's passed key, and a job with a
+dependency that has none (commit-keyed or on the fail-safe path) has none itself.
+Its dependency actions are not compared: a dependency rerun on equal inputs keeps
+its passed key. Only a `passed` action is reused this way. Queued and running work is still shared under
+the commit and dependency actions exactly as under `inflight`, so outstanding
+work never joins across revisions. A failed, interrupted, canceled or stopping
+action is never reused.
+
+A reused job is listed in the candidate's `reused` with the action and the
+candidate and revision it ran for, and emits `action.reused`. `status` shows the
+job as `passed` with its `reused` entry, and the frontier certificate marks the
+receipt `reused`. A declared job with a passed key receives it as
+`PATCHWEFT_INPUTS`: the same inputs and dependencies give the same value, so a
+job can derive its own run identities (a seed) from it. The value differs from
+job to job, because the recipe names the job, so an identity several jobs share
+(a run id across shards) must come from something train-wide instead. A declared
+job with `base_paths` receives the base it was keyed at as `PATCHWEFT_BASE`,
+whether or not it has a passed key, since it needs its base either way.
+
+Before registering a profile with `declared` jobs, every executor must run a
+binary that knows the policy, and the jobs themselves must not pass vacuously: a
+job that skips its checks when "nothing it covers changed" (an adapter's own
+applicability test) exits 0, and Patchweft cannot tell that skip from a pass, so
+the declared key must replace such a skip rather than sit beside it.
+
+Each of these keeps a job on today's `inflight` behaviour, keyed on the commit
+and its dependency actions with no completed reuse:
+
+- its entry is absent or `whole_tree` (the value is the reason);
+- it has `base_paths` but no base;
+- one of its dependencies has no passed key (commit-keyed, or itself on this list);
+- a symlink or submodule is among its matched files;
+- the declarations file is missing or invalid. That applies to every declared
+  job, is recorded as an `inputs.invalid` event with the reason, and never fails
+  the submit.
+
+The file is invalid when it has another schema, an unknown field or a duplicate
+key at any level, when a
+pattern is outside the dialect, when a `common`, `paths`, `keep` or `base_paths`
+pattern matches no tracked file (`base_paths` at the base), when an entry has
+neither or both of `paths` and `whole_tree`, or when a `why` is missing or under
+20 characters.
+
+The declarations are the project's claim, like `audit`: Patchweft does not check
+that a job reads only what it declares. A reused pass is the earlier
+observation, not a fresh test. As for `exact` and `files`, a host change the
+recipe cannot see, such as a new compiler or Docker release, needs a recipe
+change to force a fresh run.
 
 ## Retain passed obligations after a profile change
 
@@ -153,8 +244,8 @@ reservation and the new candidate's own upstream actions. The candidate records
 `not_retained`; each retention emits an `action.retained` event, and the frontier
 certificate marks those receipts as retained. A retained pass is the earlier
 observation, not a fresh test. Without `--retain-from`, a submission under the
-new profile takes no completed pass, except through the `exact` and `files`
-policies above.
+new profile takes no completed pass, except through the `exact`, `files` and
+`declared` policies above.
 
 Job identity does not see host toolchain changes, such as a new system compiler,
 container image or package-manager release. Do not retain across those changes.
@@ -201,7 +292,9 @@ Cleanup runs afterward, so the job timeout is not a hard bound on the complete
 attempt lifecycle.
 
 Jobs receive `PATCHWEFT_STATE`, `PATCHWEFT_ATTEMPT`, `PATCHWEFT_REVISION`,
-`PATCHWEFT_SLOTS` (unless `export_slots` is false) and `PATCHWEFT_REPORT`.
+`PATCHWEFT_SLOTS` (unless `export_slots` is false), `PATCHWEFT_REPORT` and, for
+declared jobs with a passed key, `PATCHWEFT_INPUTS` and, for declared jobs with
+`base_paths` and a base, `PATCHWEFT_BASE` (passed key or not).
 `PATCHWEFT_STATE` is the store's directory on the API host and the executor's
 `--work` directory elsewhere; `$PATCHWEFT_STATE/attempts/$PATCHWEFT_ATTEMPT` is the
 attempt directory on both.

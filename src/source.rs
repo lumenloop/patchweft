@@ -24,12 +24,18 @@ pub fn git_command(repo: &Path) -> Command {
         .env("LANG", "C.UTF-8")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        // /etc/gitattributes would change checkout bytes outside every declared input (pw#11 gate P3).
+        .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .args([
             "-c",
             "core.hooksPath=/dev/null",
             "-c",
             "commit.gpgsign=false",
+            // Checkouts write the tree's bytes as declared inputs hash them: line-ending conversion
+            // comes only from tracked .gitattributes, which are inputs (pw#11 gate P2-2).
+            "-c",
+            "core.autocrlf=false",
             "-C",
         ])
         .arg(repo);
