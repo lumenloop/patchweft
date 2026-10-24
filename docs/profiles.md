@@ -165,6 +165,8 @@ submit from the revision under test:
   within one path segment, leading dots included; `?` matches one character;
   `**`, only as a whole segment, matches any number of segments. Braces,
   brackets, backslashes, a leading `!` or `/` and empty segments are refused.
+  [`inputs-dialect-vectors.json`](inputs-dialect-vectors.json) publishes the dialect as test vectors:
+  any other implementation, such as an adapter that checks a reused archive, must agree with each one.
 
 The declared identity covers the job's entry without `why`, `common`, and the
 path, mode and object ID of every input and base file. A declared job reuses an
