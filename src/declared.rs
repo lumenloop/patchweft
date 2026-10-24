@@ -57,16 +57,33 @@ impl Glob {
     }
 }
 
+/// Whether the pattern's segments match the path's, one row per pattern segment from the last back:
+/// `matched[j]` says the rest of the pattern matches `path[j..]`. O(pattern × path), so no pattern
+/// can stall a submit that holds the store's write lock (pw#11 adversary F2: backtracking through
+/// `**` cost about 6^k per path).
 fn segments_match(pattern: &[Segment], path: &[&str]) -> bool {
-    match pattern.split_first() {
-        None => path.is_empty(),
-        Some((Segment::Any, rest)) => {
-            (0..=path.len()).any(|skip| segments_match(rest, &path[skip..]))
+    let mut matched = vec![false; path.len() + 1];
+    matched[path.len()] = true;
+    for segment in pattern.iter().rev() {
+        let mut row = vec![false; path.len() + 1];
+        match segment {
+            // `**` matches zero or more segments: the rest may start at j or anywhere after it.
+            Segment::Any => {
+                let mut later = false;
+                for j in (0..=path.len()).rev() {
+                    later |= matched[j];
+                    row[j] = later;
+                }
+            }
+            Segment::Name(name) => {
+                for j in 0..path.len() {
+                    row[j] = matched[j + 1] && name_matches(name, path[j]);
+                }
+            }
         }
-        Some((Segment::Name(name), rest)) => path
-            .split_first()
-            .is_some_and(|(first, tail)| name_matches(name, first) && segments_match(rest, tail)),
+        matched = row;
     }
+    matched[0]
 }
 
 /// `*` matches any run of characters, a leading dot included; `?` matches exactly one.
@@ -1034,6 +1051,63 @@ mod tests {
         );
         assert_eq!(proofs(&unknown), None);
         assert!(resolved(&unknown).identity("lint").is_some());
+    }
+
+    /// The backtracking matcher this replaced, kept as the reference the DP must agree with.
+    fn reference(pattern: &[Segment], path: &[&str]) -> bool {
+        match pattern.split_first() {
+            None => path.is_empty(),
+            Some((Segment::Any, rest)) => {
+                (0..=path.len()).any(|skip| reference(rest, &path[skip..]))
+            }
+            Some((Segment::Name(name), rest)) => path
+                .split_first()
+                .is_some_and(|(first, tail)| name_matches(name, first) && reference(rest, tail)),
+        }
+    }
+
+    #[test]
+    fn segments_match_agrees_with_the_backtracking_reference() {
+        let (patterns, names) = (
+            ["**", "a", "*", "b?", ".a", "*a*"],
+            ["a", "b", "ba", ".a", "ab"],
+        );
+        let mut seed: u64 = 0x5eed;
+        let mut next = |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n
+        };
+        for _ in 0..5000 {
+            let pattern: Vec<&str> = (0..1 + next(5))
+                .map(|_| patterns[next(patterns.len())])
+                .collect();
+            let path: Vec<&str> = (0..next(6)).map(|_| names[next(names.len())]).collect();
+            let Ok(glob) = Glob::parse(&pattern.join("/")) else {
+                continue;
+            };
+            assert_eq!(
+                segments_match(&glob.0, &path),
+                reference(&glob.0, &path),
+                "{pattern:?} vs {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn many_globstars_match_in_polynomial_time() {
+        // pw#11 adversary F2: backtracking through `**` cost ~6^k per path inside submit's write lock.
+        let glob = Glob::parse(&format!("{}b", "**/a/".repeat(7))).unwrap();
+        let path = vec!["a"; 40].join("/");
+        let started = std::time::Instant::now();
+        assert!(!glob.matches(&path));
+        assert!(glob.matches(&format!("{path}/b")));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
