@@ -208,7 +208,61 @@ impl Declared {
     }
 }
 
+/// Walks a JSON document and fails on any object key that appears twice: `serde_json::Value` keeps the
+/// last copy, which another reader may not, so a duplicate is ambiguous (pw#11 adversary F3).
+struct UniqueKeys;
+
+impl<'de> serde::de::DeserializeSeed<'de> for UniqueKeys {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for UniqueKeys {
+    type Value = ();
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("JSON")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let mut seen = BTreeSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key.clone()) {
+                return Err(serde::de::Error::custom(format!("duplicate key {key:?}")));
+            }
+            map.next_value_seed(UniqueKeys)?;
+        }
+        Ok(())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while seq.next_element_seed(UniqueKeys)?.is_some() {}
+        Ok(())
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+}
+
 pub fn parse(text: &str) -> Result<Declarations> {
+    let mut document = serde_json::Deserializer::from_str(text);
+    serde::de::DeserializeSeed::deserialize(UniqueKeys, &mut document)
+        .and_then(|()| document.end())
+        .context("declarations are not unambiguous JSON")?;
     let value: Value = serde_json::from_str(text).context("declarations are not JSON")?;
     ensure!(
         value.get("schema") == Some(&json!(SCHEMA)),
@@ -1092,6 +1146,23 @@ mod tests {
                 reference(&glob.0, &path),
                 "{pattern:?} vs {path:?}"
             );
+        }
+    }
+
+    #[test]
+    fn duplicate_keys_make_the_file_invalid() {
+        // pw#11 adversary F3: a Value keeps the last duplicate, so `lint` whole-tree then declared read as
+        // declared. Any duplicate is ambiguous to a reader, so the file fails closed.
+        for text in [
+            r#"{"schema":"patchweft.inputs/1","common":[],"jobs":{"lint":{"whole_tree":"lists it"},
+                "lint":{"paths":["src/a.ts"],"why":"lint reads only src/a.ts, measured"}}}"#,
+            r#"{"schema":"patchweft.inputs/1","schema":"patchweft.inputs/1","common":[],"jobs":{}}"#,
+            r#"{"schema":"patchweft.inputs/1","common":[],"jobs":{"lint":{"paths":["src/**"],
+                "paths":["src/a.ts"],"why":"lint reads only src/a.ts, measured"}}}"#,
+        ] {
+            // The reason as resolve() records it on `inputs.invalid`: the whole context chain.
+            let error = format!("{:#}", parse(text).unwrap_err());
+            assert!(error.contains("duplicate key"), "{error}");
         }
     }
 

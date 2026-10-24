@@ -2119,12 +2119,10 @@ mod declared_tests {
         let b = lab.submit(&outside, &profile);
         // prep is declared, so it is reused too, and check's passed key folds in prep's.
         assert_eq!(b.reused["prep"].action, a.required["prep"]);
-        for job in ["census"] {
-            assert_ne!(
-                b.required[job], a.required[job],
-                "{job} keeps the commit key"
-            );
-        }
+        assert_ne!(
+            b.required["census"], a.required["census"],
+            "census keeps the commit key"
+        );
         for job in ["check", "solo"] {
             assert_eq!(b.required[job], a.required[job], "{job}");
             assert_eq!(lab.actions(job), 1, "{job} has no new action");
@@ -2317,11 +2315,9 @@ mod declared_tests {
                 .unwrap()
             )
         );
-        for job in ["census"] {
-            let action = lab.store.action(&candidate.required[job]).unwrap();
-            assert_eq!(action.declared_inputs, None, "{job}");
-            assert_eq!(passed_key_of(&lab.store.db, &action.id).unwrap(), None);
-        }
+        let census = lab.store.action(&candidate.required["census"]).unwrap();
+        assert_eq!(census.declared_inputs, None);
+        assert_eq!(passed_key_of(&lab.store.db, &census.id).unwrap(), None);
     }
 
     #[test]
