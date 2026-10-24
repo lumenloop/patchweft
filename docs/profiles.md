@@ -183,9 +183,12 @@ A reused job is listed in the candidate's `reused` with the action and the
 candidate and revision it ran for, and emits `action.reused`. `status` shows the
 job as `passed` with its `reused` entry, and the frontier certificate marks the
 receipt `reused`. A declared job with a passed key receives it as
-`PATCHWEFT_INPUTS`, and with `base_paths` the base it was keyed at as
-`PATCHWEFT_BASE`: the same inputs and dependencies give the same value, so a job
-can derive run identities (seeds, run ids) from it.
+`PATCHWEFT_INPUTS`: the same inputs and dependencies give the same value, so a
+job can derive its own run identities (a seed) from it. The value differs from
+job to job, because the recipe names the job, so an identity several jobs share
+(a run id across shards) must come from something train-wide instead. A declared
+job with `base_paths` receives the base it was keyed at as `PATCHWEFT_BASE`,
+whether or not it has a passed key, since it needs its base either way.
 
 Before registering a profile with `declared` jobs, every executor must run a
 binary that knows the policy, and the jobs themselves must not pass vacuously: a
@@ -290,8 +293,8 @@ attempt lifecycle.
 
 Jobs receive `PATCHWEFT_STATE`, `PATCHWEFT_ATTEMPT`, `PATCHWEFT_REVISION`,
 `PATCHWEFT_SLOTS` (unless `export_slots` is false), `PATCHWEFT_REPORT` and, for
-declared jobs with a passed key, `PATCHWEFT_INPUTS` (and `PATCHWEFT_BASE` with
-`base_paths`).
+declared jobs with a passed key, `PATCHWEFT_INPUTS` and, for declared jobs with
+`base_paths` and a base, `PATCHWEFT_BASE` (passed key or not).
 `PATCHWEFT_STATE` is the store's directory on the API host and the executor's
 `--work` directory elsewhere; `$PATCHWEFT_STATE/attempts/$PATCHWEFT_ATTEMPT` is the
 attempt directory on both.
