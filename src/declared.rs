@@ -651,6 +651,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_published_dialect_vectors_hold() {
+        // docs/inputs-dialect-vectors.json is the dialect's shared contract: ng-ci-lab's ng_prep.py keeps a
+        // byte-identical copy and checks the same vectors (lab#41 gate P3-4), so the two can't drift apart.
+        let vectors: Value =
+            serde_json::from_str(include_str!("../docs/inputs-dialect-vectors.json")).unwrap();
+        let text = |value: &Value| value.as_str().unwrap().to_string();
+        for case in vectors["match"].as_array().unwrap() {
+            let (pattern, path) = (text(&case["pattern"]), text(&case["path"]));
+            let expected = case["matches"].as_bool().unwrap();
+            assert_eq!(
+                glob(&pattern).matches(&path),
+                expected,
+                "{pattern:?} on {path:?}"
+            );
+        }
+        for pattern in vectors["refuse"].as_array().unwrap() {
+            assert!(Glob::parse(&text(pattern)).is_err(), "{pattern}");
+        }
+        for pattern in vectors["accept"].as_array().unwrap() {
+            assert!(Glob::parse(&text(pattern)).is_ok(), "{pattern}");
+        }
+    }
+
     fn tracked(path: &str, mode: &str) -> Tracked {
         Tracked {
             path: path.into(),
